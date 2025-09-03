@@ -1,3 +1,909 @@
 https://chatgpt.com/share/68b78dcd-48bc-800d-b32a-aecc510baa8b
 
 https://chatgpt.com/share/68b78dcd-48bc-800d-b32a-aecc510baa8b
+
+Perfeito — vamos migrar o seu projeto para Bluetooth (SPP/Serial), tirar WebView/navegador do app, mover o LED para um pino seguro que não conflita com a roda, e preparar a rota com TensorFlow fora da ESP32-CAM (no Node.js). Já deixo tudo funcionando sem TF e com toggles no app para:
+
+
+
+
+Fonte do vídeo: direto da ESP por Bluetooth (sem TF) ou via servidor (com TF habilitável).
+
+
+Troca de modo: manual / auto / patrol (via Bluetooth).
+
+
+Joystick: envia vetores x/y.
+
+
+Bomba (MOSFET): botão ON/OFF.
+
+
+LED indicador: realocado para pino seguro.
+
+
+
+
+
+
+⚠️ Observações importantes
+
+
+
+
+Bluetooth clássico (SPP) funciona no Android. No iOS o SPP não é suportado; se precisar iOS, usamos Wi-Fi ou BLE (sem vídeo fluido).
+
+
+Expo Go não tem Bluetooth clássico. Use Expo Dev Build (ou bare) com react-native-bluetooth-serial-next. Abaixo deixo o passo-a-passo.
+
+
+
+
+
+
+
+A) Firmware ESP32-CAM (Bluetooth + vídeo em Base64 + comandos)
+
+
+O que muda
+
+
+
+
+Sem Wi-Fi/HTTP — tudo por Bluetooth Serial.
+
+
+Vídeo MJPEG capturado, encodado em base64 e enviado como NDJSON (JSON por linha). FPS baixo (1–2) para caber no throughput do SPP.
+
+
+Comandos simples por texto (linhas): CMD:MODE:auto, CMD:STREAM:1, CMD:JOY:x,y, CMD:PUMP:1, CMD:LED:1, CMD:TF:1.
+
+
+LED indicador movido para GPIO 33 (saída OK). PUMP no GPIO 32. (Ambos não conflitam com câmera; fio um LED externo no 33 com resistor).
+
+
+
+
+Crie o arquivo HydroBotBT.ino:
+
+
+/**
+ * HydroBotBT.ino — ESP32-CAM (AI Thinker) via Bluetooth SPP
+ * - Captura frames JPEG e envia via Bluetooth como NDJSON (1 linha por evento)
+ * - Sem Wi-Fi/HTTP. Tudo por SerialBT.
+ * - Comandos por linha (texto): CMD:...
+ * - LED indicador em GPIO 33 (não conflita com roda/motores)
+ * - MOSFET da bomba em GPIO 32
+ * - Sem sensor IR por enquanto
+ *
+ * OBS: FPS baixo (1–2) por limitação de banda do SPP
+ */
+
+#include "esp_camera.h"
+#include <BluetoothSerial.h>
+#include <time.h>
+#include "mbedtls/base64.h"
+
+// ===== Pins (AI Thinker) =====
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ===== Seus atuadores sem conflito =====
+#define LED_IND_PIN  33   // LED indicador externo
+#define PUMP_PIN     32   // MOSFET da bomba
+
+BluetoothSerial SerialBT;
+
+// ===== Estado =====
+String g_mode = "manual";
+bool   g_streamOn = true;     // envia frames
+bool   g_ledOn    = false;    // LED indicador
+bool   g_pumpOn   = false;    // bomba
+bool   g_tfOn     = false;    // só espelha no status (TF roda fora)
+float  g_joyX     = 0.0f;
+float  g_joyY     = 0.0f;
+
+uint32_t lastFrameMs = 0;
+uint32_t frameIntervalMs = 700; // ~1.4 fps (ajuste ao seu gosto)
+char lineBuf[256];
+
+// ===== Util =====
+void writeJsonLine(const String& s) {
+  SerialBT.write((const uint8_t*)s.c_str(), s.length());
+  SerialBT.write('\n');
+}
+
+String isoTsUptime() {
+  // sem NTP → uptime
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"uptime_ms\":%lu}", millis());
+  return String(buf);
+}
+
+// ===== Camera =====
+bool initCamera() {
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer   = LEDC_TIMER_0;
+  c.pin_d0       = Y2_GPIO_NUM;
+  c.pin_d1       = Y3_GPIO_NUM;
+  c.pin_d2       = Y4_GPIO_NUM;
+  c.pin_d3       = Y5_GPIO_NUM;
+  c.pin_d4       = Y6_GPIO_NUM;
+  c.pin_d5       = Y7_GPIO_NUM;
+  c.pin_d6       = Y8_GPIO_NUM;
+  c.pin_d7       = Y9_GPIO_NUM;
+  c.pin_xclk     = XCLK_GPIO_NUM;
+  c.pin_pclk     = PCLK_GPIO_NUM;
+  c.pin_vsync    = VSYNC_GPIO_NUM;
+  c.pin_href     = HREF_GPIO_NUM;
+  c.pin_sscb_sda = SIOD_GPIO_NUM;
+  c.pin_sscb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn     = PWDN_GPIO_NUM;
+  c.pin_reset    = RESET_GPIO_NUM;
+  c.xclk_freq_hz = 20000000;
+  c.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    c.frame_size   = FRAMESIZE_QVGA; // 320x240 para reduzir base64
+    c.jpeg_quality = 22;             // + número = + compactação
+    c.fb_count     = 2;
+    c.fb_location  = CAMERA_FB_IN_PSRAM;
+    c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  } else {
+    c.frame_size   = FRAMESIZE_QQVGA; // 160x120 fallback
+    c.jpeg_quality = 25;
+    c.fb_count     = 1;
+    c.fb_location  = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    s->set_exposure_ctrl(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 0);
+    s->set_dcw(s, 1);
+  }
+  return true;
+}
+
+// ===== Envio de frame como NDJSON base64 =====
+void sendFrameBase64() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  // Base64 tamanho ~ 4/3 do JPEG
+  size_t outLen = 4 * ((fb->len + 2) / 3) + 4;
+  uint8_t* b64 = (uint8_t*)malloc(outLen);
+  if (!b64) {
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  size_t olen = 0;
+  int rc = mbedtls_base64_encode(b64, outLen, &olen, fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  if (rc != 0) { free(b64); return; }
+
+  // Monta JSON por partes para não estourar buffer interno do BT
+  writeJsonLine(String("{\"evt\":\"frame\",\"fmt\":\"jpeg\",\"b64\":\"BEGIN\"}"));
+  // envia o base64 em blocos
+  const size_t CHUNK = 1000;
+  for (size_t i = 0; i < olen; i += CHUNK) {
+    size_t n = (i + CHUNK <= olen) ? CHUNK : (olen - i);
+    SerialBT.write((const uint8_t*)"{\"chunk\":\"", 10);
+    SerialBT.write((const uint8_t*)(b64 + i), n);
+    SerialBT.write((const uint8_t*)"\"}\n", 3);
+  }
+  writeJsonLine(String("{\"evt\":\"frame\",\"b64\":\"END\"}"));
+  free(b64);
+}
+
+// ===== Parser de comandos "CMD:..." por linha =====
+void handleCmd(const String& line) {
+  // Formatos aceitos:
+  // CMD:MODE:auto
+  // CMD:STREAM:1
+  // CMD:JOY:x,y
+  // CMD:PUMP:1
+  // CMD:LED:1
+  // CMD:TF:1
+  if (!line.startsWith("CMD:")) return;
+  int p1 = line.indexOf(':', 4);
+  if (p1 < 0) return;
+  String key = line.substring(4, p1);
+  String val = line.substring(p1 + 1);
+  val.trim();
+
+  if (key == "MODE") {
+    if (val == "manual" || val == "auto" || val == "patrol") {
+      g_mode = val;
+      writeJsonLine(String("{\"evt\":\"mode\",\"v\":\"") + g_mode + "\"}");
+    }
+  } else if (key == "STREAM") {
+    g_streamOn = (val == "1" || val == "true");
+    writeJsonLine(String("{\"evt\":\"stream\",\"on\":") + (g_streamOn?"true":"false") + "}");
+  } else if (key == "LED") {
+    g_ledOn = (val == "1" || val == "true");
+    digitalWrite(LED_IND_PIN, g_ledOn ? HIGH : LOW);
+    writeJsonLine(String("{\"evt\":\"led\",\"on\":") + (g_ledOn?"true":"false") + "}");
+  } else if (key == "PUMP") {
+    g_pumpOn = (val == "1" || val == "true");
+    digitalWrite(PUMP_PIN, g_pumpOn ? HIGH : LOW);
+    writeJsonLine(String("{\"evt\":\"pump\",\"on\":") + (g_pumpOn?"true":"false") + "}");
+  } else if (key == "TF") {
+    g_tfOn = (val == "1" || val == "true");
+    writeJsonLine(String("{\"evt\":\"tf\",\"on\":") + (g_tfOn?"true":"false") + "}");
+  } else if (key == "JOY") {
+    int c = val.indexOf(',');
+    if (c > 0) {
+      g_joyX = val.substring(0, c).toFloat();
+      g_joyY = val.substring(c + 1).toFloat();
+      // eco simples
+      char buf[96];
+      snprintf(buf, sizeof(buf), "{\"evt\":\"joy\",\"x\":%.3f,\"y\":%.3f}", g_joyX, g_joyY);
+      writeJsonLine(String(buf));
+    }
+  }
+}
+
+// ===== Setup/Loop =====
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_IND_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(LED_IND_PIN, LOW);
+  digitalWrite(PUMP_PIN, LOW);
+
+  if (!initCamera()) {
+    Serial.println("Falha camera");
+    delay(3000);
+    ESP.restart();
+  }
+
+  // Bluetooth
+  if (!SerialBT.begin("HYDROBOT")) {
+    Serial.println("BT falhou");
+    while (1) delay(1000);
+  }
+  Serial.println("BT pronto: HYDROBOT");
+
+  // Status inicial
+  writeJsonLine(String("{\"evt\":\"status\",\"ts\":") + isoTsUptime() +
+                ",\"mode\":\"" + g_mode + "\",\"stream\":" + (g_streamOn?"true":"false") + "}");
+}
+
+void loop() {
+  // Leitura de comandos por linha
+  static String acc;
+  while (SerialBT.available()) {
+    char ch = (char)SerialBT.read();
+    if (ch == '\n' || ch == '\r') {
+      if (acc.length() > 0) { handleCmd(acc); acc = ""; }
+    } else {
+      if (acc.length() < 200) acc += ch; // evita linhas absurdas
+    }
+  }
+
+  // Envio periódico de frame
+  uint32_t now = millis();
+  if (g_streamOn && now - lastFrameMs >= frameIntervalMs && SerialBT.hasClient()) {
+    lastFrameMs = now;
+    sendFrameBase64();
+  }
+
+  // Status ping a cada ~3s
+  static uint32_t lastPing = 0;
+  if (now - lastPing > 3000) {
+    lastPing = now;
+    writeJsonLine(String("{\"evt\":\"status\",\"ts\":") + isoTsUptime() +
+      ",\"mode\":\"" + g_mode + "\",\"led\":" + (g_ledOn?"true":"false") +
+      ",\"pump\":" + (g_pumpOn?"true":"false") + ",\"tf\":" + (g_tfOn?"true":"false") + "}");
+  }
+}
+
+
+
+
+
+Fiação:
+
+
+
+
+LED indicador: GPIO33 → resistor 220Ω → LED → GND.
+
+
+Bomba (MOSFET): GPIO32 → gate (MOSFET logic-level) + resistência 100k pull-down gate-GND; não alimente bomba pelo 3V3 da placa.
+
+
+
+
+
+
+
+B) App React Native (Expo Dev Build, TS) — Bluetooth + vídeo + controles
+
+
+1) Projeto e dependências
+
+
+npx create-expo-app hydrobot-bt -t expo-template-blank-typescript
+cd hydrobot-bt
+
+# Bluetooth Clássico:
+yarn add react-native-bluetooth-serial-next
+# se usar npm: npm i react-native-bluetooth-serial-next
+
+# Pré-build (cria projeto nativo)
+npx expo prebuild
+
+# Android: habilite BLUETOOTH perms automaticamente pelo pacote.
+# Gere Dev Build:
+eas build:configure
+eas build --profile development --platform android
+# Instale o .apk de dev no aparelho e abra o app com ele (não Expo Go).
+
+
+
+
+
+Se preferir bare, rode npx react-native run-android.
+
+
+
+
+2) Serviço de Bluetooth — src/services/bluetooth.ts
+
+
+// src/services/bluetooth.ts
+import BluetoothSerial from 'react-native-bluetooth-serial-next';
+import { NativeEventEmitter } from 'react-native';
+
+type Listener = (msg: any) => void;
+
+let connectedId: string | null = null;
+let lineBuffer = '';
+
+const listeners = new Set<Listener>();
+
+export async function ensureEnabled() {
+  const ok = await BluetoothSerial.isEnabled();
+  if (!ok) await BluetoothSerial.requestEnable();
+}
+
+export async function listDevices() {
+  const bonded = await BluetoothSerial.list();
+  return bonded; // [{id,name,address},...]
+}
+
+export async function connectByName(name: string) {
+  const devs = await listDevices();
+  const dev = devs.find(d => (d.name || '').includes(name));
+  if (!dev) throw new Error(`Dispositivo '${name}' não pareado`);
+  await BluetoothSerial.connect(dev.id);
+  connectedId = dev.id;
+  // ler dados contínuos
+  BluetoothSerial.withDelimiter('\n'); // separa por \n
+  BluetoothSerial.on('read', ({ data }) => {
+    // cada 'data' é uma linha (string)
+    try {
+      const obj = JSON.parse(data);
+      for (const cb of listeners) cb(obj);
+    } catch {
+      // pode chegar chunks do frame ({"chunk":"..."}), ainda é JSON
+      try {
+        const o2 = JSON.parse(data);
+        for (const cb of listeners) cb(o2);
+      } catch {}
+    }
+  });
+}
+
+export function onMsg(cb: Listener) { listeners.add(cb); return () => listeners.delete(cb); }
+
+async function send(line: string) {
+  if (!connectedId) throw new Error('BT não conectado');
+  await BluetoothSerial.write(line + '\n');
+}
+
+// === Comandos ===
+export async function setMode(v: 'manual'|'auto'|'patrol') {
+  await send(`CMD:MODE:${v}`);
+}
+export async function setStream(on: boolean) {
+  await send(`CMD:STREAM:${on ? 1 : 0}`);
+}
+export async function setLED(on: boolean) {
+  await send(`CMD:LED:${on ? 1 : 0}`);
+}
+export async function setPump(on: boolean) {
+  await send(`CMD:PUMP:${on ? 1 : 0}`);
+}
+export async function setTF(on: boolean) {
+  await send(`CMD:TF:${on ? 1 : 0}`);
+}
+export async function sendJoy(x: number, y: number) {
+  const nx = Math.max(-1, Math.min(1, x));
+  const ny = Math.max(-1, Math.min(1, y));
+  await send(`CMD:JOY:${nx.toFixed(3)},${ny.toFixed(3)}`);
+}
+
+
+
+3) Componente de Joystick — src/components/Joystick.tsx
+
+
+// src/components/Joystick.tsx
+import React, { useMemo, useState } from 'react';
+import { View, PanResponder } from 'react-native';
+
+export default function Joystick({ onMove }:{ onMove:(x:number,y:number)=>void }) {
+  const size = 160, knob = 64;
+  const r = size/2, rk = knob/2;
+  const [p,setP] = useState({x:0,y:0});
+  const pan = useMemo(()=>PanResponder.create({
+    onStartShouldSetPanResponder:()=>true,
+    onPanResponderMove:(_,g)=>{
+      const lim = r - rk;
+      let x = g.dx, y = g.dy;
+      const mag = Math.hypot(x,y);
+      if (mag > lim) { const k = lim/mag; x*=k; y*=k; }
+      setP({x,y});
+      onMove(x/lim, -y/lim);
+    },
+    onPanResponderRelease:()=>{
+      setP({x:0,y:0});
+      onMove(0,0);
+    }
+  }),[]);
+  return (
+    <View {...pan.panHandlers} style={{
+      width:size,height:size,borderRadius:r,backgroundColor:'#101827',
+      borderWidth:1,borderColor:'#223',justifyContent:'center',alignItems:'center'
+    }}>
+      <View style={{
+        position:'absolute',width:knob,height:knob,borderRadius:rk,backgroundColor:'#4f7cff',
+        transform:[{translateX:p.x},{translateY:p.y}]
+      }}/>
+    </View>
+  );
+}
+
+
+
+4) Montagem da tela — App.tsx
+
+
+// App.tsx
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { SafeAreaView, View, Text, TouchableOpacity, TextInput, Image, ScrollView, Alert } from 'react-native';
+import Joystick from './src/components/Joystick';
+import { ensureEnabled, connectByName, onMsg, setMode, setLED, setPump, setStream, setTF, sendJoy } from './src/services/bluetooth';
+
+type FrameState = { collecting:boolean, chunks:string[], last:string };
+
+export default function App() {
+  const [btName,setBtName] = useState('HYDROBOT');
+  const [status,setStatus] = useState<any>({});
+  const [imgB64,setImgB64] = useState<string>('');
+  const [useServer,setUseServer] = useState(false); // fonte do vídeo: false=ESP direto; true=servidor
+  const [tfOn,setTfOn] = useState(false);
+
+  useEffect(()=>{ (async()=>{
+    try {
+      await ensureEnabled();
+      await connectByName(btName);
+      const off = onMsg((msg)=>{
+        // Protocolo:
+        // {evt:"frame", b64:"BEGIN"} / {chunk:"..."} / {evt:"frame", b64:"END"}
+        // {evt:"status"...} etc.
+        if (msg.evt === 'status' || msg.evt === 'mode' || msg.evt === 'led' || msg.evt === 'pump' || msg.evt === 'tf') {
+          setStatus((s:any)=>({ ...s, ...msg }));
+        } else if (msg.evt === 'frame' && msg.b64 === 'BEGIN') {
+          frame.current = { collecting:true, chunks:[], last:'' };
+        } else if (msg.evt === 'frame' && msg.b64 === 'END') {
+          const b64 = frame.current.chunks.join('');
+          setImgB64(b64);
+          frame.current = { collecting:false, chunks:[], last:'' };
+        } else if (typeof msg.chunk === 'string') {
+          if (frame.current.collecting) frame.current.chunks.push(msg.chunk);
+        }
+      });
+      return ()=>off();
+    } catch (e:any) {
+      Alert.alert('BT', e.message || String(e));
+    }
+  })(); }, []);
+
+  const frame = useRef<FrameState>({ collecting:false, chunks:[], last:'' });
+
+  async function toggleLED(){ await setLED(!(status.led)); }
+  async function togglePump(){ await setPump(!(status.pump)); }
+  async function toggleStream(){ await setStream(!(status.stream)); }
+  async function switchMode(m:'manual'|'auto'|'patrol'){ await setMode(m); }
+  async function toggleTF(){
+    const next = !tfOn; setTfOn(next);
+    await setTF(next);
+    // Quando usar servidor, o TF real roda lá; no app apenas espelhamos estado.
+  }
+
+  const videoView = useMemo(()=>{
+    if (useServer) {
+      return (
+        <View style={{height:220, borderRadius:10, backgroundColor:'#000', alignItems:'center', justifyContent:'center'}}>
+          <Text style={{color:'#fff', opacity:0.7}}>Vídeo via Servidor (TF)</Text>
+          {/* Em próxima etapa, conectamos ao WS ws://servidor:4000 para receber frames processados */}
+        </View>
+      );
+    }
+    return (
+      <View style={{height:220, borderRadius:10, backgroundColor:'#000', overflow:'hidden', alignItems:'center', justifyContent:'center'}}>
+        {imgB64 ? (
+          <Image source={{ uri: 'data:image/jpeg;base64,' + imgB64 }} style={{ width:'100%', height:'100%', resizeMode:'contain' }}/>
+        ) : (
+          <Text style={{color:'#fff', opacity:0.7}}>Sem frame ainda…</Text>
+        )}
+      </View>
+    );
+  },[useServer, imgB64]);
+
+  return (
+    <SafeAreaView style={{flex:1, backgroundColor:'#0b1220'}}>
+      <ScrollView contentContainerStyle={{padding:16, gap:12}}>
+        <Text style={{color:'#fff', fontSize:20, fontWeight:'700'}}>HydroBot — Bluetooth</Text>
+
+        <View style={{flexDirection:'row', gap:8}}>
+          <TextInput value={btName} onChangeText={setBtName}
+            placeholder="Nome BT (pareado) — HYDROBOT" placeholderTextColor="#789"
+            style={{flex:1, backgroundColor:'#111a2e', color:'#fff', padding:10, borderRadius:8}} />
+        </View>
+
+        {videoView}
+
+        <View style={{flexDirection:'row', gap:8, flexWrap:'wrap'}}>
+          <TouchableOpacity onPress={toggleLED} style={{backgroundColor:'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>LED {status.led ? 'ON' : 'OFF'}</Text></TouchableOpacity>
+          <TouchableOpacity onPress={togglePump} style={{backgroundColor:'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>Bomba {status.pump ? 'ON' : 'OFF'}</Text></TouchableOpacity>
+          <TouchableOpacity onPress={()=>switchMode('manual')} style={{backgroundColor: (status.mode==='manual')?'#3a6df0':'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>Manual</Text></TouchableOpacity>
+          <TouchableOpacity onPress={()=>switchMode('auto')} style={{backgroundColor: (status.mode==='auto')?'#3a6df0':'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>Auto</Text></TouchableOpacity>
+          <TouchableOpacity onPress={()=>switchMode('patrol')} style={{backgroundColor: (status.mode==='patrol')?'#3a6df0':'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>Patrol</Text></TouchableOpacity>
+          <TouchableOpacity onPress={toggleStream} style={{backgroundColor:'#2e374f', padding:10, borderRadius:8}}><Text style={{color:'#fff'}}>Stream {status.stream ? 'ON':'OFF'}</Text></TouchableOpacity>
+          <TouchableOpacity onPress={toggleTF} style={{backgroundColor: tfOn ? '#22c55e' : '#2e374f', padding:10, borderRadius:8}}>
+            <Text style={{color:'#fff'}}>TensorFlow {tfOn ? 'ON' : 'OFF'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={()=>setUseServer(!useServer)} style={{backgroundColor: useServer ? '#22c55e' : '#2e374f', padding:10, borderRadius:8}}>
+            <Text style={{color:'#fff'}}>Fonte: {useServer ? 'Servidor (TF)' : 'ESP direto'}</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{alignItems:'center', marginTop:6}}>
+          <Joystick onMove={(x,y)=>{ sendJoy(x,y).catch(()=>{}); }} />
+          <Text style={{color:'#8cb', marginTop:6}}>Arraste para enviar JOY (x,y)</Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+
+
+
+
+O app acima envia/recebe tudo por Bluetooth e mostra vídeo direto da ESP (sem navegador).
+
+Quando você alternar para “Servidor (TF)”, o painel de vídeo já troca (na próxima seção ligamos o servidor com TF + WebSocket).
+
+
+
+
+
+C) Servidor intermediário (Node.js) — Bluetooth ↔ TF ↔ App (WebSocket)
+
+
+Objetivo: rodar TensorFlow fora da ESP e automatizar “detectar fogo ⇒ aciona bomba + ir até o fogo”.
+
+
+Aqui deixo um servidor funcional que:
+
+
+
+
+Conecta ao Bluetooth SPP da ESP (nome HYDROBOT).
+
+
+Recebe NDJSON (frames em base64).
+
+
+(Stub TF) Faz detecção simplificada (lugar do TF real) e envia evento por WebSocket.
+
+
+Repassa comandos de autonomia para a ESP (ex.: liga bomba quando “fogo” detectado).
+
+
+
+
+server/
+  package.json
+  index.js
+
+
+
+server/package.json
+
+
+{
+  "name": "hydrobot-server",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "bluetooth-serial-port": "^2.2.8",
+    "ws": "^8.18.0",
+    "jimp": "^0.22.12"
+  }
+}
+
+
+
+server/index.js
+
+
+import { BluetoothSerialPort } from 'bluetooth-serial-port';
+import { WebSocketServer } from 'ws';
+import Jimp from 'jimp';
+
+const DEV_NAME = process.env.ESP_NAME || 'HYDROBOT';
+
+const bt = new BluetoothSerialPort();
+let btChannelOpen = false;
+
+const wss = new WebSocketServer({ port: 4000 });
+const clients = new Set();
+
+wss.on('connection', ws => {
+  clients.add(ws);
+  ws.on('close', ()=>clients.delete(ws));
+});
+
+function broadcast(obj) {
+  const s = JSON.stringify(obj);
+  for (const ws of clients) {
+    try { ws.send(s); } catch {}
+  }
+}
+
+function findAndConnect() {
+  bt.inquire();
+  bt.on('found', function(address, name) {
+    if (!name) return;
+    if (name.includes(DEV_NAME)) {
+      bt.findSerialPortChannel(address, channel => {
+        bt.connect(address, channel, () => {
+          console.log('BT conectado a', name, address, 'ch', channel);
+          btChannelOpen = true;
+
+          // peca stream
+          writeLine('CMD:STREAM:1');
+
+          let acc = '';
+          bt.on('data', (buf) => {
+            acc += buf.toString('utf8');
+            let i;
+            while ((i = acc.indexOf('\n')) >= 0) {
+              const line = acc.slice(0, i).trim();
+              acc = acc.slice(i + 1);
+              if (!line) continue;
+              handleLine(line);
+            }
+          });
+
+        }, () => console.log('Falha BT connect'));
+      }, () => console.log('Sem canal SPP'));
+    }
+  });
+}
+
+function writeLine(s) {
+  if (!btChannelOpen) return;
+  bt.write(Buffer.from(s + '\n', 'utf8'), (err) => {
+    if (err) console.log('BT write err', err);
+  });
+}
+
+// Coleta de frame (BEGIN/chunks/END) vinda da ESP
+const frameCollector = { collecting:false, parts:[] };
+
+async function handleLine(line) {
+  try {
+    const obj = JSON.parse(line);
+    if (obj.evt === 'frame' && obj.b64 === 'BEGIN') {
+      frameCollector.collecting = true;
+      frameCollector.parts = [];
+    } else if (obj.evt === 'frame' && obj.b64 === 'END') {
+      const b64 = frameCollector.parts.join('');
+      frameCollector.collecting = false;
+      frameCollector.parts = [];
+      broadcast({ evt:'frame', b64 });
+
+      // === STUB de detecção (substitua por TF real) ===
+      try {
+        const img = await Jimp.read(Buffer.from(b64, 'base64'));
+        // regra boba: pixel "vermelho forte" acima de limiar
+        let redCount = 0, tot = img.bitmap.width * img.bitmap.height;
+        img.scan(0,0,img.bitmap.width,img.bitmap.height,function(x,y,idx){
+          const r=this.bitmap.data[idx], g=this.bitmap.data[idx+1], b=this.bitmap.data[idx+2];
+          if (r > 200 && g < 120 && b < 120) redCount++;
+        });
+        const ratio = redCount / tot;
+        const fire = ratio > 0.08; // limiar experimental
+        broadcast({ evt:'detect', fire, ratio });
+
+        if (fire) {
+          writeLine('CMD:PUMP:1');        // liga bomba
+          writeLine('CMD:MODE:auto');     // sinaliza modo auto (você pode usar para acionar locomoção)
+          // Próximo passo: calcular direção do “centro vermelho” e mandar JOY para perseguir.
+        }
+      } catch (e) {}
+    } else if (typeof obj.chunk === 'string') {
+      if (frameCollector.collecting) frameCollector.parts.push(obj.chunk);
+    } else {
+      broadcast(obj); // status/mode/led/pump/tf/joy…
+    }
+  } catch {}
+}
+
+findAndConnect();
+console.log('WS em ws://localhost:4000  (broadcast frames/detections)')
+
+
+
+
+
+Próxima etapa para TF real: trocar o bloco Jimp pelo @tensorflow/tfjs-node + modelo de “fire detection” (classificação em recortes ou detecção com YOLO-lite). A estrutura acima já envia {evt:'detect', fire, ratio} para o app e comanda a ESP (bomba + modo) ao detectar.
+
+
+
+
+
+D) App — recebendo do servidor (quando “Servidor (TF)” estiver ativo)
+
+
+No App.tsx, quando useServer === true, você pode abrir um WebSocket e substituir imgB64/eventos pelos do servidor:
+
+
+// adicione no App.tsx
+useEffect(()=>{
+  if (!useServer) return;
+  const ws = new WebSocket('ws://<IP_DO_NOTEBOOK>:4000');
+  ws.onmessage = (e)=>{
+    try{
+      const msg = JSON.parse(e.data);
+      if (msg.evt === 'frame' && msg.b64) setImgB64(msg.b64);
+      if (msg.evt === 'detect') {
+        // pode mostrar um badge “🔥”
+      }
+    }catch{}
+  };
+  return ()=>{ try{ws.close();}catch{} }
+}, [useServer]);
+
+
+
+
+
+Assim você alterna: ESP direto (Bluetooth) ou Servidor (TF) por um botão — como você pediu.
+
+
+
+
+
+E) Passo a passo (resumo executável)
+
+
+
+
+
+
+Grave a ESP32-CAM com HydroBotBT.ino.
+
+
+
+
+LED indicador → GPIO33 (externo).
+
+
+MOSFET bomba → GPIO32.
+
+
+Pareie a ESP no Android (nome HYDROBOT).
+
+
+
+
+
+
+
+
+App (Expo Dev Build)
+
+
+
+
+Instale dependências, expo prebuild, gere Dev Build e instale o .apk.
+
+
+Abra o app, BT ligado, nome HYDROBOT, aguarde status → vídeo surgirá (1–2 fps).
+
+
+
+
+
+
+
+
+Servidor (opcional p/ TF)
+
+
+
+
+cd server && npm i && node index.js
+
+
+No app, ative “Servidor (TF)” para receber frames do WS.
+
+
+(Hoje está com detecção stub via “vermelho” e comanda PUMP + MODE:auto automaticamente.)
+
+
+
+
+
+
+
+
+
+F) Próximos incrementos (quando você quiser)
+
+
+
+
+Auto-drive real: no servidor, calcule o centro do fogo (momento vermelho) e envie CMD:JOY:x,y para perseguir — já está tudo encadeado.
+
+
+TF real: trocar o stub por modelo TFJS/Node (ex.: MobileNet+SVM ou YOLO-tiny).
+
+
+Segurança elétrica: diodo flyback na bomba, fonte 5V/2A, GND comum.
+
+
+iOS: usar Wi-Fi ou BLE GATT (com streaming reduzido) — podemos te dar uma variação.
+
+
+
+
+
+Se quiser, eu já acoplo a lógica de perseguição (cálculo de vetor JOY a partir do centro detectado) e deixo curva exponencial/limiar para o joystick, além de debounce da bomba (só ligar por 2–3s e pausar).
+
