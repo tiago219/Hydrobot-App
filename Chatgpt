@@ -4143,3 +4143,135 @@ Por isso sempre: server primeiro → app depois.
 Quer que eu te mande um checklist rápido de teste (pingar ESP, abrir stream, checar /status do server) pra você marcar quando for validar?
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Boa, vi pela sua print que o erro é:
+
+
+No module named uvicorn
+
+
+
+👉 Isso significa que no novo PC você ainda não instalou as dependências (FastAPI, Uvicorn, etc).
+
+Ou seja, o Python está rodando, mas o pacote não existe nesse ambiente.
+
+
+
+Como resolver (Windows / PowerShell)
+
+
+
+
+Entre na pasta do seu servidor:
+
+
+
+
+cd D:\Loud2025\hydrobot-server
+
+
+
+
+
+(opcional, mas recomendado) Crie um ambiente virtual:
+
+
+
+
+py -3.13 -m venv .venv
+.\.venv\Scripts\activate
+
+
+
+Você vai ver (.venv) no começo da linha do terminal.
+
+
+
+
+Instale os pacotes necessários:
+
+
+
+
+pip install fastapi==0.115.5 uvicorn[standard]==0.32.0 opencv-python==4.10.0.84 numpy==2.1.1 requests
+
+
+
+
+
+Agora rode o servidor:
+
+
+
+
+python -m uvicorn server_heuristic:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+Dicas extras
+
+
+
+
+Sempre rode dentro do venv (.\.venv\Scripts\activate).
+
+
+Se trocar de PC, basta rodar de novo o pip install ... ou usar um requirements.txt.
+
+Exemplo:
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+opencv-python==4.10.0.84
+numpy==2.1.1
+requests
+
+
+e depois:
+
+pip install -r requirements.txt
+
+
+
+
+
+
+
+
+Quer que eu te monte esse requirements.txt já pronto, pra você só dar pip install -r requirements.txt e nunca mais precisar digitar os pacotes um a um quando mudar de computador?
+
