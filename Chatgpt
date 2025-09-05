@@ -1461,3 +1461,132 @@ Tema dark consistente com seu logo HB 🔥💧
 
 Se quiser, eu adiciono um badge na aba Câmera quando a conexão com o ESP32 falhar/sucesso, ou coloco labels grandes no tab bar.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfeito 👌 vamos deixar a tela inicial (Home) como um menu em grade com botões quadrados grandes, cada um levando para a aba correspondente. Os ícones vão usar Ionicons (já vem com Expo).
+
+
+
+src/screens/HomeScreen.tsx (nova versão)
+
+
+import { View, Text, StyleSheet, Pressable, Dimensions } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
+import { useNavigation } from "@react-navigation/native";
+import type { TabParamList } from "../../App";
+import type { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
+
+type Nav = BottomTabNavigationProp<TabParamList>;
+
+const size = Dimensions.get("window").width / 2 - 32; // 2 colunas com espaçamento
+
+export default function HomeScreen() {
+  const navigation = useNavigation<Nav>();
+
+  const items = [
+    { name: "Camera" as keyof TabParamList, label: "Câmera", icon: "videocam" as const, color: "#2b48ff" },
+    { name: "Dashboard" as keyof TabParamList, label: "Dashboard", icon: "pulse" as const, color: "#17a34a" },
+    { name: "Settings" as keyof TabParamList, label: "Ajustes", icon: "settings" as const, color: "#eab308" },
+  ];
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>HydroBotApp2</Text>
+      <View style={styles.grid}>
+        {items.map((item) => (
+          <Pressable
+            key={item.name}
+            onPress={() => navigation.navigate(item.name)}
+            style={({ pressed }) => [
+              styles.card,
+              { width: size, height: size, backgroundColor: item.color },
+              pressed && { opacity: 0.85 },
+            ]}
+          >
+            <Ionicons name={item.icon} size={42} color="white" />
+            <Text style={styles.cardText}>{item.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+      <Text style={styles.footerHint}>ou use o rodapé abaixo para navegar</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b1220", padding: 20 },
+  title: { color: "white", fontSize: 24, fontWeight: "800", marginBottom: 20, textAlign: "center" },
+  grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between" },
+  card: {
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 20,
+    shadowColor: "#000",
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 5,
+  },
+  cardText: { color: "white", marginTop: 10, fontWeight: "600", fontSize: 16 },
+  footerHint: { textAlign: "center", color: "#8aa0ff", marginTop: 10, fontSize: 12 },
+});
+
+
+
+
+Como fica
+
+
+
+
+Título em cima: HydroBotApp2
+
+
+Grade de botões quadrados grandes (2 colunas):
+
+
+
+📹 Câmera (azul)
+
+
+📊 Dashboard (verde)
+
+
+⚙️ Ajustes (amarelo)
+
+
+
+
+
+
+Rodapé ainda existe (tabs) para navegação alternativa.
+
+
+
+
+
+quer que eu já adicione também o botão da Home (🏠) nesse grid, ou prefere deixar Home só como hub de acesso às outras telas?
+
