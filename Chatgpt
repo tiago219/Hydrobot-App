@@ -4275,3 +4275,198 @@ pip install -r requirements.txt
 
 Quer que eu te monte esse requirements.txt já pronto, pra você só dar pip install -r requirements.txt e nunca mais precisar digitar os pacotes um a um quando mudar de computador?
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bora fazer o vídeo aparecer 👇
+
+
+Checklist rápido (pra isolar o problema)
+
+
+
+
+
+
+No celular, abra o navegador e acesse:
+
+http://192.168.4.1:81/stream
+
+
+
+
+Se aparecer o vídeo → a câmera está ok; o ajuste é no app.
+
+
+Se não aparecer → é rede/conexão com o ESP (cheque Wi-Fi HYDROBOT-CAM).
+
+
+
+
+
+
+
+
+Confirme no app.json (você já tinha adicionado, mas vale checar):
+
+
+
+
+
+
+{
+  "expo": {
+    "...": "...",
+    "android": {
+      "usesCleartextTraffic": true
+    },
+    "ios": {
+      "infoPlist": {
+        "NSAppTransportSecurity": { "NSAllowsArbitraryLoads": true }
+      }
+    }
+  }
+}
+
+
+
+Depois rode: npx expo start -c
+
+
+
+Ajuste na tela: carregar o stream direto (sem HTML wrapper)
+
+
+Alguns devices/WebView não curtem MJPEG dentro de <img> em HTML local. Carregar direto a URL no WebView costuma funcionar melhor.
+
+
+No seu CameraScreen.tsx, troque apenas o bloco do WebView (deixe todo o resto igual):
+
+
+{/* Vídeo MJPEG (carrega a URL diretamente) */}
+<WebView
+  ref={webref}
+  source={{ uri: streamUrl }}          // <--- direto na URL
+  style={styles.web}
+  originWhitelist={["*"]}
+  javaScriptEnabled
+  domStorageEnabled
+  allowsInlineMediaPlayback
+  mediaPlaybackRequiresUserAction={false}
+  mixedContentMode="always"            // <--- importante no Android
+  overScrollMode="never"
+  allowingReadAccessToURL={"*"}
+/>
+
+
+
+E remova as variáveis/uso do const html = \...`;` se não for mais usar o HTML.
+
+
+
+Se ainda não renderizar
+
+
+
+
+
+
+Teste outra variante do WebView:
+
+
+<WebView
+  source={{ uri: `${streamUrl}` }}
+  useWebKit
+  allowsInlineMediaPlayback
+  mixedContentMode="always"
+  originWhitelist={["*"]}
+  style={styles.web}
+/>
+
+
+
+
+
+
+
+Alguns Androids bloqueiam MJPEG no WebView. Alternativas:
+
+
+
+
+Usar o pacote react-native-mjpeg (exibe MJPEG nativamente no Android).
+
+
+Servir JPEGs individuais do servidor (snapshot a cada 200–300 ms) e mostrar com <Image>; é menos fluido, mas funciona em qualquer lugar:
+
+const [frameUri, setFrameUri] = useState(`${server}/snapshot?ts=${Date.now()}`);
+useEffect(() => {
+  let id: any;
+  const pull = async () => {
+    setFrameUri(`${server}/snapshot?ts=${Date.now()}`);
+    id = setTimeout(pull, 300);
+  };
+  pull();
+  return () => clearTimeout(id);
+}, [server]);
+
+<Image source={{ uri: frameUri }} style={{ flex: 1, resizeMode: "contain", backgroundColor: "black" }} />
+
+
+(precisa do endpoint /snapshot ativo no servidor.)
+
+
+
+
+
+
+
+
+
+Teste na ordem
+
+
+
+
+Servidor rodando (/status responde).
+
+
+Celular e PC no mesmo Wi-Fi do ESP.
+
+
+Abra no celular o navegador em http://192.168.4.1:81/stream (tem que ver vídeo).
+
+
+Abra o app → aba Câmera → coloque ESP IP = 192.168.4.1 → Testar → depois troque o WebView como mostrei acima.
+
+
+
+
+Se travar em algum passo, me diga exatamente qual (e o modelo do celular). A seguir, posso te passar a opção com react-native-mjpeg já pronta.
+
+
