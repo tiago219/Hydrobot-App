@@ -2115,3 +2115,689 @@ const styles = StyleSheet.create({
 
 👉 quer que eu cole novamente o código inteiro da CameraScreen.tsx atualizado, junto com esses, para ficar 100% fechado em um só bloco?
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+show! vou te entregar um guia passo-a-passo (sem pular nada) + código pronto de um servidor intermediário em Python com TensorFlow “normal” (Keras) e a integração no app para exibir a detecção.
+
+
+
+PARTE A — Servidor de IA (TensorFlow)
+
+
+0) Pré-requisitos
+
+
+
+
+Python 3.10 ou 3.11 (recomendado p/ TF 2.15)
+
+
+Pip atualizado: python -m pip install -U pip
+
+
+Máquina que consiga acessar o ESP32 na rede (ex.: conectada ao Wi-Fi HYDROBOT-CAM)
+
+
+
+
+
+
+Dica: quando o celular estiver no Wi-Fi do ESP32 (sem internet), rode o Expo com --tunnel para continuar vendo o app.
+
+
+
+
+
+1) Criar a pasta do servidor
+
+
+mkdir hydrobot-server
+cd hydrobot-server
+
+
+
+Crie estes arquivos:
+
+
+requirements.txt
+
+
+
+
+(TensorFlow 2.15 usa NumPy 1.26.x — importante fixar)
+
+
+
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+opencv-python==4.10.0.84
+numpy==1.26.4
+tensorflow==2.15.1
+
+
+
+Estrutura
+
+
+hydrobot-server/
+  server_tf.py
+  requirements.txt
+  models/
+    fire_classifier.h5      ← seu modelo Keras (2 classes: [no_fire, fire])
+
+
+
+server_tf.py
+
+
+import cv2
+import time
+import threading
+import numpy as np
+from typing import Optional, List, Dict
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from tensorflow.keras.models import load_model  # TensorFlow "normal"
+
+# =========================
+# Config do servidor
+# =========================
+CAMERA_IP = "192.168.4.1"                 # IP padrão do ESP32-CAM em AP
+STREAM_URL_FMT = "http://{}:81/stream"
+MODEL_PATH = "./models/fire_classifier.h5" # Keras (2 saídas: [no_fire, fire])
+SCORE_THRESHOLD = 0.60                     # corte (ajuste depois)
+USE_HEURISTIC_IF_MODEL_MISSING = True      # fallback se faltar modelo
+
+app = FastAPI(title="HydroBot Fire TF Server", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# =========================
+# Leitor de frames (OpenCV)
+# =========================
+class CameraReader:
+    def __init__(self, ip: str):
+        self.ip = ip
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._lock = threading.Lock()
+        self._last_frame: Optional[np.ndarray] = None
+        self._fps = 0.0
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._running: return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread: self._thread.join(timeout=2.0)
+        if self._cap: self._cap.release()
+        self._cap = None
+
+    def set_ip(self, ip: str):
+        if ip == self.ip: return
+        self.ip = ip
+        self.stop(); self.start()
+
+    def _open(self):
+        cap = cv2.VideoCapture(STREAM_URL_FMT.format(self.ip))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _loop(self):
+        self._cap = self._open()
+        if not self._cap or not self._cap.isOpened():
+            for _ in range(10):
+                time.sleep(0.6)
+                self._cap = self._open()
+                if self._cap.isOpened(): break
+
+        frames, last = 0, time.time()
+        while self._running:
+            if not self._cap or not self._cap.isOpened():
+                time.sleep(0.3); continue
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                time.sleep(0.03); continue
+            with self._lock:
+                self._last_frame = frame
+            frames += 1
+            now = time.time()
+            if now - last >= 1.0:
+                self._fps = frames / (now - last)
+                frames, last = 0, now
+
+    def get_latest(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return None if self._last_frame is None else self._last_frame.copy()
+
+    def get_fps(self) -> float:
+        return self._fps
+
+reader = CameraReader(CAMERA_IP)
+reader.start()
+
+# =========================
+# Carregar modelo Keras
+# =========================
+class FireClassifier:
+    def __init__(self, model_path: str):
+        self.model = None
+        try:
+            self.model = load_model(model_path)
+        except Exception as e:
+            print(f"[WARN] Não foi possível carregar o modelo: {e}")
+            self.model = None
+
+        # inferir input shape [H, W, 3]
+        if self.model is not None:
+            ishape = self.model.inputs[0].shape  # (None, H, W, 3)
+            self.H = int(ishape[1]); self.W = int(ishape[2])
+        else:
+            self.H = 224; self.W = 224  # padrão se faltar modelo
+
+    def preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
+        img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
+        x = img.astype(np.float32) / 255.0   # normalização padrão
+        return np.expand_dims(x, axis=0)
+
+    def predict(self, frame_bgr: np.ndarray) -> float:
+        if self.model is None:
+            # fallback heurístico (proporção de pixels "quentes")
+            hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+            score = float(np.count_nonzero(mask)) / float(mask.size)
+            return float(min(1.0, score * 4.0))
+        x = self.preprocess(frame_bgr)
+        probs = self.model.predict(x, verbose=0)[0]
+        # espera [no_fire, fire]; se for 1 saída (sigmoid), trate como fire
+        if probs.shape[0] == 2:
+            fire_score = float(probs[1])
+        else:
+            fire_score = float(probs[0])
+        return max(0.0, min(1.0, fire_score))
+
+clf = FireClassifier(MODEL_PATH)
+
+# =========================
+# Caixas por heurística (opcional)
+# =========================
+def fire_boxes(frame_bgr: np.ndarray) -> List[List[int]]:
+    h, w = frame_bgr.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame_bgr, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: List[List[int]] = []
+    rx, ry = w / float(scl), h / float(rs.shape[0])
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600: 
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# =========================
+# API
+# =========================
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+@app.get("/status")
+def status():
+    return {
+        "ok": True,
+        "camera_ip": reader.ip,
+        "fps": round(reader.get_fps(), 2),
+        "has_frame": reader.get_latest() is not None,
+        "model": "keras_h5" if clf.model is not None else ("heuristic" if USE_HEURISTIC_IF_MODEL_MISSING else "none"),
+        "ts": int(time.time() * 1000),
+    }
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    reader.set_ip(cfg.camera_ip)
+    return {"ok": True, "camera_ip": reader.ip}
+
+@app.get("/snapshot")
+def snapshot():
+    frame = reader.get_latest()
+    if frame is None:
+        return {"ok": False, "error": "no frame yet"}
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        return {"ok": False, "error": "encode failed"}
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    frame = reader.get_latest()
+    if frame is None:
+        return {"ok": False, "error": "no frame"}
+    score = clf.predict(frame)
+    is_fire = bool(score >= SCORE_THRESHOLD)
+    boxes = fire_boxes(frame) if is_fire else []
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(score), 3),
+        "boxes": boxes,
+        "threshold": SCORE_THRESHOLD,
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+
+2) Instalar e rodar
+
+
+# (na pasta hydrobot-server)
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
+pip install -r requirements.txt
+uvicorn server_tf:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+
+Sem modelo ainda? Pode rodar assim mesmo: ele usa o fallback heurístico.
+
+Quando você colocar models/fire_classifier.h5, ele usa o Keras automaticamente.
+
+
+
+
+
+3) Conectividade de rede
+
+
+
+
+ESP32-CAM cria o AP HYDROBOT-CAM → IP padrão 192.168.4.1
+
+
+Servidor (sua máquina) deve conectar a esse AP para ler o stream.
+
+
+Celular também conecta ao mesmo AP para usar o app.
+
+
+Para o Expo Go funcionar enquanto está nesse AP (sem internet), rode o bundler com:
+
+npx expo start --tunnel
+
+
+(o túnel usa a rede móvel para entregar o bundle)
+
+
+
+
+Descubra o IP do servidor dentro do AP (Windows: ipconfig, macOS/Linux: ifconfig).
+
+Geralmente vira 192.168.4.x.
+
+
+
+PARTE B — App (React Native) consumindo a IA
+
+
+Você já tem a CameraScreen.tsx. Vamos adicionar:
+
+
+
+
+Campo de Servidor (http://192.168.4.X:8000)
+
+
+Botão Detectar (liga/desliga polling)
+
+
+Banner “🔥 FOGO” com score
+
+
+
+
+
+
+Substitua seu src/screens/CameraScreen.tsx pelo abaixo (já inclui LED, Bomba, Joystick e Detecção):
+
+
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  ActivityIndicator,
+  PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
+} from "react-native";
+import { WebView } from "react-native-webview";
+
+const DEFAULT_IP = "192.168.4.1";          // ESP32-CAM
+const DEFAULT_SERVER = "http://192.168.4.2:8000"; // <-- troque para o IP do seu servidor no AP
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // Detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // Joystick UI
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  const webref = useRef<WebView>(null);
+
+  const streamUrl = useMemo(() => `http://${ip}:81/stream`, [ip]);
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl   = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl  = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl);
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(
+        `OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`
+      );
+    } catch {
+      setStatusText("Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.");
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() {
+    try {
+      const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t);
+    } catch { setStatusText("Erro ao alternar LED."); }
+  }
+  async function togglePump() {
+    try {
+      const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t);
+    } catch { setStatusText("Erro ao alternar bomba."); }
+  }
+
+  useEffect(() => {
+    pingStatus(); const id = setInterval(pingStatus, 5000);
+    return () => clearInterval(id);
+  }, [statusUrl]);
+
+  // HTML para MJPEG
+  const html = `
+    <html>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+      <body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh;">
+        <img src="${streamUrl}" style="width:100%;height:100%;object-fit:contain;" />
+      </body>
+    </html>
+  `;
+
+  // ======= Polling de detecção =======
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const r = await fetch(`${server}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(tick, 500); // ~2Hz (ajuste)
+      }
+    };
+    tick();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Joystick (UI) =====
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Controles superiores */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>ESP IP:</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder="192.168.4.1"
+          autoCapitalize="none" autoCorrect={false} style={styles.input} keyboardType="numeric" />
+        <Pressable onPress={pingStatus} style={styles.btn}><Text style={styles.btnText}>{isChecking ? "..." : "Testar"}</Text></Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? "LED ON" : "LED OFF"}</Text>
+        </Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? "BOMBA ON" : "BOMBA OFF"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha do servidor + detecção */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>Servidor:</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder="http://192.168.4.2:8000"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? "Detectando" : "Detectar"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+        <Pressable onPress={() => webref.current?.reload()} style={[styles.btn, { marginLeft: 8 }]}>
+          <Text style={styles.btnText}>Recarregar</Text>
+        </Pressable>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? `🔥 FOGO • score ${fireScore.toFixed(2)}` : `Sem fogo • score ${fireScore.toFixed(2)}`}
+          </Text>
+        </View>
+      )}
+
+      {/* Vídeo */}
+      <WebView
+        ref={webref}
+        originWhitelist={["*"]}
+        source={{ html }}
+        style={styles.web}
+        allowFileAccess
+        allowingReadAccessToURL={"*"}
+        javaScriptEnabled
+        domStorageEnabled
+        allowUniversalAccessFromFileURLs
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
+      />
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const PALETTE = { bg:"#000", card:"#0d0d0d", border:"#1a1a1a", red:"#E53B2F", white:"#fff" };
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  web: { flex: 1, backgroundColor: "black" },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+CHECKLIST rápido (do zero até ver “🔥 FOGO” no app)
+
+
+
+
+Ligue o ESP32-CAM (AP HYDROBOT-CAM, senha 12345678).
+
+
+Conecte o notebook ao AP HYDROBOT-CAM.
+
+
+Suba o servidor:
+
+
+
+Crie a pasta hydrobot-server, cole os arquivos, pip install -r requirements.txt,
+
+
+Rode: uvicorn server_tf:app --reload --host 0.0.0.0 --port 8000.
+
+
+(Opcional) Coloque models/fire_classifier.h5. Sem ele, usa heurística.
+
+
+
+
+
+
+Descubra o IP do notebook no AP (ex.: 192.168.4.2).
+
+
+No app, rode npx expo start --tunnel.
+
+
+No app Câmera:
+
+
+
+Campo ESP IP: 192.168.4.1 → tocar Testar (status OK).
+
+
+Campo Servidor: http://192.168.4.2:8000 (troque pelo seu IP).
+
+
+Toque Detectar → deve aparecer um banner “Sem fogo • score …”.
+
+
+Aponte chama/luz quente → quando o score ≥ 0.60, aparece 🔥 FOGO.
+
+
+
+
+
+
+(Opcional) Ajuste SCORE_THRESHOLD no server_tf.py conforme seu modelo.
+
+
+
+
+Pronto. Quando quiser, eu:
+
+
+
+
+Troco o fallback por um detector com caixas (SSD/EfficientDet em TF) e desenho overlay.
+
+
+Automatizo bomba ao detectar fogo (com histerese/timeout para não ligar/superligar).
+
+
+Adiciono /detect/stream (SSE) para latência menor e menos requisições.
+
+
+
