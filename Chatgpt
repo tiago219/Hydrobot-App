@@ -3109,3 +3109,161 @@ Em paralelo, prepare o Plano B (Docker) para usar seu modelo TensorFlow sem esqu
 
 Se quiser, eu te mando o server_tf.py completo novamente, e/ou um docker-compose.yml pra subir com um comando só.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Valeu pela print — o erro é claro: o comando uvicorn não foi encontrado no PATH. O pip instalou os scripts em uma pasta que não está no PATH (a mensagem amarela mostra isso). Resolvo em 1 minuto com qualquer uma destas opções; deixo a recomendada primeiro.
+
+
+
+✅ Solução recomendada (sem dor de cabeça): use um venv e chame via python -m
+
+
+
+
+Dentro da pasta do servidor (onde está server_heuristic.py):
+
+
+
+
+# crie e ative um venv usando o Python que você quer (3.13 mesmo)
+py -3.13 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -U pip
+
+
+
+
+
+Instale as dependências no venv (Plano A – heurística):
+
+
+
+
+pip install fastapi==0.115.5 uvicorn[standard]==0.32.0 opencv-python==4.10.0.84 numpy==2.1.1
+
+
+
+
+
+Rode o servidor sem depender do PATH:
+
+
+
+
+python -m uvicorn server_heuristic:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+
+Usando python -m uvicorn funciona mesmo se o uvicorn.exe não estiver no PATH.
+
+
+
+
+Se abrir, você verá “Uvicorn running on http://0.0.0.0:8000”.
+
+Teste em outro terminal: curl http://localhost:8000/status
+
+
+
+Alternativas rápidas (caso prefira)
+
+
+
+
+
+
+A. Usar o Python 3.11 (se foi nele que o pip instalou):
+
+
+py -3.11 -m uvicorn server_heuristic:app --reload --host 0.0.0.0 --port 8000
+
+
+
+(garante que você usa o mesmo Python que instalou o uvicorn)
+
+
+
+
+
+
+B. Adicionar a pasta “Scripts” ao PATH (não recomendado; venv é melhor):
+
+Adicione a pasta mostrada no aviso (ex.: C:\Users\SEUUSER\AppData\Roaming\Python\Python311\Scripts\) ao PATH do Windows, feche e reabra o terminal. Depois uvicorn --version deve funcionar.
+
+
+
+
+
+
+
+Checagens rápidas se ainda falhar
+
+
+
+
+Confirme o arquivo e a pasta:
+
+
+
+Nome do arquivo: server_heuristic.py
+
+
+Comando é executado na mesma pasta do arquivo.
+
+
+
+
+
+
+Confirme o Python do venv:
+
+python -V
+pip -V
+
+
+(devem apontar para .venv\…)
+
+
+Teste import direto:
+
+python -c "import uvicorn, fastapi; print('ok')"
+
+
+
+
+
+
+
+Seguindo os passos do venv acima, o servidor sobe lisinho e seu app já consegue chamar http://<IP_DO_PC>:8000/detect.
+
+
