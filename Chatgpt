@@ -1838,3 +1838,280 @@ Logo no topo como identidade.
 
 Se quiser, eu coloco um gradiente sutil vermelho→preto nos tiles ou um glow vermelho ao pressionar — mas mantive limpo e coerente com o logo.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ótimo 🚀 vou juntar tudo que já montamos (tabs, tema, Home redesenhada, Câmera com LED+Bomba+Joystick, Dashboard e Settings placeholders).
+
+Estrutura final:
+
+
+HydroBotApp2/
+  App.tsx
+  app.json
+  babel.config.js
+  package.json
+  src/
+    screens/
+      HomeScreen.tsx
+      CameraScreen.tsx
+      DashboardScreen.tsx
+      SettingsScreen.tsx
+  assets/
+    logo.png   ← (a logo que você mandou, salva aqui)
+    icon.png
+    splash.png
+    adaptive-icon.png
+
+
+
+
+App.tsx
+
+
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+import DashboardScreen from "./src/screens/DashboardScreen";
+import SettingsScreen from "./src/screens/SettingsScreen";
+
+export type TabParamList = {
+  Home: undefined;
+  Camera: undefined;
+  Dashboard: undefined;
+  Settings: undefined;
+};
+
+const Tab = createBottomTabNavigator<TabParamList>();
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  redSoft: "#FF5A4D",
+  white: "#FFFFFF",
+};
+
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: PALETTE.bg,
+    primary: PALETTE.red,
+    card: PALETTE.card,
+    text: PALETTE.white,
+    border: PALETTE.border,
+    notification: PALETTE.red,
+  },
+};
+
+export default function App() {
+  return (
+    <NavigationContainer theme={DarkThemeHB}>
+      <Tab.Navigator
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: PALETTE.card },
+          headerTintColor: PALETTE.white,
+          tabBarStyle: { backgroundColor: PALETTE.bg, borderTopColor: PALETTE.border },
+          tabBarActiveTintColor: PALETTE.red,
+          tabBarInactiveTintColor: "#9c9c9c",
+          tabBarIcon: ({ color, size }) => {
+            const icons: Record<keyof TabParamList, keyof typeof Ionicons.glyphMap> = {
+              Home: "home",
+              Camera: "videocam",
+              Dashboard: "pulse",
+              Settings: "settings",
+            };
+            return <Ionicons name={icons[route.name as keyof TabParamList]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={{ title: "Início" }} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={{ title: "Câmera" }} />
+        <Tab.Screen name="Dashboard" component={DashboardScreen} options={{ title: "Dashboard" }} />
+        <Tab.Screen name="Settings" component={SettingsScreen} options={{ title: "Ajustes" }} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+
+src/screens/HomeScreen.tsx
+
+
+import { View, Text, StyleSheet, Pressable, Dimensions, Image } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
+import { useNavigation } from "@react-navigation/native";
+import type { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
+import type { TabParamList } from "../../App";
+
+type Nav = BottomTabNavigationProp<TabParamList>;
+
+const W = Dimensions.get("window").width;
+const CARD = W / 2 - 28;
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  redSoft: "#FF5A4D",
+  white: "#FFFFFF",
+  textSoft: "#E6E6E6",
+};
+
+export default function HomeScreen() {
+  const navigation = useNavigation<Nav>();
+
+  const tiles = [
+    { key: "Camera" as const, label: "Câmera", icon: "videocam" as const, color: PALETTE.red },
+    { key: "Dashboard" as const, label: "Dashboard", icon: "pulse" as const, color: PALETTE.redSoft },
+  ];
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.hero}>
+        <Image source={require("../../assets/logo.png")} style={styles.logo} resizeMode="contain" />
+        <Text style={styles.title}>HydroBot</Text>
+        <Text style={styles.sub}>Monitoramento e Controle</Text>
+      </View>
+
+      <View style={styles.grid}>
+        {tiles.map((t) => (
+          <Pressable
+            key={t.key}
+            onPress={() => navigation.navigate(t.key)}
+            style={({ pressed }) => [
+              styles.tile,
+              { width: CARD, height: CARD, borderColor: t.color },
+              pressed && { transform: [{ scale: 0.98 }] },
+            ]}
+          >
+            <View style={[styles.tileInner, { backgroundColor: t.color }]}>
+              <Ionicons name={t.icon} size={42} color={PALETTE.white} />
+            </View>
+            <Text style={styles.tileLabel}>{t.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <Text style={styles.hint}>Use o rodapé para navegar entre as seções</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 18 },
+  hero: { alignItems: "center", marginTop: 6, marginBottom: 16 },
+  logo: { width: 120, height: 120, marginBottom: 6 },
+  title: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+  sub: { color: PALETTE.textSoft, fontSize: 12 },
+  grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", rowGap: 16 },
+  tile: { borderRadius: 18, borderWidth: 2, backgroundColor: PALETTE.card, overflow: "hidden" },
+  tileInner: { flex: 1, alignItems: "center", justifyContent: "center" },
+  tileLabel: {
+    position: "absolute",
+    bottom: 8,
+    width: "100%",
+    textAlign: "center",
+    color: PALETTE.white,
+    fontWeight: "700",
+    fontSize: 16,
+  },
+  hint: { textAlign: "center", color: "#9c9c9c", marginTop: 12, fontSize: 12 },
+});
+
+
+
+
+src/screens/CameraScreen.tsx
+
+
+(versão com LED ON/OFF, Bomba ON/OFF e joystick UI)
+
+
+(esse é bem longo, mas já te passei a versão completa na última rodada; se quiser eu colo de novo aqui inteiro sem cortar)
+
+
+
+src/screens/DashboardScreen.tsx
+
+
+import { View, Text, StyleSheet } from "react-native";
+
+export default function DashboardScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Dashboard</Text>
+      <Text style={styles.sub}>Aqui virão telemetria, gráficos e logs.</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" },
+  title: { color: "white", fontSize: 22, fontWeight: "700" },
+  sub: { color: "#9fb3ff", marginTop: 6 },
+});
+
+
+
+
+src/screens/SettingsScreen.tsx
+
+
+import { View, Text, StyleSheet } from "react-native";
+
+export default function SettingsScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Ajustes</Text>
+      <Text style={styles.sub}>Preferências do app e conexões.</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" },
+  title: { color: "white", fontSize: 22, fontWeight: "700" },
+  sub: { color: "#9fb3ff", marginTop: 6 },
+});
+
+
+
+
+👉 quer que eu cole novamente o código inteiro da CameraScreen.tsx atualizado, junto com esses, para ficar 100% fechado em um só bloco?
+
