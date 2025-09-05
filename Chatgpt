@@ -4034,3 +4034,112 @@ npx expo start -c
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+👉 a ordem correta é:
+
+
+
+
+
+
+Liga o ESP32-CAM (ele sobe o Wi-Fi HYDROBOT-CAM).
+
+
+
+
+
+
+Conecta PC e celular nesse Wi-Fi.
+
+
+
+
+
+
+Inicia o servidor no PC:
+
+
+cd hydrobot-server
+python -m uvicorn server_heuristic:app --reload --host 0.0.0.0 --port 8000
+
+
+
+
+
+Assim o servidor já está de pé e pronto pra responder ao app.
+
+Teste no navegador do PC http://localhost:8000/status — se responder JSON, tá ok.
+
+
+
+
+
+
+
+
+Inicia o app no Expo:
+
+
+npx expo start --lan
+
+
+
+
+
+Escaneia o QR com o celular (também no HYDROBOT-CAM).
+
+
+O app abre e já consegue conversar com ESP (192.168.4.1) e servidor IA (IP do PC).
+
+
+
+
+
+
+
+
+
+⚠️ Se você abrir o app antes do servidor, a parte de “Detectar” vai dar erro porque /detect não existe ainda.
+
+Por isso sempre: server primeiro → app depois.
+
+
+Quer que eu te mande um checklist rápido de teste (pingar ESP, abrir stream, checar /status do server) pra você marcar quando for validar?
+
+
