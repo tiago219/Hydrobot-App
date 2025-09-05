@@ -1200,3 +1200,264 @@ Pronto — o botão BOMBA ON/OFF usa a rota /pump do seu ESP e mantém o estado 
 
 Se quiser, no próximo passo adiciono um controle PWM (slider para /pump_pwm?duty=0..255).
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfeito — vamos deixar o index/Home bonito e adicionar um rodapé com abas (Home, Câmera, Dashboard, Settings).
+
+A navegação passa a usar Bottom Tabs do @react-navigation.
+
+
+
+1) App.tsx (tabs + tema escuro)
+
+
+Substitua o arquivo inteiro:
+
+
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+import DashboardScreen from "./src/screens/DashboardScreen";
+import SettingsScreen from "./src/screens/SettingsScreen";
+
+export type TabParamList = {
+  Home: undefined;
+  Camera: undefined;
+  Dashboard: undefined;
+  Settings: undefined;
+};
+
+const Tab = createBottomTabNavigator<TabParamList>();
+
+// Tema dark do app
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: "#0b1220",
+    primary: "#2b48ff",
+    card: "#111a33",
+    text: "#e5e7ff",
+    border: "#1e2a4d",
+    notification: "#2b48ff",
+  },
+};
+
+export default function App() {
+  return (
+    <NavigationContainer theme={DarkThemeHB}>
+      <Tab.Navigator
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: "#111a33" },
+          headerTintColor: "#fff",
+          tabBarStyle: { backgroundColor: "#0f1730", borderTopColor: "#0f1730" },
+          tabBarActiveTintColor: "#2b48ff",
+          tabBarInactiveTintColor: "#8aa0ff",
+          tabBarIcon: ({ color, size }) => {
+            const icons: Record<keyof TabParamList, keyof typeof Ionicons.glyphMap> = {
+              Home: "home",
+              Camera: "videocam",
+              Dashboard: "pulse",
+              Settings: "settings",
+            };
+            return <Ionicons name={icons[route.name as keyof TabParamList]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={{ title: "Início" }} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={{ title: "Câmera" }} />
+        <Tab.Screen name="Dashboard" component={DashboardScreen} options={{ title: "Dashboard" }} />
+        <Tab.Screen name="Settings" component={SettingsScreen} options={{ title: "Ajustes" }} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+
+2) src/screens/HomeScreen.tsx (hero + CTA)
+
+
+Substitua o arquivo para um layout “hero card” com seu logo e botão para abrir a Câmera (troca para a aba Camera):
+
+
+import { View, Text, StyleSheet, Image, Pressable } from "react-native";
+import { useNavigation } from "@react-navigation/native";
+import type { TabParamList } from "../../App";
+import type { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
+
+type Nav = BottomTabNavigationProp<TabParamList>;
+
+export default function HomeScreen() {
+  const navigation = useNavigation<Nav>();
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.card}>
+        <Image
+          source={require("../../assets/logo.png")} // salve sua imagem como assets/logo.png
+          style={styles.logo}
+          resizeMode="contain"
+        />
+        <Text style={styles.title}>HydroBotApp2</Text>
+        <Text style={styles.subtitle}>Controle o robô • Vídeo • Bomba • LED</Text>
+
+        <Pressable
+          onPress={() => navigation.navigate("Camera")}
+          style={({ pressed }) => [styles.cta, pressed && { opacity: 0.9 }]}
+        >
+          <Text style={styles.ctaText}>Abrir Câmera</Text>
+        </Pressable>
+
+        <View style={styles.linksRow}>
+          <View style={styles.pill}><Text style={styles.pillText}>Dashboard</Text></View>
+          <View style={styles.pill}><Text style={styles.pillText}>Ajustes</Text></View>
+        </View>
+      </View>
+
+      <Text style={styles.footerHint}>Use as abas no rodapé para navegar</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b1220", alignItems: "center", justifyContent: "center", padding: 20 },
+  card: {
+    width: "100%",
+    backgroundColor: "#111a33",
+    borderRadius: 20,
+    padding: 20,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+  },
+  logo: { width: 140, height: 140, marginBottom: 12 },
+  title: { color: "white", fontSize: 24, fontWeight: "800" },
+  subtitle: { color: "#9fb3ff", fontSize: 14, marginTop: 4, textAlign: "center" },
+  cta: {
+    marginTop: 16,
+    backgroundColor: "#2b48ff",
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 22,
+    shadowColor: "#2b48ff",
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  ctaText: { color: "white", fontWeight: "700", fontSize: 16 },
+  linksRow: { flexDirection: "row", gap: 8, marginTop: 16 },
+  pill: { backgroundColor: "#0b1220", borderColor: "#1e2a4d", borderWidth: 1, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
+  pillText: { color: "#cbd5ff", fontSize: 12 },
+  footerHint: { color: "#8aa0ff", marginTop: 14, fontSize: 12 },
+});
+
+
+
+
+
+Coloque a imagem que você enviou como assets/logo.png (PNG com fundo transparente fica top).
+
+
+
+
+
+3) Novas telas “placeholder”
+
+
+src/screens/DashboardScreen.tsx
+
+
+import { View, Text, StyleSheet } from "react-native";
+
+export default function DashboardScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Dashboard</Text>
+      <Text style={styles.sub}>Aqui virão telemetria, gráficos e logs.</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b1220", alignItems: "center", justifyContent: "center" },
+  title: { color: "white", fontSize: 22, fontWeight: "700" },
+  sub: { color: "#9fb3ff", marginTop: 6 },
+});
+
+
+
+src/screens/SettingsScreen.tsx
+
+
+import { View, Text, StyleSheet } from "react-native";
+
+export default function SettingsScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Ajustes</Text>
+      <Text style={styles.sub}>Preferências do app e conexões.</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#0b1220", alignItems: "center", justifyContent: "center" },
+  title: { color: "white", fontSize: 22, fontWeight: "700" },
+  sub: { color: "#9fb3ff", marginTop: 6 },
+});
+
+
+
+
+
+Sua CameraScreen.tsx permanece como fizemos (com LED, Bomba e Joystick UI). Ela já aparece como aba “Câmera”.
+
+
+
+
+
+4) Ícones
+
+
+@expo/vector-icons já vem com Expo; não precisa instalar nada extra.
+
+
+
+Pronto! Você terá:
+
+
+
+
+Home com hero + botão “Abrir Câmera”
+
+
+Rodapé com abas: Home, Câmera, Dashboard, Settings
+
+
+Tema dark consistente com seu logo HB 🔥💧
+
+
+
+
+Se quiser, eu adiciono um badge na aba Câmera quando a conexão com o ESP32 falhar/sucesso, ou coloco labels grandes no tab bar.
+
