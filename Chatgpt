@@ -8690,3 +8690,624 @@ const styles = StyleSheet.create({
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfeito! abaixo estão as três telas atualizadas (Home, Dashboard e Camera) usando o useLanguage() para traduzir labels/placeholder/botões em pt/en/es.
+
+É só substituir os arquivos pelos códigos a seguir.
+
+
+
+src/screens/HomeScreen.tsx
+
+
+import { View, Text, StyleSheet, Pressable, Dimensions, Image } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
+import { useNavigation } from "@react-navigation/native";
+import type { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
+import type { TabParamList } from "../../App";
+import { useLanguage } from "../context/LanguageContext";
+
+type Nav = BottomTabNavigationProp<TabParamList>;
+const W = Dimensions.get("window").width;
+const CARD = W / 2 - 28;
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  redSoft: "#FF5A4D",
+  white: "#FFFFFF",
+  textSoft: "#E6E6E6",
+};
+
+const texts = {
+  pt: { title: "HydroBot", sub: "Monitoramento e Controle", cam: "Câmera", dash: "Dashboard", hint: "Use o rodapé para navegar entre as seções" },
+  en: { title: "HydroBot", sub: "Monitoring & Control", cam: "Camera", dash: "Dashboard", hint: "Use the footer to navigate" },
+  es: { title: "HydroBot", sub: "Monitoreo y Control", cam: "Cámara", dash: "Panel", hint: "Usa el pie para navegar" },
+};
+
+export default function HomeScreen() {
+  const navigation = useNavigation<Nav>();
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  const tiles = [
+    { key: "Camera" as const, label: T.cam, icon: "videocam" as const, color: PALETTE.red },
+    { key: "Dashboard" as const, label: T.dash, icon: "pulse" as const, color: PALETTE.redSoft },
+  ];
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.hero}>
+        <Image source={require("../../assets/logo.png")} style={styles.logo} resizeMode="contain" />
+        <Text style={styles.title}>{T.title}</Text>
+        <Text style={styles.sub}>{T.sub}</Text>
+      </View>
+
+      <View style={styles.grid}>
+        {tiles.map((t) => (
+          <Pressable
+            key={t.key}
+            onPress={() => navigation.navigate(t.key)}
+            style={({ pressed }) => [
+              styles.tile,
+              { width: CARD, height: CARD, borderColor: t.color },
+              pressed && { transform: [{ scale: 0.98 }] },
+            ]}
+          >
+            <View style={[styles.tileInner, { backgroundColor: t.color }]}>
+              <Ionicons name={t.icon} size={42} color={PALETTE.white} />
+            </View>
+            <Text style={styles.tileLabel}>{t.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <Text style={styles.hint}>{T.hint}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 18 },
+  hero: { alignItems: "center", marginTop: 6, marginBottom: 16 },
+  logo: { width: 120, height: 120, marginBottom: 6 },
+  title: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+  sub: { color: PALETTE.textSoft, fontSize: 12 },
+  grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", rowGap: 16 },
+  tile: { borderRadius: 18, borderWidth: 2, backgroundColor: PALETTE.card, overflow: "hidden" },
+  tileInner: { flex: 1, alignItems: "center", justifyContent: "center" },
+  tileLabel: { position: "absolute", bottom: 8, width: "100%", textAlign: "center", color: PALETTE.white, fontWeight: "700", fontSize: 16 },
+  hint: { textAlign: "center", color: "#9c9c9c", marginTop: 12, fontSize: 12 },
+});
+
+
+
+
+src/screens/DashboardScreen.tsx
+
+
+import { useEffect, useState } from "react";
+import {
+  View, Text, StyleSheet, FlatList, Image, Pressable, Alert, TextInput, Modal, TouchableOpacity, SafeAreaView,
+} from "react-native";
+import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#0a0a0a", card: "#121212", border: "#232323", text: "#e5e7eb", sub: "#9ca3af", accent: "#2b48ff", danger: "#ef4444" };
+
+const texts = {
+  pt: {
+    title: "Dashboard",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar agora",
+    saving: "Salvando...",
+    empty1: "Sem eventos ainda.",
+    empty2: "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
+    fire: "Detecção de fogo",
+    clear: "Limpar",
+    confirmClearTitle: "Limpar tudo",
+    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
+    cancel: "Cancelar",
+    delete: "Excluir",
+    confirmDeleteTitle: "Excluir registro",
+    confirmDeleteBody: "Deseja excluir este evento?",
+    fail: "Falha ao salvar",
+    failBody: "Verifique o servidor /snapshot e a rede.",
+  },
+  en: {
+    title: "Dashboard",
+    server: "Server:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Save now",
+    saving: "Saving...",
+    empty1: "No events yet.",
+    empty2: "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
+    fire: "Fire detection",
+    clear: "Clear",
+    confirmClearTitle: "Clear all",
+    confirmClearBody: "This will delete all events and images. Continue?",
+    cancel: "Cancel",
+    delete: "Delete",
+    confirmDeleteTitle: "Delete entry",
+    confirmDeleteBody: "Do you want to delete this event?",
+    fail: "Failed to save",
+    failBody: "Check the /snapshot endpoint and network.",
+  },
+  es: {
+    title: "Panel",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar ahora",
+    saving: "Guardando...",
+    empty1: "Sin eventos aún.",
+    empty2: "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
+    fire: "Detección de fuego",
+    clear: "Limpiar",
+    confirmClearTitle: "Limpiar todo",
+    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
+    cancel: "Cancelar",
+    delete: "Eliminar",
+    confirmDeleteTitle: "Eliminar registro",
+    confirmDeleteBody: "¿Deseas eliminar este evento?",
+    fail: "Error al guardar",
+    failBody: "Revisa /snapshot y la red.",
+  },
+};
+
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+export default function DashboardScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  const [server, setServer] = useState<string>(DEFAULT_SERVER);
+  const [items, setItems] = useState<FireEvent[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [preview, setPreview] = useState<FireEvent | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    setRefreshing(true);
+    try { setItems(await getEvents()); } finally { setRefreshing(false); }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function handleRegisterNow() {
+    try {
+      setBusy(true);
+      const ev = await saveEventFromServer(server);
+      setItems((prev) => [ev, ...prev]);
+    } catch (e) {
+      Alert.alert(T.fail, T.failBody);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmDelete(ev: FireEvent) {
+    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
+      { text: T.cancel, style: "cancel" },
+      { text: T.delete, style: "destructive", onPress: async () => {
+          await deleteEvent(ev.id);
+          setItems((prev) => prev.filter((x) => x.id !== ev.id));
+        }
+      },
+    ]);
+  }
+
+  function confirmClearAll() {
+    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
+      { text: T.cancel, style: "cancel" },
+      { text: T.clear, style: "destructive", onPress: async () => { await clearAllEvents(); setItems([]); } },
+    ]);
+  }
+
+  const renderItem = ({ item }: { item: FireEvent }) => {
+    const dateStr = new Date(item.ts).toLocaleString();
+    return (
+      <Pressable onPress={() => setPreview(item)} style={styles.card}>
+        <Image source={{ uri: item.imageUri }} style={styles.thumb} />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>{T.fire}</Text>
+          <Text style={styles.time}>{dateStr}</Text>
+          <Text style={styles.path} numberOfLines={1}>{item.imageUri}</Text>
+        </View>
+        <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
+          <Text style={styles.trashTxt}>{T.delete}</Text>
+        </Pressable>
+      </Pressable>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>{T.title}</Text>
+        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
+          <Text style={styles.clearAllTxt}>{T.clear}</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholder}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
+          <Text style={styles.btnTxt}>{busy ? T.saving : T.btnSave}</Text>
+        </Pressable>
+      </View>
+
+      <FlatList
+        data={items}
+        keyExtractor={(it) => it.id}
+        renderItem={renderItem}
+        refreshing={refreshing}
+        onRefresh={load}
+        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
+        ListEmptyComponent={
+          <View style={{ alignItems: "center" }}>
+            <Text style={{ color: PALETTE.sub }}>{T.empty1}</Text>
+            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>{T.empty2}</Text>
+          </View>
+        }
+      />
+
+      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
+        <View style={styles.modalBg}>
+          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
+            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
+  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
+  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
+  clearAllTxt: { color: "white", fontWeight: "700" },
+
+  row: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
+  label: { color: PALETTE.sub, fontSize: 12 },
+  input: { backgroundColor: PALETTE.card, color: PALETTE.text, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, borderWidth: 1, borderColor: PALETTE.border, minWidth: 140 },
+  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
+  btnTxt: { color: "white", fontWeight: "700" },
+
+  card: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
+  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
+  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
+  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
+  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
+
+  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
+  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
+
+  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.9)", alignItems: "center", justifyContent: "center" },
+  fullImg: { width: "100%", height: "100%" },
+});
+
+
+
+
+src/screens/CameraScreen.tsx
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+const texts = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor /snapshot.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholder: "http://192.168.4.2:8000",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check HYDROBOT-CAM Wi-Fi and IP.",
+    noVideo: "No video (snapshot). Check /snapshot server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholder: "http://192.168.4.2:8000",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Fallo de conexión. Verifica el Wi-Fi HYDROBOT-CAM y el IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa /snapshot.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholder: "http://192.168.4.2:8000",
+  },
+};
+
+// padrões
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // controle de registro (evitar spam)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // “vídeo” por snapshots do servidor
+  const [frameUri, setFrameUri] = useState<string>("");
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo por snapshots =====
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      if (stop) return;
+      setFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+      setTimeout(tick, 250);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server]);
+
+  // ===== DETECT =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) { setIsFire(!!j.isFire); setFireScore(Number(j.score || 0)); }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 500);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Registro de evento (rising edge) =====
+  useEffect(() => {
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder="192.168.4.1" autoCapitalize="none" autoCorrect={false} style={styles.input} keyboardType="numeric" />
+        <Pressable onPress={pingStatus} style={styles.btn}><Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text></Pressable>
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text></Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text></Pressable>
+      </View>
+
+      {/* Servidor + Detect */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput value={server} onChangeText={setServer} placeholder={T.placeholder} autoCapitalize="none" autoCorrect={false} style={[styles.input, { flex: 1 }]} />
+        <Pressable onPress={() => setDetectOn(v => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>
+            {detectOn ? (saving ? T.saving : T.detecting) : T.detect}
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}
+          </Text>
+        </View>
+      )}
+
+      {/* Vídeo via snapshots */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => { setStatusText(T.noVideo); }}
+      />
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+Pronto! Agora Home, Dashboard e Camera traduzem de acordo com o idioma escolhido em Settings.
+
+Se quiser, posso centralizar os textos num único arquivo src/i18n.ts pra evitar duplicação entre telas.
+
