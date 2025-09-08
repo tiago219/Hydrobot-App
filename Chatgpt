@@ -5945,3 +5945,406 @@ const styles = StyleSheet.create({
   joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
   joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfeito — aqui vai uma implementação completa do Dashboard + um pequeno módulo de persistência para registrar cada evento de fogo com horário exato e screenshot (jpeg) salvo no dispositivo.
+
+
+
+
+Requisitos (se ainda não tiver):
+
+expo install expo-file-system
+
+npm i @react-native-async-storage/async-storage && npx pod-install (no iOS)
+
+
+
+
+
+1) Persistência dos eventos
+
+
+Crie src/storage/fireLog.ts:
+
+
+// src/storage/fireLog.ts
+import * as FileSystem from "expo-file-system";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export type FireEvent = {
+  id: string;       // ex: 2025-09-08T12-34-56.789Z
+  ts: number;       // epoch ms
+  iso: string;      // ISO string
+  imageUri: string; // file://.../fire_events/<id>.jpg
+};
+
+const EVENTS_KEY = "fire_events_index_v1";
+const DIR = FileSystem.documentDirectory + "fire_events/";
+
+async function ensureDir() {
+  const info = await FileSystem.getInfoAsync(DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(DIR, { intermediates: true });
+  }
+}
+
+export async function getEvents(): Promise<FireEvent[]> {
+  const raw = await AsyncStorage.getItem(EVENTS_KEY);
+  const arr: FireEvent[] = raw ? JSON.parse(raw) : [];
+  // mais recente primeiro
+  return arr.sort((a, b) => b.ts - a.ts);
+}
+
+async function saveIndex(list: FireEvent[]) {
+  await AsyncStorage.setItem(EVENTS_KEY, JSON.stringify(list));
+}
+
+export async function deleteEvent(id: string) {
+  const list = await getEvents();
+  const idx = list.findIndex((e) => e.id === id);
+  if (idx >= 0) {
+    const ev = list[idx];
+    // apaga arquivo se existir
+    try {
+      const info = await FileSystem.getInfoAsync(ev.imageUri);
+      if (info.exists) await FileSystem.deleteAsync(ev.imageUri, { idempotent: true });
+    } catch {}
+    list.splice(idx, 1);
+    await saveIndex(list);
+  }
+}
+
+export async function clearAllEvents() {
+  // apaga diretório e índice
+  try {
+    const info = await FileSystem.getInfoAsync(DIR);
+    if (info.exists) await FileSystem.deleteAsync(DIR, { idempotent: true });
+  } catch {}
+  await AsyncStorage.removeItem(EVENTS_KEY);
+  await ensureDir();
+}
+
+/**
+ * Baixa um snapshot do servidor em tempo real e cria um evento.
+ * serverBase deve ser algo como: http://192.168.4.2:8000
+ */
+export async function saveEventFromServer(serverBase: string): Promise<FireEvent> {
+  await ensureDir();
+  // id com formato seguro para filename
+  const now = new Date();
+  const iso = now.toISOString();
+  const id = iso.replace(/[:]/g, "-"); // : não é permitido no Windows
+  const ts = now.getTime();
+
+  const target = `${DIR}${id}.jpg`;
+  const url = `${serverBase.replace(/\/+$/, "")}/snapshot?ts=${ts}`;
+
+  // baixa direto para arquivo (sem base64)
+  await FileSystem.downloadAsync(url, target);
+
+  const ev: FireEvent = { id, ts, iso, imageUri: target };
+  const list = await getEvents();
+  list.push(ev);
+  await saveIndex(list);
+  return ev;
+}
+
+
+
+
+2) Tela do Dashboard
+
+
+Crie src/screens/DashboardScreen.tsx:
+
+
+import { useEffect, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  Image,
+  Pressable,
+  Alert,
+  TextInput,
+  Modal,
+  TouchableOpacity,
+  SafeAreaView,
+} from "react-native";
+import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+
+const PALETTE = { bg: "#0a0a0a", card: "#121212", border: "#232323", text: "#e5e7eb", sub: "#9ca3af", accent: "#2b48ff", danger: "#ef4444", ok: "#16a34a" };
+
+// ajuste o padrão do servidor conforme seu ambiente
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+export default function DashboardScreen() {
+  const [server, setServer] = useState<string>(DEFAULT_SERVER);
+  const [items, setItems] = useState<FireEvent[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [preview, setPreview] = useState<FireEvent | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    setRefreshing(true);
+    try {
+      const list = await getEvents();
+      setItems(list);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function handleRegisterNow() {
+    try {
+      setBusy(true);
+      const ev = await saveEventFromServer(server);
+      setItems((prev) => [ev, ...prev]); // insere no topo
+    } catch (e) {
+      Alert.alert("Falha ao salvar", "Verifique o servidor /snapshot e a rede.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmDelete(ev: FireEvent) {
+    Alert.alert("Excluir registro", "Deseja excluir este evento?", [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Excluir",
+        style: "destructive",
+        onPress: async () => {
+          await deleteEvent(ev.id);
+          setItems((prev) => prev.filter((x) => x.id !== ev.id));
+        },
+      },
+    ]);
+  }
+
+  function confirmClearAll() {
+    Alert.alert("Limpar tudo", "Isso apagará todos os eventos e imagens. Continuar?", [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Apagar tudo",
+        style: "destructive",
+        onPress: async () => {
+          await clearAllEvents();
+          setItems([]);
+        },
+      },
+    ]);
+  }
+
+  const renderItem = ({ item }: { item: FireEvent }) => {
+    const dateStr = new Date(item.ts).toLocaleString();
+    return (
+      <Pressable onPress={() => setPreview(item)} style={styles.card}>
+        <Image source={{ uri: item.imageUri }} style={styles.thumb} />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>Detecção de fogo</Text>
+          <Text style={styles.time}>{dateStr}</Text>
+          <Text style={styles.path} numberOfLines={1}>{item.imageUri}</Text>
+        </View>
+        <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
+          <Text style={styles.trashTxt}>Excluir</Text>
+        </Pressable>
+      </Pressable>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      {/* Header / controles */}
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>Dashboard</Text>
+        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
+          <Text style={styles.clearAllTxt}>Limpar</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha de servidor + registrar agora */}
+      <View style={styles.row}>
+        <Text style={styles.label}>Servidor:</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder="http://192.168.4.2:8000"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
+          <Text style={styles.btnTxt}>{busy ? "Salvando..." : "Registrar agora"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Lista */}
+      <FlatList
+        data={items}
+        keyExtractor={(it) => it.id}
+        renderItem={renderItem}
+        refreshing={refreshing}
+        onRefresh={load}
+        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
+        ListEmptyComponent={
+          <View style={{ alignItems: "center" }}>
+            <Text style={{ color: PALETTE.sub }}>Sem eventos ainda.</Text>
+            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>
+              Quando o detector sinalizar fogo, capturemos o snapshot automaticamente.{'\n'}
+              Você também pode tocar “Registrar agora”.
+            </Text>
+          </View>
+        }
+      />
+
+      {/* Preview em tela cheia */}
+      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
+        <View style={styles.modalBg}>
+          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
+            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+  },
+  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
+  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
+  clearAllTxt: { color: "white", fontWeight: "700" },
+
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+  },
+  label: { color: PALETTE.sub, fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.card,
+    color: PALETTE.text,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    minWidth: 140,
+  },
+  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
+  btnTxt: { color: "white", fontWeight: "700" },
+
+  card: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+  },
+  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
+  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
+  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
+  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
+
+  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
+  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
+
+  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.9)", alignItems: "center", justifyContent: "center" },
+  fullImg: { width: "100%", height: "100%" },
+});
+
+
+
+
+3) Como integrar com a detecção da Câmera (automático)
+
+
+Na sua CameraScreen.tsx, quando o score cruzar o limiar (ou isFire mudar de false → true), chame:
+
+
+import { saveEventFromServer } from "../storage/fireLog";
+
+// ...
+const [wasFire, setWasFire] = useState(false);
+
+useEffect(() => {
+  if (detectOn && isFire && !wasFire) {
+    // registra e evita spam (ex.: só 1 vez por surto)
+    saveEventFromServer(server).catch(() => {});
+  }
+  setWasFire(isFire);
+}, [detectOn, isFire, server]);
+
+
+
+
+
+Isso vai baixar o /snapshot no momento da detecção e guardar no disco + índice.
+
+O Dashboard automaticamente listará o novo evento (se você chamar load() via pull-to-refresh ou usando um event emitter — posso adicionar depois).
+
+
+
+
+Se quiser, eu já deixo o CameraScreen chamando e envio a versão pronta com esse useEffect.
+
