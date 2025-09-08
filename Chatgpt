@@ -7348,3 +7348,205 @@ Abra a tela Dashboard (se você já criou) para ver a lista; se ainda não, poss
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Perfeito 🚀
+
+Aqui está a tela Settings básica, com suporte a espanhol, inglês e português.
+
+Usei AsyncStorage para gravar a escolha e um LanguageContext simples para permitir que todo o app use essa configuração depois (quando você quiser traduzir mais textos).
+
+
+
+1) Crie um src/context/LanguageContext.tsx
+
+
+import React, { createContext, useContext, useEffect, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+type Lang = "pt" | "en" | "es";
+
+type LanguageContextType = {
+  lang: Lang;
+  setLang: (l: Lang) => void;
+};
+
+const LanguageContext = createContext<LanguageContextType>({
+  lang: "en",
+  setLang: () => {},
+});
+
+export const useLanguage = () => useContext(LanguageContext);
+
+const STORAGE_KEY = "app_language";
+
+export function LanguageProvider({ children }: { children: React.ReactNode }) {
+  const [lang, setLangState] = useState<Lang>("en");
+
+  useEffect(() => {
+    (async () => {
+      const saved = await AsyncStorage.getItem(STORAGE_KEY);
+      if (saved === "pt" || saved === "es" || saved === "en") {
+        setLangState(saved);
+      }
+    })();
+  }, []);
+
+  function setLang(l: Lang) {
+    setLangState(l);
+    AsyncStorage.setItem(STORAGE_KEY, l);
+  }
+
+  return (
+    <LanguageContext.Provider value={{ lang, setLang }}>
+      {children}
+    </LanguageContext.Provider>
+  );
+}
+
+
+
+No App.tsx (nível raiz), envolva seu app com o LanguageProvider:
+
+
+import { LanguageProvider } from "./src/context/LanguageContext";
+
+export default function App() {
+  return (
+    <LanguageProvider>
+      {/* seu NavigationContainer / Tabs */}
+    </LanguageProvider>
+  );
+}
+
+
+
+
+2) Tela Settings (src/screens/SettingsScreen.tsx)
+
+
+import { View, Text, StyleSheet, Pressable } from "react-native";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#0a0a0a", card: "#121212", border: "#232323", text: "#e5e7eb", accent: "#2b48ff" };
+
+export default function SettingsScreen() {
+  const { lang, setLang } = useLanguage();
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>
+        {lang === "pt" ? "Configurações" : lang === "es" ? "Configuraciones" : "Settings"}
+      </Text>
+
+      <Text style={styles.label}>
+        {lang === "pt" ? "Idioma do aplicativo:" : lang === "es" ? "Idioma de la aplicación:" : "App language:"}
+      </Text>
+
+      <View style={styles.row}>
+        <Pressable
+          onPress={() => setLang("pt")}
+          style={[styles.btn, lang === "pt" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>Português</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => setLang("en")}
+          style={[styles.btn, lang === "en" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>English</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => setLang("es")}
+          style={[styles.btn, lang === "es" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>Español</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 20 },
+  title: { color: PALETTE.text, fontSize: 22, fontWeight: "700", marginBottom: 20 },
+  label: { color: PALETTE.text, marginBottom: 12 },
+  row: { flexDirection: "row", gap: 12 },
+  btn: {
+    backgroundColor: PALETTE.card,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+  },
+  btnActive: { backgroundColor: PALETTE.accent, borderColor: PALETTE.accent },
+  btnText: { color: "white", fontWeight: "600" },
+});
+
+
+
+
+Como funciona
+
+
+
+
+A língua escolhida fica salva no AsyncStorage.
+
+
+Ao abrir o app de novo, a preferência é carregada.
+
+
+Você pode usar const { lang } = useLanguage() em qualquer tela e mudar o texto conforme o idioma.
+
+
+
+
+
+Quer que eu já adapte o Dashboard e a Camera pra mostrarem seus labels (ex: “Detectar”, “Bomba”, “Configurações”) nos três idiomas usando esse lang?
+
