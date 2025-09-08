@@ -24,6 +24,486 @@ LED indicador: realocado para pino seguro.
 
 
 
+perfeito! abaixo está o CameraScreen.tsx completo já com a lógica de registrar evento sempre que o fogo for detectado (borda de subida), salvando horário exato e screenshot via server/snapshot.
+
+Incluí um cooldown de 5s pra evitar spam enquanto o fogo permanece contínuo.
+
+
+
+
+Requisitos (se ainda não instalou):
+
+
+
+
+expo install expo-file-system
+
+
+npm i @react-native-async-storage/async-storage && npx pod-install (no iOS)
+
+
+crie também o arquivo src/storage/fireLog.ts (segue no final)
+
+
+
+
+
+
+
+src/screens/CameraScreen.tsx (com persistência de eventos)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
+  Image,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+// ajuste estes padrões se quiser
+const DEFAULT_IP = "192.168.4.1";                // ESP32-CAM (AP)
+const DEFAULT_SERVER = "http://192.168.4.2:8000"; // Servidor IA (PC no mesmo AP)
+
+export default function CameraScreen() {
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // controle de registro (evitar spam)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000; // 5s entre registros
+
+  // “vídeo” por snapshots do servidor
+  const [frameUri, setFrameUri] = useState<string>("");
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // consulta /status do ESP
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(
+        `OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`
+      );
+    } catch {
+      setStatusText("Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.");
+    } finally {
+      setIsChecking(false);
+    }
+  }
+
+  async function toggleLed() {
+    try {
+      const t = !ledOn;
+      await fetch(ledUrl(t));
+      setLedOn(t);
+    } catch {
+      setStatusText("Erro ao alternar LED.");
+    }
+  }
+
+  async function togglePump() {
+    try {
+      const t = !pumpOn;
+      await fetch(pumpUrl(t));
+      setPumpOn(t);
+    } catch {
+      setStatusText("Erro ao alternar bomba.");
+    }
+  }
+
+  // ping periódico de status do ESP
+  useEffect(() => {
+    pingStatus();
+    const id = setInterval(pingStatus, 5000);
+    return () => clearInterval(id);
+  }, [statusUrl]);
+
+  // ===== Vídeo por snapshots do servidor =====
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      if (stop) return;
+      // cache-buster (?ts=) para evitar cache da Image
+      setFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+      setTimeout(tick, 250); // ~4 fps; ajuste conforme sua máquina/rede
+    };
+    tick();
+    return () => {
+      stop = true;
+    };
+  }, [server]);
+
+  // polling de /detect do servidor de IA
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false);
+          setFireScore(0);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 500); // ~2 Hz
+      }
+    };
+    loop();
+    return () => {
+      stop = true;
+    };
+  }, [detectOn, server]);
+
+  // ===== Registro automático de evento (quando fogo detectado) =====
+  useEffect(() => {
+    // borda de subida: false -> true
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          // feedback no status
+          const ts = new Date(lastSaveRef.current).toLocaleString();
+          setStatusText(`Evento salvo em ${ts}`);
+        } catch {
+          setStatusText("Falha ao salvar evento (snapshot). Verifique o servidor.");
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving]);
+
+  // joystick (UI)
+  const RADIUS = 64;
+  const KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS;
+        let ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny);
+        if (len > 1) {
+          nx /= len;
+          ny /= len;
+        }
+        setJoy({ x: nx, y: -ny }); // y positivo para cima
+      },
+      onPanResponderRelease: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+      onPanResponderTerminate: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS;
+  const knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>ESP IP:</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="192.168.4.1"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : "Testar"}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? "LED ON" : "LED OFF"}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? "BOMBA ON" : "BOMBA OFF"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>Servidor:</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder="http://192.168.4.2:8000"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? "Salvando..." : "Detectando") : "Detectar"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>
+          {statusText}
+        </Text>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? `🔥 FOGO • score ${fireScore.toFixed(2)}` : `Sem fogo • score ${fireScore.toFixed(2)}`}
+          </Text>
+        </View>
+      )}
+
+      {/* “Vídeo” via snapshots do servidor */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => {
+          setStatusText("Sem vídeo (snapshot). Verifique o servidor /snapshot.");
+        }}
+      />
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2,
+                height: KNOB_R * 2,
+                borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>
+            x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}
+          </Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.bg,
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  // vídeo por snapshots
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+src/storage/fireLog.ts (mesmo do passo anterior)
+
+
+import * as FileSystem from "expo-file-system";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export type FireEvent = {
+  id: string;       // ex: 2025-09-08T12-34-56.789Z
+  ts: number;       // epoch ms
+  iso: string;      // ISO string
+  imageUri: string; // file://.../fire_events/<id>.jpg
+};
+
+const EVENTS_KEY = "fire_events_index_v1";
+const DIR = FileSystem.documentDirectory + "fire_events/";
+
+async function ensureDir() {
+  const info = await FileSystem.getInfoAsync(DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(DIR, { intermediates: true });
+  }
+}
+
+export async function getEvents(): Promise<FireEvent[]> {
+  const raw = await AsyncStorage.getItem(EVENTS_KEY);
+  const arr: FireEvent[] = raw ? JSON.parse(raw) : [];
+  return arr.sort((a, b) => b.ts - a.ts);
+}
+
+async function saveIndex(list: FireEvent[]) {
+  await AsyncStorage.setItem(EVENTS_KEY, JSON.stringify(list));
+}
+
+export async function deleteEvent(id: string) {
+  const list = await getEvents();
+  const idx = list.findIndex((e) => e.id === id);
+  if (idx >= 0) {
+    const ev = list[idx];
+    try {
+      const info = await FileSystem.getInfoAsync(ev.imageUri);
+      if (info.exists) await FileSystem.deleteAsync(ev.imageUri, { idempotent: true });
+    } catch {}
+    list.splice(idx, 1);
+    await saveIndex(list);
+  }
+}
+
+export async function clearAllEvents() {
+  try {
+    const info = await FileSystem.getInfoAsync(DIR);
+    if (info.exists) await FileSystem.deleteAsync(DIR, { idempotent: true });
+  } catch {}
+  await AsyncStorage.removeItem(EVENTS_KEY);
+  await ensureDir();
+}
+
+/** Baixa um snapshot e registra o evento localmente. */
+export async function saveEventFromServer(serverBase: string): Promise<FireEvent> {
+  await ensureDir();
+  const now = new Date();
+  const iso = now.toISOString();
+  const id = iso.replace(/[:]/g, "-");
+  const ts = now.getTime();
+
+  const target = `${DIR}${id}.jpg`;
+  const url = `${serverBase.replace(/\/+$/, "")}/snapshot?ts=${ts}`;
+
+  await FileSystem.downloadAsync(url, target);
+
+  const ev: FireEvent = { id, ts, iso, imageUri: target };
+  const list = await getEvents();
+  list.push(ev);
+  await saveIndex(list);
+  return ev;
+}
+
+
+
+
+Como validar
+
+
+
+
+Inicie o servidor (/detect e /snapshot).
+
+
+No app, Detectar ligado.
+
+
+Quando o banner mostrar 🔥 FOGO, o app salva o snapshot e o horário (1 registro a cada ≥5s).
+
+
+Abra a tela Dashboard (se você já criou) para ver a lista; se ainda não, posso te enviar a tela pronta.
+
+
+
 
 
 ⚠️ Observações importantes
@@ -6347,4 +6827,524 @@ O Dashboard automaticamente listará o novo evento (se você chamar load() via p
 
 
 Se quiser, eu já deixo o CameraScreen chamando e envio a versão pronta com esse useEffect.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+perfeito! abaixo está o CameraScreen.tsx completo já com a lógica de registrar evento sempre que o fogo for detectado (borda de subida), salvando horário exato e screenshot via server/snapshot.
+
+Incluí um cooldown de 5s pra evitar spam enquanto o fogo permanece contínuo.
+
+
+
+
+Requisitos (se ainda não instalou):
+
+
+
+
+expo install expo-file-system
+
+
+npm i @react-native-async-storage/async-storage && npx pod-install (no iOS)
+
+
+crie também o arquivo src/storage/fireLog.ts (segue no final)
+
+
+
+
+
+
+
+src/screens/CameraScreen.tsx (com persistência de eventos)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
+  Image,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+// ajuste estes padrões se quiser
+const DEFAULT_IP = "192.168.4.1";                // ESP32-CAM (AP)
+const DEFAULT_SERVER = "http://192.168.4.2:8000"; // Servidor IA (PC no mesmo AP)
+
+export default function CameraScreen() {
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // controle de registro (evitar spam)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000; // 5s entre registros
+
+  // “vídeo” por snapshots do servidor
+  const [frameUri, setFrameUri] = useState<string>("");
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // consulta /status do ESP
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(
+        `OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`
+      );
+    } catch {
+      setStatusText("Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.");
+    } finally {
+      setIsChecking(false);
+    }
+  }
+
+  async function toggleLed() {
+    try {
+      const t = !ledOn;
+      await fetch(ledUrl(t));
+      setLedOn(t);
+    } catch {
+      setStatusText("Erro ao alternar LED.");
+    }
+  }
+
+  async function togglePump() {
+    try {
+      const t = !pumpOn;
+      await fetch(pumpUrl(t));
+      setPumpOn(t);
+    } catch {
+      setStatusText("Erro ao alternar bomba.");
+    }
+  }
+
+  // ping periódico de status do ESP
+  useEffect(() => {
+    pingStatus();
+    const id = setInterval(pingStatus, 5000);
+    return () => clearInterval(id);
+  }, [statusUrl]);
+
+  // ===== Vídeo por snapshots do servidor =====
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      if (stop) return;
+      // cache-buster (?ts=) para evitar cache da Image
+      setFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+      setTimeout(tick, 250); // ~4 fps; ajuste conforme sua máquina/rede
+    };
+    tick();
+    return () => {
+      stop = true;
+    };
+  }, [server]);
+
+  // polling de /detect do servidor de IA
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false);
+          setFireScore(0);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 500); // ~2 Hz
+      }
+    };
+    loop();
+    return () => {
+      stop = true;
+    };
+  }, [detectOn, server]);
+
+  // ===== Registro automático de evento (quando fogo detectado) =====
+  useEffect(() => {
+    // borda de subida: false -> true
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          // feedback no status
+          const ts = new Date(lastSaveRef.current).toLocaleString();
+          setStatusText(`Evento salvo em ${ts}`);
+        } catch {
+          setStatusText("Falha ao salvar evento (snapshot). Verifique o servidor.");
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving]);
+
+  // joystick (UI)
+  const RADIUS = 64;
+  const KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS;
+        let ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny);
+        if (len > 1) {
+          nx /= len;
+          ny /= len;
+        }
+        setJoy({ x: nx, y: -ny }); // y positivo para cima
+      },
+      onPanResponderRelease: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+      onPanResponderTerminate: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS;
+  const knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>ESP IP:</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="192.168.4.1"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : "Testar"}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? "LED ON" : "LED OFF"}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? "BOMBA ON" : "BOMBA OFF"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>Servidor:</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder="http://192.168.4.2:8000"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? "Salvando..." : "Detectando") : "Detectar"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>
+          {statusText}
+        </Text>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? `🔥 FOGO • score ${fireScore.toFixed(2)}` : `Sem fogo • score ${fireScore.toFixed(2)}`}
+          </Text>
+        </View>
+      )}
+
+      {/* “Vídeo” via snapshots do servidor */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => {
+          setStatusText("Sem vídeo (snapshot). Verifique o servidor /snapshot.");
+        }}
+      />
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2,
+                height: KNOB_R * 2,
+                borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>
+            x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}
+          </Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.bg,
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  // vídeo por snapshots
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+src/storage/fireLog.ts (mesmo do passo anterior)
+
+
+import * as FileSystem from "expo-file-system";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export type FireEvent = {
+  id: string;       // ex: 2025-09-08T12-34-56.789Z
+  ts: number;       // epoch ms
+  iso: string;      // ISO string
+  imageUri: string; // file://.../fire_events/<id>.jpg
+};
+
+const EVENTS_KEY = "fire_events_index_v1";
+const DIR = FileSystem.documentDirectory + "fire_events/";
+
+async function ensureDir() {
+  const info = await FileSystem.getInfoAsync(DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(DIR, { intermediates: true });
+  }
+}
+
+export async function getEvents(): Promise<FireEvent[]> {
+  const raw = await AsyncStorage.getItem(EVENTS_KEY);
+  const arr: FireEvent[] = raw ? JSON.parse(raw) : [];
+  return arr.sort((a, b) => b.ts - a.ts);
+}
+
+async function saveIndex(list: FireEvent[]) {
+  await AsyncStorage.setItem(EVENTS_KEY, JSON.stringify(list));
+}
+
+export async function deleteEvent(id: string) {
+  const list = await getEvents();
+  const idx = list.findIndex((e) => e.id === id);
+  if (idx >= 0) {
+    const ev = list[idx];
+    try {
+      const info = await FileSystem.getInfoAsync(ev.imageUri);
+      if (info.exists) await FileSystem.deleteAsync(ev.imageUri, { idempotent: true });
+    } catch {}
+    list.splice(idx, 1);
+    await saveIndex(list);
+  }
+}
+
+export async function clearAllEvents() {
+  try {
+    const info = await FileSystem.getInfoAsync(DIR);
+    if (info.exists) await FileSystem.deleteAsync(DIR, { idempotent: true });
+  } catch {}
+  await AsyncStorage.removeItem(EVENTS_KEY);
+  await ensureDir();
+}
+
+/** Baixa um snapshot e registra o evento localmente. */
+export async function saveEventFromServer(serverBase: string): Promise<FireEvent> {
+  await ensureDir();
+  const now = new Date();
+  const iso = now.toISOString();
+  const id = iso.replace(/[:]/g, "-");
+  const ts = now.getTime();
+
+  const target = `${DIR}${id}.jpg`;
+  const url = `${serverBase.replace(/\/+$/, "")}/snapshot?ts=${ts}`;
+
+  await FileSystem.downloadAsync(url, target);
+
+  const ev: FireEvent = { id, ts, iso, imageUri: target };
+  const list = await getEvents();
+  list.push(ev);
+  await saveIndex(list);
+  return ev;
+}
+
+
+
+
+Como validar
+
+
+
+
+Inicie o servidor (/detect e /snapshot).
+
+
+No app, Detectar ligado.
+
+
+Quando o banner mostrar 🔥 FOGO, o app salva o snapshot e o horário (1 registro a cada ≥5s).
+
+
+Abra a tela Dashboard (se você já criou) para ver a lista; se ainda não, posso te enviar a tela pronta.
+
+
+
 
