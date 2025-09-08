@@ -7827,3 +7827,180 @@ Pronto! Agora quando você trocar o idioma em Settings, os nomes das abas e tít
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Boa notícia: isso é só cache/opções estáticas do React Navigation. Se as options forem objetos fixos, elas não reagem ao lang. Existem duas formas simples de corrigir:
+
+
+
+
+Forçar o re-render do TabNavigator quando o idioma muda (key={lang}), e
+
+
+Definir options como função (para cada Tab.Screen) que usa o lang atual.
+
+
+
+
+Aqui vai seu App.tsx já ajustado — é só colar:
+
+
+import React from "react";
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+import DashboardScreen from "./src/screens/DashboardScreen";
+import SettingsScreen from "./src/screens/SettingsScreen";
+
+import { LanguageProvider, useLanguage } from "./src/context/LanguageContext";
+
+export type TabParamList = {
+  Home: undefined;
+  Camera: undefined;
+  Dashboard: undefined;
+  Settings: undefined;
+};
+
+const Tab = createBottomTabNavigator<TabParamList>();
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  redSoft: "#FF5A4D",
+  white: "#FFFFFF",
+};
+
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: PALETTE.bg,
+    primary: PALETTE.red,
+    card: PALETTE.card,
+    text: PALETTE.white,
+    border: PALETTE.border,
+    notification: PALETTE.red,
+  },
+};
+
+// Traduções simples
+const labels = {
+  pt: { home: "Início", camera: "Câmera", dashboard: "Dashboard", settings: "Ajustes" },
+  en: { home: "Home", camera: "Camera", dashboard: "Dashboard", settings: "Settings" },
+  es: { home: "Inicio", camera: "Cámara", dashboard: "Panel", settings: "Ajustes" },
+};
+
+function AppNavigator() {
+  const { lang } = useLanguage();
+  const L = labels[lang];
+
+  return (
+    <NavigationContainer theme={DarkThemeHB}>
+      {/* key={lang} força o TabNavigator a reconfigurar rótulos/títulos ao mudar o idioma */}
+      <Tab.Navigator
+        key={lang}
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: PALETTE.card },
+          headerTintColor: PALETTE.white,
+          tabBarStyle: { backgroundColor: PALETTE.bg, borderTopColor: PALETTE.border },
+          tabBarActiveTintColor: PALETTE.red,
+          tabBarInactiveTintColor: "#9c9c9c",
+          tabBarIcon: ({ color, size }) => {
+            const icons: Record<keyof TabParamList, keyof typeof Ionicons.glyphMap> = {
+              Home: "home",
+              Camera: "videocam",
+              Dashboard: "pulse",
+              Settings: "settings",
+            };
+            return <Ionicons name={icons[route.name as keyof TabParamList]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen
+          name="Home"
+          component={HomeScreen}
+          // options como FUNÇÃO, para recomputar com L atualizado
+          options={() => ({ title: L.home, tabBarLabel: L.home })}
+        />
+        <Tab.Screen
+          name="Camera"
+          component={CameraScreen}
+          options={() => ({ title: L.camera, tabBarLabel: L.camera })}
+        />
+        <Tab.Screen
+          name="Dashboard"
+          component={DashboardScreen}
+          options={() => ({ title: L.dashboard, tabBarLabel: L.dashboard })}
+        />
+        <Tab.Screen
+          name="Settings"
+          component={SettingsScreen}
+          options={() => ({ title: L.settings, tabBarLabel: L.settings })}
+        />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+export default function App() {
+  return (
+    <LanguageProvider>
+      <AppNavigator />
+    </LanguageProvider>
+  );
+}
+
+
+
+Observações rápidas
+
+
+
+
+Com key={lang} e options={() => ({ ... })}, a troca de idioma reflete imediatamente nos títulos/labels das abas.
+
+
+Para os textos dentro das telas (botões, rótulos, etc.), use const { lang } = useLanguage() em cada tela e renderize com base no lang — se quiser, te ajudo a internacionalizar Camera/Dashboard rapidinho.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
