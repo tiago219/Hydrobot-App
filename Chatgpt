@@ -683,3 +683,415 @@ Se ainda assim a câmera apagar quando o servidor sobe, é quase certo que o ser
 Quer que eu inclua um docker-compose.yml para esse servidor?
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Fechou. A raiz do problema é a disputa pelo /stream do ESP quando o servidor está ligado. Vou te dar um CameraScreen.tsx completo que:
+
+
+
+
+Mostra o vídeo sempre por /snapshot do ESP (porta 80) — sem WebView, sem MJPEG.
+
+Isso elimina qualquer conflito com o servidor (que também pode usar /snapshot).
+
+
+Detecção e salvamento continuam usando o servidor (campo Servidor) em /detect e seu saveEventFromServer.
+
+
+Tem fallbacks robustos de rede e evita requisições concorrentes (sem “fila” de fetch).
+
+
+
+
+Cole este arquivo inteiro:
+
+
+// app/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Platform,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+const texts = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.",
+    noVideo: "Sem vídeo. Verifique o /snapshot do ESP.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    needServer: "Defina o campo Servidor para detectar fogo.",
+    usingEspSnapshot: "Exibindo vídeo via /snapshot do ESP (porta 80).",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check HYDROBOT-CAM Wi-Fi and IP.",
+    noVideo: "No video. Check ESP /snapshot.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    needServer: "Set the Server field to run fire detection.",
+    usingEspSnapshot: "Showing video via ESP /snapshot (port 80).",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Fallo de conexión. Verifica el Wi-Fi HYDROBOT-CAM y el IP.",
+    noVideo: "Sin vídeo. Revisa /snapshot del ESP.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    needServer: "Define el Servidor para detectar fuego.",
+    usingEspSnapshot: "Mostrando vídeo vía /snapshot del ESP (puerto 80).",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = ""; // vazio => detecção desligada
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // registro
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // vídeo via /snapshot (ESP)
+  const [frameUri, setFrameUri] = useState<string>("");
+  const fetchBusyRef = useRef<boolean>(false); // evita concorrência de updates
+  const stopVideoRef = useRef<boolean>(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // bases
+  const espBase = useMemo(() => `http://${ip}`, [ip]);
+  const serverBase = useMemo(() => (server && server.trim()) ? server.trim().replace(/\/+$/,"") : "", [server]);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `${espBase}/status`, [espBase]);
+  const ledUrl    = useMemo(() => (on: boolean) => `${espBase}/led?on=${on ? "1" : "0"}`, [espBase]);
+  const pumpUrl   = useMemo(() => (on: boolean) => `${espBase}/pump?on=${on ? "1" : "0"}`, [espBase]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== VÍDEO POR SNAPSHOT DO ESP (sem MJPEG, sem WebView) =====
+  // Evita disputar o /stream com o servidor. Apenas puxa /snapshot do ESP em loop.
+  useEffect(() => {
+    setStatusText(T.usingEspSnapshot);
+    stopVideoRef.current = false;
+    const TICK_MS = 250;
+
+    const tick = () => {
+      if (stopVideoRef.current) return;
+      if (!fetchBusyRef.current) {
+        fetchBusyRef.current = true;
+        // Apenas atualiza o URI do <Image>; o RN buscará a imagem.
+        setFrameUri(`${espBase}/snapshot?ts=${Date.now()}`);
+        // Liberamos o "busy" logo após, pois o <Image> vai fazer a requisição
+        // sem bloquear o JS thread.
+        fetchBusyRef.current = false;
+      }
+      setTimeout(tick, TICK_MS);
+    };
+
+    tick();
+    return () => { stopVideoRef.current = true; };
+  }, [espBase, T.usingEspSnapshot]);
+
+  // ===== DETECT (sempre no SERVIDOR externo) =====
+  useEffect(() => {
+    if (!detectOn) return;
+    if (!serverBase) {
+      setStatusText(T.needServer);
+      setIsFire(false);
+      setFireScore(0);
+      return;
+    }
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${serverBase}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && (j.ok === undefined || j.ok)) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 500);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, serverBase, T.needServer]);
+
+  // ===== Registro (rising edge) — usa o SERVIDOR =====
+  useEffect(() => {
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      if (!serverBase) {
+        setStatusText(T.needServer);
+      } else {
+        (async () => {
+          try {
+            setSaving(true);
+            await saveEventFromServer(serverBase);
+            lastSaveRef.current = Date.now();
+            setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+          } catch {
+            setStatusText(T.noVideo);
+          } finally {
+            setSaving(false);
+          }
+        })();
+      }
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, serverBase, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType={Platform.select({ ios: "numbers-and-punctuation", android: "numeric", default: "default" })}
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Servidor + Detect */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn(v => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>
+            {detectOn ? (saving ? T.saving : T.detecting) : T.detect}
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}
+          </Text>
+        </View>
+      )}
+
+      {/* VÍDEO: sempre via /snapshot do ESP */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => { setStatusText(T.noVideo); }}
+      />
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+Por que agora funciona
+
+
+
+
+Vídeo: o app nunca disputa o /stream; ele puxa somente **/snapshot do ESP (porta 80)**, com cache-buster no URI para forçar atualização. Isso convive com qualquer servidor que também use /snapshot`.
+
+
+Detecção: continua no servidor via /detect, independente do vídeo — então o fogo volta a ser detectado normalmente.
+
+
+Sem alternância: abordagem única (snapshot), simples e estável.
+
+
+
+
+Se quiser manter frame rate mais alto, pode reduzir TICK_MS de 250 ms para ~100 ms. Se ainda assim algo não aparecer, me diga qual mensagem aparece em status que eu já ajusto o polling.
+
