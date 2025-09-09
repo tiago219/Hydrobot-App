@@ -380,3 +380,306 @@ void loop() {
   server.handleClient();
   delay(10);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Perfeito — o que está travando é o servidor disputando o /stream do ESP.
+
+A solução é não abrir o /stream no servidor. Em vez disso, o servidor deve buscar 1 frame via /snapshot do ESP (porta 80) a cada chamada de /detect (e de /snapshot do próprio servidor). Assim:
+
+
+
+
+O app continua exatamente como está (WebView em :81/stream, sem mudar nada).
+
+
+O servidor não segura conexão nenhuma no :81/stream; ele só “belisca” uma foto no :80/snapshot quando preciso.
+
+
+Para evitar carga, o servidor faz cache de 200 ms do último snapshot (throttle), então mesmo que o app peça /detect a cada 500 ms, o ESP não é sobrecarregado.
+
+
+
+
+Abaixo o server_heuristic.py completo refeito para esse fluxo (sem tocar no app):
+
+
+# server_heuristic.py
+# FastAPI + OpenCV + requests
+# NÃO abre o :81/stream do ESP. Apenas consome /snapshot (porta 80) por demanda,
+# com cache de 200 ms para reduzir carga.
+
+import time
+import threading
+from typing import Optional, List
+
+import cv2
+import numpy as np
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ================== CONFIG ==================
+CAMERA_IP = "192.168.4.1"       # IP do ESP32-CAM (AP HYDROBOT-CAM)
+ESP_SNAPSHOT = "http://{ip}/snapshot"   # JPEG único (porta 80)
+SCORE_THRESHOLD = 0.60
+
+HTTP_TIMEOUT = 2.0              # segundos para GET no /snapshot do ESP
+CACHE_WINDOW_S = 0.20           # 200 ms: throttling de snapshot
+JPEG_QUALITY = 85               # qualidade para re-encode em /snapshot
+
+# ================== APP ==================
+app = FastAPI(title="HydroBot Fire (Heuristic via ESP /snapshot)", version="0.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ============ Snapshot Cache ============
+_last_jpeg: Optional[bytes] = None
+_last_frame: Optional[np.ndarray] = None  # BGR
+_last_ts: float = 0.0
+_lock = threading.Lock()
+
+def _fetch_snapshot_from_esp(ip: str) -> Optional[bytes]:
+    """Busca JPEG do ESP via /snapshot (porta 80)."""
+    url = ESP_SNAPSHOT.format(ip=ip)
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
+            return r.content
+    except Exception:
+        pass
+    return None
+
+def _get_snapshot_bytes(ip: str) -> Optional[bytes]:
+    """Throttle com cache de 200 ms para não sobrecarregar o ESP."""
+    global _last_jpeg, _last_ts
+    now = time.time()
+    with _lock:
+        if (now - _last_ts) < CACHE_WINDOW_S and _last_jpeg is not None:
+            return _last_jpeg
+    # fora do cache: buscar de fato
+    jpeg = _fetch_snapshot_from_esp(ip)
+    if jpeg is not None:
+        with _lock:
+            _last_jpeg = jpeg
+            _last_ts = time.time()
+    return jpeg
+
+def _get_frame_bgr(ip: str) -> Optional[np.ndarray]:
+    """Retorna frame BGR decodificado do último JPEG (com cache)."""
+    global _last_frame
+    jpeg = _get_snapshot_bytes(ip)
+    if jpeg is None:
+        return None
+    with _lock:
+        # se já existe frame decodificado referente ao último _last_jpeg, reutiliza
+        if _last_frame is not None and _last_jpeg is not None and len(jpeg) == len(_last_jpeg) and jpeg[:16] == _last_jpeg[:16]:
+            return _last_frame.copy()
+    # decodifica fora do lock
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    with _lock:
+        _last_frame = frame
+    return frame.copy()
+
+# ============ Heurística de fogo ============
+def fire_score(frame: np.ndarray) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))   # faixa laranja-amarela
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame: np.ndarray) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# ============ Rotas ============
+@app.get("/status")
+def status():
+    return {
+        "ok": True,
+        "camera_ip": CAMERA_IP,
+        "source": "ESP:/snapshot",
+        "note": "Server does NOT open ESP :81/stream; it only fetches snapshots on demand with 200ms cache.",
+        "ts": int(time.time() * 1000),
+    }
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = _get_snapshot_bytes(CAMERA_IP)
+    if jpeg is None:
+        return {"ok": False, "error": "no frame from ESP /snapshot"}
+    # devolve como image/jpeg (pode ser útil para debug no navegador)
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    frame = _get_frame_bgr(CAMERA_IP)
+    if frame is None:
+        return {"ok": False, "error": "no frame from ESP /snapshot"}
+    s = fire_score(frame)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "boxes": (fire_boxes(frame) if is_fire else []),
+        "threshold": SCORE_THRESHOLD,
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+Por que isso resolve
+
+
+
+
+O app continua consumindo o :81/stream sem concorrência.
+
+
+O servidor nunca toca o :81/stream; ele usa /snapshot (porta 80) — uma foto por requisição.
+
+
+O cache de 200 ms impede que múltiplas chamadas seguidas causem rajadas no ESP.
+
+
+
+
+Pré-requisitos
+
+
+Instale as dependências do servidor:
+
+
+pip install fastapi uvicorn requests opencv-python
+
+
+
+Rodar:
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000
+
+
+
+Checagem rápida do ESP
+
+
+Como você já adicionou o /snapshot no ESP, confirme que estas linhas existem no setup():
+
+
+server.on("/snapshot",  HTTP_GET, api_snapshot);
+server.on("/snapshot",  HTTP_OPTIONS, handleCORS);
+
+
+
+…e que o handler api_snapshot() envia image/jpeg (como você já tinha).
+
+
+Se ainda assim a câmera apagar quando o servidor sobe, é quase certo que o servidor ainda esteja chamando :81/stream (algum processo antigo) — feche processos anteriores ou troque a porta do uvicorn para garantir que você está usando este binário novo.
+
+
+Quer que eu inclua um docker-compose.yml para esse servidor?
+
+
