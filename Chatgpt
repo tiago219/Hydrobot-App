@@ -1,3 +1,592 @@
+Perfeito — segue a Opção A completa e arrumada:
+
+
+
+1) server_heuristic.py (substitua o seu por este)
+
+
+# server_heuristic.py
+# FastAPI lendo MJPEG do ESP32-CAM manualmente (sem cv2.VideoCapture).
+# Em /snapshot e /detect abrimos o :81/stream, extraímos 1 JPEG e fechamos.
+# Em caso de falha, devolvemos um JPEG "placeholder" com status 200 para o app não quebrar.
+
+import time
+from typing import Optional, List
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ---------- CONFIG ----------
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+SCORE_THRESHOLD = 0.60
+CONNECT_TIMEOUT = 3.0   # s para conectar
+READ_TIMEOUT = 3.0      # s para ler o primeiro frame
+BOUNDARY = b"--frame"   # seu ESP usa "frame"
+JPEG_QUALITY = 85
+
+# ---------- FASTAPI ----------
+app = FastAPI(title="HydroBot Fire (MJPEG manual)", version="0.3.1")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ---------- MJPEG READER ----------
+def read_one_jpeg_from_mjpeg(ip: str) -> Optional[bytes]:
+    """
+    Abre http://<ip>:81/stream e extrai o PRIMEIRO JPEG via boundary '--frame'.
+    Retorna bytes do JPEG ou None se falhar.
+    """
+    url = STREAM_URL_FMT.format(ip)
+    t0 = time.time()
+    try:
+        with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+            if r.status_code != 200:
+                return None
+
+            buf = b""
+            MAX_BYTES = 2_000_000
+            while time.time() - t0 < READ_TIMEOUT:
+                for chunk in r.iter_content(chunk_size=4096):
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    if len(buf) > MAX_BYTES:
+                        return None
+
+                    # procura um boundary
+                    i = buf.find(BOUNDARY)
+                    if i == -1:
+                        continue
+
+                    # pula \r\n após boundary (se houver)
+                    hdr_start = i + len(BOUNDARY)
+                    while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                        hdr_start += 2
+
+                    # fim de headers
+                    headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                    if headers_end == -1:
+                        # ainda não temos todos os headers
+                        continue
+
+                    headers_bytes = buf[hdr_start:headers_end]
+                    headers_text = headers_bytes.decode("latin1", errors="ignore")
+
+                    content_length = None
+                    for line in headers_text.split("\r\n"):
+                        if line.lower().startswith("content-length:"):
+                            try:
+                                content_length = int(line.split(":", 1)[1].strip())
+                            except:
+                                pass
+                            break
+
+                    img_start = headers_end + 4
+                    if content_length is not None:
+                        # temos tamanho => garanta que chegou tudo
+                        if len(buf) < img_start + content_length:
+                            continue
+                        return buf[img_start:img_start + content_length]
+                    else:
+                        # sem Content-Length => delimite pelo próximo boundary
+                        j = buf.find(BOUNDARY, img_start)
+                        if j != -1:
+                            jpeg = buf[img_start:j]
+                            # tente cortar até marcador de fim JPEG
+                            end = jpeg.rfind(b"\xff\xd9")
+                            if end != -1:
+                                jpeg = jpeg[:end+2]
+                            return jpeg
+            return None
+    except requests.exceptions.RequestException:
+        return None
+
+def decode_jpeg_to_bgr(jpeg_bytes: bytes):
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+# ---------- FIRE HEURISTIC ----------
+def fire_score(frame) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # faixa laranja/amarela comum em chamas
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# ---------- HELPERS ----------
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)  # BGR
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ---------- ENDPOINTS ----------
+@app.get("/status")
+def status():
+    return {"ok": True, "camera_ip": CAMERA_IP, "model": "mjpeg_manual", "threshold": SCORE_THRESHOLD}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        # devolve JPEG de placeholder com 200 para o <Image> não disparar onError
+        jpeg = placeholder_jpeg("NO FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        return {"ok": False, "error": "no frame"}
+    frame = decode_jpeg_to_bgr(jpeg)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    s = fire_score(frame)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "threshold": SCORE_THRESHOLD,
+        "boxes": fire_boxes(frame) if is_fire else [],
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+
+
+Dependências (uma vez):
+
+
+pip install fastapi uvicorn numpy opencv-python requests
+
+
+
+
+
+
+
+Execução:
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+Depois, no celular (mesma rede do PC), teste no navegador:
+
+
+
+
+http://IP_DO_PC:8000/status  → deve mostrar JSON
+
+
+http://IP_DO_PC:8000/snapshot → deve mostrar uma imagem (placeholder se a câmera falhar)
+
+
+
+
+
+
+
+2) app/screens/CameraScreen.tsx (use este arquivo)
+
+
+// app/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+const texts = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check HYDROBOT-CAM Wi-Fi and IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Fallo de conexión. Verifica el Wi-Fi HYDROBOT-CAM y el IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";                // ESP32-CAM
+const DEFAULT_SERVER = "http://192.168.4.2:8000"; // PC rodando FastAPI
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // controle de registro (cooldown)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // “vídeo” (snapshots do servidor)
+  const [frameUri, setFrameUri] = useState<string>("");
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo via snapshots =====
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      if (stop) return;
+      // aponta para o servidor FastAPI (PC), não para o ESP
+      setFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+      setTimeout(tick, 250); // ~4 fps
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server]);
+
+  // ===== DETECT =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) { setIsFire(!!j.isFire); setFireScore(Number(j.score || 0)); }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 500);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Registro de evento (rising edge) =====
+  useEffect(() => {
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}
+          </Text>
+        </View>
+      )}
+
+      {/* “Vídeo” via snapshots do servidor */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => { setStatusText(T.noVideo); }}
+      />
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+Lembretes essenciais
+
+
+
+
+No app, no campo Servidor, coloque http://IP_DO_PC:8000 (não use localhost).
+
+
+PC e celular precisam estar na mesma rede (ou ambos no AP do ESP, com IP fixo no PC, ex.: 192.168.4.2).
+
+
+O endpoint /snapshot agora sempre retorna um JPEG (placeholder quando falhar), então o <Image> não fica em erro.
+
+
+
+
+Se quiser, posso te enviar também um pequeno script para testar o MJPEG do ESP via linha de comando e validar a leitura do primeiro frame.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // app/screens/CameraScreen.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
