@@ -1,3 +1,7 @@
+
+
+
+
 CameraScreen.tsx
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -458,3 +462,344 @@ def detect():
         "threshold": SCORE_THRESHOLD,
         "ts": int(time.time() * 1000),
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Isso normalmente acontece porque o OpenCV não lê bem o MJPEG do ESP32-CAM (porta 81//stream) via VideoCapture. Resultado: o seu /snapshot está falhando (volta JSON de erro) e o <Image> do app nunca recebe um JPEG válido.
+
+
+A solução é não usar cv2.VideoCapture para esse stream e, em vez disso, ler manualmente o MJPEG e extrair o primeiro frame. Abaixo vai um server_heuristic.py substituto que:
+
+
+
+
+usa requests para conectar no :81/stream,
+
+
+encontra o boundary --frame, lê os cabeçalhos (Content-Length) e pega 1 JPEG,
+
+
+devolve o JPEG em /snapshot,
+
+
+usa o mesmo frame para /detect.
+
+
+
+
+
+
+Instale a dependência:
+
+
+pip install requests
+
+
+
+
+
+
+Substitua seu server_heuristic.py por este
+
+
+# server_heuristic.py
+# FastAPI + leitura MANUAL do MJPEG do ESP32-CAM (sem VideoCapture).
+# Em cada /snapshot ou /detect, abre o stream, extrai o primeiro frame JPEG e fecha.
+
+import time
+from typing import Optional, List
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ------- CONFIG -------
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+SCORE_THRESHOLD = 0.60
+CONNECT_TIMEOUT = 3.0   # seg p/ conectar
+READ_TIMEOUT = 3.0      # seg p/ ler dados do stream
+JPEG_QUALITY = 85
+# O ESP32 do seu código usa boundary "frame"
+BOUNDARY = b"--frame"
+
+# ------- FASTAPI -------
+app = FastAPI(title="HydroBot Fire (MJPEG manual)", version="0.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ------- MJPEG READER -------
+def read_one_jpeg_from_mjpeg(ip: str) -> Optional[bytes]:
+    """
+    Abre http://<ip>:81/stream e extrai o PRIMEIRO JPEG usando o boundary '--frame'.
+    Retorna bytes do JPEG ou None se falhar.
+    """
+    url = STREAM_URL_FMT.format(ip)
+    t0 = time.time()
+
+    try:
+        with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+            if r.status_code != 200:
+                return None
+
+            # Vamos iterar o 'iter_content' com chunks pequenos e montar um buffer
+            buf = b""
+            # limites razoáveis para não ficar preso:
+            MAX_BYTES = 2_000_000  # 2MB
+            while time.time() - t0 < READ_TIMEOUT:
+                for chunk in r.iter_content(chunk_size=4096):
+                    if chunk:
+                        buf += chunk
+                        if len(buf) > MAX_BYTES:
+                            # stream estranho/ruim
+                            return None
+
+                        # Procurar boundary completo "\r\n--frame" (às vezes começa direto com --frame)
+                        # Para robustez, procure simplesmente por BOUNDARY
+                        i = buf.find(BOUNDARY)
+                        if i == -1:
+                            continue
+
+                        # Tem um boundary, esperam-se headers até uma linha em branco \r\n\r\n
+                        # Ex: Content-Type e Content-Length
+                        # Procure o final dos headers a partir de i
+                        hdr_start = i + len(BOUNDARY)
+                        # Alguns servidores usam \r\n após o boundary
+                        # então pule \r\n opcionais
+                        while hdr_start < len(buf) and buf[hdr_start:hdr_start+2] in (b"\r\n",):
+                            hdr_start += 2
+
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        if headers_end == -1:
+                            # headers incompletos; continue juntando
+                            continue
+
+                        headers_bytes = buf[hdr_start:headers_end]
+                        headers_text = headers_bytes.decode("latin1", errors="ignore")
+                        content_length = None
+                        for line in headers_text.split("\r\n"):
+                            if line.lower().startswith("content-length:"):
+                                try:
+                                    content_length = int(line.split(":", 1)[1].strip())
+                                except:
+                                    pass
+                                break
+
+                        img_start = headers_end + 4
+                        if content_length is not None:
+                            # Temos o tamanho, garanta que o buffer já tem tudo
+                            if len(buf) < img_start + content_length:
+                                # ainda não chegou tudo
+                                continue
+                            jpeg_bytes = buf[img_start:img_start+content_length]
+                            if jpeg_bytes.startswith(b"\xff\xd8") and jpeg_bytes.endswith(b"\xff\xd9"):
+                                return jpeg_bytes
+                            else:
+                                # fallback: tenta decodificar mesmo assim
+                                return jpeg_bytes
+                        else:
+                            # Sem Content-Length – tenta achar o próximo boundary para fechar o frame
+                            j = buf.find(BOUNDARY, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                # pode conter \r\n no fim; remova lixo do fim
+                                # tente cortar até último marcador de fim JPEG
+                                end = jpeg_bytes.rfind(b"\xff\xd9")
+                                if end != -1:
+                                    jpeg_bytes = jpeg_bytes[:end+2]
+                                return jpeg_bytes
+                            # ainda não chegou o próximo boundary, continue lendo
+                if time.time() - t0 >= READ_TIMEOUT:
+                    break
+    except requests.exceptions.RequestException:
+        return None
+
+    return None
+
+def decode_jpeg_to_bgr(jpeg_bytes: bytes) -> Optional[np.ndarray]:
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
+
+# ------- FIRE HEURISTIC -------
+def fire_score(frame: np.ndarray) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame: np.ndarray) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+          continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# ------- ENDPOINTS -------
+@app.get("/status")
+def status():
+    return {"ok": True, "camera_ip": CAMERA_IP, "model": "mjpeg_manual", "ts": int(time.time() * 1000)}
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        return {"ok": False, "error": "no frame (ESP busy/unreachable or parse error)"}
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        return {"ok": False, "error": "no frame (ESP busy/unreachable or parse error)"}
+    frame = decode_jpeg_to_bgr(jpeg)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    s = fire_score(frame)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "boxes": (fire_boxes(frame) if is_fire else []),
+        "threshold": SCORE_THRESHOLD,
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+
+Ajustes no App (se ainda não fez)
+
+
+No CameraScreen.tsx você já está chamando:
+
+
+setFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+
+
+
+Perfeito. Só confirme na UI que:
+
+
+
+
+Servidor = http://IP_DO_SEU_PC:8000
+
+
+(Opcional) envie a config pro servidor (uma vez) se seu ESP não usa 192.168.4.1:
+
+curl -X POST http://IP_DO_PC:8000/config -H "Content-Type: application/json" -d "{\"camera_ip\":\"192.168.4.1\"}"
+
+
+
+
+
+
+
+Dicas de diagnóstico rápido
+
+
+
+
+Abra no navegador do celular (conectado ao AP do ESP):
+
+http://IP_DO_PC:8000/snapshot
+
+Se baixar/abrir uma imagem, o app também deveria mostrar.
+
+
+Se não abrir:
+
+
+
+verifique firewall do PC (libere Python/uvicorn na rede privada),
+
+
+confira se o celular e o PC estão na mesma sub-rede do AP do ESP,
+
+
+confirme o IP correto do PC no campo “Servidor”.
+
+
+
+
+
+
+
+
+Com essa leitura manual do MJPEG, o /snapshot volta a fornecer JPEG válido e as imagens aparecem no app, liberando a detecção de fogo também.
+
