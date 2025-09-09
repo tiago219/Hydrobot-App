@@ -1,166 +1,4 @@
-    } finally {
-      setIsChecking(false);
-    }
-  }
-  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
-  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
-
-  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
-
-  // ===== Vídeo =====
-  const streamUrl = useMemo(() => `http://${ip}:81/stream`, [ip]); // MJPEG do ESP
-
-  // Snapshot do SERVIDOR (só quando serverBase existe)
-  useEffect(() => {
-    if (useStream) return;        // stream pelo ESP quando true
-    if (!serverBase) return;      // só roda com servidor definido
-    let stop = false;
-    const TICK_MS = 250;
-    const tick = () => {
-      if (stop) return;
-      setFrameUri(`${serverBase}/snapshot?ts=${Date.now()}`);
-      setTimeout(tick, TICK_MS);
-    };
-    tick();
-    return () => { stop = true; };
-  }, [useStream, serverBase]);
-
-  // ===== DETECT (sempre no SERVIDOR) =====
-  useEffect(() => {
-    if (!detectOn) return;
-    if (!serverBase) {
-      setStatusText(T.needServer);
-      setIsFire(false);
-      setFireScore(0);
-      return;
-    }
-    let stop = false;
-    const loop = async () => {
-      try {
-        const r = await fetch(`${serverBase}/detect`, { method: "GET" });
-        const j = await r.json();
-        if (!stop && j && (j.ok === undefined || j.ok)) {
-          setIsFire(!!j.isFire);
-          setFireScore(Number(j.score || 0));
-        }
-      } catch {
-        if (!stop) { setIsFire(false); setFireScore(0); }
-      } finally {
-        if (!stop) setTimeout(loop, 500);
-      }
-    };
-    loop();
-    return () => { stop = true; };
-  }, [detectOn, serverBase, T.needServer]);
-
-  // ===== Registro (rising edge) — usa o SERVIDOR =====
-  useEffect(() => {
-    const risingEdge = !wasFireRef.current && isFire;
-    const now = Date.now();
-    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
-    if (detectOn && risingEdge && cooldownOk && !saving) {
-      if (!serverBase) {
-        setStatusText(T.needServer);
-      } else {
-        (async () => {
-          try {
-            setSaving(true);
-            await saveEventFromServer(serverBase);
-            lastSaveRef.current = Date.now();
-            setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
-          } catch {
-            setStatusText(T.noVideo);
-          } finally {
-            setSaving(false);
-          }
-        })();
-      }
-    }
-    wasFireRef.current = isFire;
-  }, [detectOn, isFire, serverBase, saving, T]);
-
-  // joystick
-  const RADIUS = 64, KNOB_R = 22;
-  const pan = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => setDragging(true),
-      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
-        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
-        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
-        setJoy({ x: nx, y: -ny });
-      },
-      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
-      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
-    })
-  ).current;
-
-  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
-
-  const mjpegHtml = `
-<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden}
-.wrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
-img{max-width:100vw;max-height:100vh;object-fit:contain}
-</style>
-</head>
-<body>
-  <div class="wrapper">
-    <img src="${streamUrl}" />
-  </div>
-</body></html>`;
-
-  return (
-    <View style={styles.container}>
-      {/* ESP + LED + BOMBA */}
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={ip}
-          onChangeText={setIp}
-          placeholder={T.placeholder}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType={Platform.select({ ios: "numbers-and-punctuation", android: "numeric", default: "default" })}
-        />
-        <Pressable onPress={pingStatus} style={styles.btn}>
-          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
-        </Pressable>
-        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
-          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
-        </Pressable>
-        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
-          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
-        </Pressable>
-      </View>
-
-      {/* Servidor + Detect (o botão de alternância foi removido; agora é automático) */}
-      <View style={styles.statusRow}>
-        <Text style={styles.label}>{T.server}</Text>
-        <TextInput
-          value={server}
-          onChangeText={setServer}
-          placeholder={`http://192.168.4.2:8000  (obrigatório p/ detectar)`}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={[styles.input, { flex: 1 }]}
-        />
-        <Pressable onPress={() => setDetectOn(v => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
-          <Text style={styles.btnText}>
-            {detectOn ? (saving ? T.saving : T.detecting) : T.detect}
-          </Text>
-        </Pressable>
-      </View>
-
-      {/* Status curto */}
-      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
-        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
-      </View>
-
+  
       {/* Banner fogo */}
       {detectOn && (
         <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
@@ -180,67 +18,7 @@ img{max-width:100vw;max-height:100vh;object-fit:contain}
           javaScriptEnabled
           onError={() => setStatusText(T.noVideo)}
           onHttpError={() => setStatusText(T.noVideo)}
-          androidHardwareAccelerationDisabled={false}
-          setSupportMultipleWindows={false}
-        />
-      ) : (
-        <Image
-          source={{ uri: frameUri }}
-          style={styles.video}
-          resizeMode="contain"
-          onError={() => { setStatusText(T.noVideo); }}
-        />
-      )}
-
-      {/* Joystick */}
-      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
-        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
-          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
-          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
-          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
-        </View>
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: PALETTE.bg },
-  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
-  label: { color: "#cfd3d8", fontSize: 12 },
-  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
-  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
-  btnOn: { backgroundColor: "#17a34a" },
-Perfeito — o problema é que o ESP32-CAM não aguenta dois clientes no /stream ao mesmo tempo (seu servidor Python + o app). Então, quando você inicia o server_heuristic.py (que abre o stream via OpenCV), o app deve parar de puxar o /stream do ESP e passar a exibir o /snapshot do servidor.
-
-Abaixo está a tela completa já com essa lógica automática:
-
-Se o campo Servidor estiver preenchido, o app troca sozinho para “Snapshot (/snapshot)” e exibe frames vindos do servidor (que por sua vez já está lendo o /stream do ESP).
-
-Se o campo Servidor estiver vazio, o app usa WebView → /stream do ESP (como antes).
-
-Detecção e salvamento continuam rodando só no Servidor.
-
-
-CameraScreen.tsx (com auto-switch de vídeo)
-
-// app/screens/CameraScreen.tsx
-import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
-  GestureResponderEvent, PanResponderGestureState, Image, Platform,
-} from "react-native";
-import { WebView } from "react-native-webview";
-import { saveEventFromServer } from "../storage/fireLog";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
-
-const texts = {
-  pt: {
-    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
-    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
-    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+          androidHardwareAccelerationDisabled={false    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
     statusFail: "Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.",
     noVideo: "Sem vídeo.",
     fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
@@ -264,60 +42,7 @@ const texts = {
     view: "View",
     viewStream: "MJPEG (/stream)",
     viewSnapshot: "Snapshot (/snapshot)",
-    needServer: "Set the Server field to run fire detection.",
-    autoSwitched: "Using Server snapshot to avoid ESP stream conflict.",
-  },
-  es: {
-    espIp: "ESP IP:", test: "Probar", ledOn: "LED ON", ledOff: "LED OFF",
-    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
-    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
-    statusFail: "Fallo de conexión. Verifica el Wi-Fi HYDROBOT-CAM y el IP.",
-    noVideo: "Sin vídeo.",
-    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
-    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
-    placeholder: "192.168.4.1",
-    view: "Ver",
-    viewStream: "MJPEG (/stream)",
-    viewSnapshot: "Snapshot (/snapshot)",
-    needServer: "Define el campo Servidor para detectar fuego.",
-    autoSwitched: "Usando snapshot del Servidor para evitar conflicto con el stream del ESP.",
-  },
-};
-
-const DEFAULT_IP = "192.168.4.1";
-const DEFAULT_SERVER = ""; // vazio => sem servidor externo
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = texts[lang];
-
-  // conexões
-  const [ip, setIp] = useState(DEFAULT_IP);
-  const [server, setServer] = useState(DEFAULT_SERVER);
-
-  // estados ESP
-  const [isChecking, setIsChecking] = useState(false);
-  const [statusText, setStatusText] = useState<string>("—");
-  const [ledOn, setLedOn] = useState<boolean>(false);
-  const [pumpOn, setPumpOn] = useState<boolean>(false);
-
-  // detecção
-  const [detectOn, setDetectOn] = useState<boolean>(false);
-  const [isFire, setIsFire] = useState<boolean>(false);
-  const [fireScore, setFireScore] = useState<number>(0);
-
-  // registro
-  const [saving, setSaving] = useState(false);
-  const lastSaveRef = useRef<number>(0);
-  const wasFireRef = useRef<boolean>(false);
-  const SAVE_COOLDOWN_MS = 5000;
-
-  // vídeo
-  const [frameUri, setFrameUri] = useState<string>("");
-  const [useStream, setUseStream] = useState<boolean>(true); // muda automaticamente com base no servidor
-
-  // joystick (UI)
-  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+    needServer: "Set the  = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
 
   // bases
@@ -332,115 +57,7 @@ export default function CameraScreen() {
   // ===== Auto-switch do modo de vídeo =====
   // Se existir servidor → usa snapshot do servidor (evita conflito com o /stream do ESP).
   useEffect(() => {
-    const shouldUseStream = serverBase.length === 0;
-    setUseStream(shouldUseStream);
-    if (!shouldUseStream) {
-      setStatusText(T.autoSwitched);
-    }
-  }, [serverBase, T.autoSwitched]);
-
-  // ===== ESP STATUS =====
-  async function pingStatus() {
-    try {
-      setIsChecking(true);
-      const r = await fetch(statusUrl, { method: "GET" });
-      const j = await r.json();
-      setLedOn(!!j.led);
-      setPumpOn(!!j.pump);
-      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
-    } catch {
-      setStatusText(T.statusFail);
-    } finally {
-      setIsChecking(false);
-    }
-  }
-  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
-  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
-
-  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
-
-  // ===== Vídeo =====
-  const streamUrl = useMemo(() => `http://${ip}:81/stream`, [ip]); // MJPEG do ESP
-
-  // Snapshot do SERVIDOR (só quando serverBase existe)
-  useEffect(() => {
-    if (useStream) return;        // stream pelo ESP quando true
-    if (!serverBase) return;      // só roda com servidor definido
-    let stop = false;
-    const TICK_MS = 250;
-    const tick = () => {
-      if (stop) return;
-      setFrameUri(`${serverBase}/snapshot?ts=${Date.now()}`);
-      setTimeout(tick, TICK_MS);
-    };
-    tick();
-    return () => { stop = true; };
-  }, [useStream, serverBase]);
-
-  // ===== DETECT (sempre no SERVIDOR) =====
-  useEffect(() => {
-    if (!detectOn) return;
-    if (!serverBase) {
-      setStatusText(T.needServer);
-      setIsFire(false);
-      setFireScore(0);
-      return;
-    }
-    let stop = false;
-    const loop = async () => {
-      try {
-        const r = await fetch(`${serverBase}/detect`, { method: "GET" });
-        const j = await r.json();
-        if (!stop && j && (j.ok === undefined || j.ok)) {
-          setIsFire(!!j.isFire);
-          setFireScore(Number(j.score || 0));
-        }
-      } catch {
-        if (!stop) { setIsFire(false); setFireScore(0); }
-      } finally {
-        if (!stop) setTimeout(loop, 500);
-      }
-    };
-    loop();
-    return () => { stop = true; };
-  }, [detectOn, serverBase, T.needServer]);
-
-  // ===== Registro (rising edge) — usa o SERVIDOR =====
-  useEffect(() => {
-    const risingEdge = !wasFireRef.current && isFire;
-    const now = Date.now();
-    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
-    if (detectOn && risingEdge && cooldownOk && !saving) {
-      if (!serverBase) {
-        setStatusText(T.needServer);
-      } else {
-        (async () => {
-          try {
-            setSaving(true);
-            await saveEventFromServer(serverBase);
-            lastSaveRef.current = Date.now();
-            setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
-          } catch {
-            setStatusText(T.noVideo);
-          } finally {
-            setSaving(false);
-          }
-        })();
-      }
-    }
-    wasFireRef.current = isFire;
-  }, [detectOn, isFire, serverBase, saving, T]);
-
-  // joystick
-  const RADIUS = 64, KNOB_R = 22;
-  const pan = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => setDragging(true),
-      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
-        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
-        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+    const th.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
         setJoy({ x: nx, y: -ny });
       },
       onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
@@ -1144,4 +761,216 @@ Rodar /detect no Servidor e salvar eventos por ele mesmo.
 
 
 Se preferir, posso adicionar um “modo avançado” para forçar stream do ESP mesmo com servidor ligado — mas, como regra, isso volta a causar a interrupção porque o ESP geralmente só segura um /stream por vez.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Beleza — o problema é que o server mantém o /stream do ESP aberto o tempo todo, competindo com o app. Abaixo está o server_heuristic.py refeito para NÃO segurar o stream: ele abre, lê 1 frame e fecha em cada /snapshot ou /detect. Assim, o app continua exibindo a câmera via WebView :81/stream como antes, e o servidor só “belisca” um frame quando necessário.
+
+
+Cole este arquivo inteiro:
+
+
+# server_heuristic.py
+# FastAPI + OpenCV — NÃO mantém o /stream do ESP aberto.
+# Em cada chamada a /snapshot ou /detect, abre o stream, lê 1 frame e fecha imediatamente.
+import cv2, time, numpy as np
+from typing import Optional, List, Tuple
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+SCORE_THRESHOLD = 0.60
+OPEN_TIMEOUT_S = 3.0          # tempo máximo tentando abrir stream
+READ_TIMEOUT_S = 1.0          # tempo máximo tentando ler um frame após abrir
+JPEG_QUALITY = 85
+
+app = FastAPI(title="HydroBot Fire (Heuristic, on-demand)", version="0.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+def open_and_read_one(ip: str) -> Optional[np.ndarray]:
+    """
+    Abre o stream MJPEG do ESP, tenta ler 1 frame e fecha.
+    Retorna BGR np.ndarray ou None se falhar.
+    """
+    url = STREAM_URL_FMT.format(ip)
+    t0 = time.time()
+    cap = None
+    try:
+        # Tenta abrir por até OPEN_TIMEOUT_S
+        while time.time() - t0 < OPEN_TIMEOUT_S:
+            cap = cv2.VideoCapture(url)
+            # alguns backends ignoram CAP_PROP_BUFFERSIZE, mas não atrapalha
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if cap.isOpened():
+                break
+            cap.release()
+            cap = None
+            time.sleep(0.15)
+        if cap is None or not cap.isOpened():
+            return None
+
+        # Tenta ler 1 frame por até READ_TIMEOUT_S
+        t1 = time.time()
+        while time.time() - t1 < READ_TIMEOUT_S:
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return frame
+            time.sleep(0.01)
+        return None
+    finally:
+        if cap is not None:
+            cap.release()
+
+def fire_score(frame: np.ndarray) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # janela laranja/amarela típica de chama; ajuste se necessário
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame: np.ndarray) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+@app.get("/status")
+def status():
+    # NÃO abre stream aqui para não competir com o app.
+    return {
+        "ok": True,
+        "camera_ip": CAMERA_IP,
+        "model": "heuristic_on_demand",
+        "note": "This server opens the ESP stream only per-request (snapshot/detect) and releases immediately.",
+        "ts": int(time.time() * 1000),
+    }
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    f = open_and_read_one(CAMERA_IP)
+    if f is None:
+        return {"ok": False, "error": "no frame (ESP busy or unreachable)"}
+    ok, buf = cv2.imencode(".jpg", f, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    if not ok:
+        return {"ok": False, "error": "encode failed"}
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    f = open_and_read_one(CAMERA_IP)
+    if f is None:
+        return {"ok": False, "error": "no frame (ESP busy or unreachable)"}
+    s = fire_score(f)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "boxes": (fire_boxes(f) if is_fire else []),
+        "threshold": SCORE_THRESHOLD,
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+O que mudou (e por quê)
+
+
+
+
+Sem thread e sem VideoCapture persistente: nada mantém o /stream ocupado.
+
+
+Cada /snapshot e /detect faz open → read 1 frame → release.
+
+Isso permite que o app fique conectado ao /stream de forma contínua, “como estava antes”.
+
+
+/status não tenta abrir nada (só informa config).
+
+
+
+
+
+
+Dica: se ainda rolar disputa rara (alguns firmwares aceitam apenas 1 conexão no exato instante), aumente OPEN_TIMEOUT_S para 5.0–7.0 e READ_TIMEOUT_S para 2.0.
+
+
+
+
+No app você pode voltar para a versão anterior (WebView fixo no :81/stream, sem alternância). Não é obrigatório mudar nada no app se ele já estava nessa forma “antiga”.
 
