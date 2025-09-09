@@ -9970,3 +9970,722 @@ void loop() {
   server.handleClient();
   delay(10);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Perfeito — aqui vão os códigos completos já com o endpoint /snapshot no firmware e a tela de câmera ajustada para usar esse endpoint (com fallback automático para o IP do ESP).
+
+
+
+CameraScreen.tsx (completo)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+const texts = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi HYDROBOT-CAM e o IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o /snapshot no ESP.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholder: "http://192.168.4.1",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check HYDROBOT-CAM Wi-Fi and IP.",
+    noVideo: "No video (snapshot). Check /snapshot on ESP.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholder: "http://192.168.4.1",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Fallo de conexión. Verifica el Wi-Fi HYDROBOT-CAM y el IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa /snapshot en el ESP.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholder: "http://192.168.4.1",
+  },
+};
+
+// padrões
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.1";
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState<string>("—");
+  const [ledOn, setLedOn] = useState<boolean>(false);
+  const [pumpOn, setPumpOn] = useState<boolean>(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState<boolean>(false);
+  const [isFire, setIsFire] = useState<boolean>(false);
+  const [fireScore, setFireScore] = useState<number>(0);
+
+  // controle de registro (evitar spam)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef<number>(0);
+  const wasFireRef = useRef<boolean>(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // “vídeo” por snapshots do ESP
+  const [frameUri, setFrameUri] = useState<string>("");
+
+  // joystick (UI)
+  const [joy, setJoy] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const baseHttp = useMemo(() => `http://${ip}`, [ip]);
+  const statusUrl = useMemo(() => `${baseHttp}/status`, [baseHttp]);
+  const ledUrl = useMemo(() => (on: boolean) => `${baseHttp}/led?on=${on ? "1" : "0"}`, [baseHttp]);
+  const pumpUrl = useMemo(() => (on: boolean) => `${baseHttp}/pump?on=${on ? "1" : "0"}`, [baseHttp]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo por snapshots =====
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      if (stop) return;
+      // se o campo "Servidor" estiver vazio, usamos o IP do ESP
+      const base = (server && server.trim().length > 0) ? server : `http://${ip}`;
+      setFrameUri(`${base.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+      setTimeout(tick, 250);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server, ip]);
+
+  // ===== DETECT =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const base = (server && server.trim().length > 0) ? server : `http://${ip}`;
+        const r = await fetch(`${base.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) { setIsFire(!!j.isFire); setFireScore(Number(j.score || 0)); }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 500);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server, ip]);
+
+  // ===== Registro de evento (rising edge) =====
+  useEffect(() => {
+    const risingEdge = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && risingEdge && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          const base = (server && server.trim().length > 0) ? server : `http://${ip}`;
+          await saveEventFromServer(base);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, ip, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="192.168.4.1"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Servidor + Detect */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholder}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn(v => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>
+            {detectOn ? (saving ? T.saving : T.detecting) : T.detect}
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>
+            {isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}
+          </Text>
+        </View>
+      )}
+
+      {/* Vídeo via snapshots */}
+      <Image
+        source={{ uri: frameUri }}
+        style={styles.video}
+        resizeMode="contain"
+        onError={() => { setStatusText(T.noVideo); }}
+      />
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+HydroBot.ino (completo, com /snapshot)
+
+
+/**
+ * HydroBot.ino - ESP32-CAM (AI Thinker) - AP ONLY (sem sensores)
+ * - AP fixo (HYDROBOT-CAM)
+ * - Stream MJPEG: /stream (porta 81)
+ * - API (80): /status, /led, /mode, /joystick, /pump (on/off), /pump_pwm?duty=0..255, /snapshot (JPEG único)
+ * - LED no GPIO 4 (flash onboard)
+ * - Bomba por MOSFET com PWM (LEDC via ESP-IDF)
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+#include <time.h>
+#include "driver/ledc.h"   // PWM (ESP-IDF)
+
+// Desativa brownout
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===================== WIFI AP =====================
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678"; // 8+ chars
+
+// ===================== PINOS =====================
+// LED seguro no ESP32-CAM (flash onboard). Se quiser usar 2, troque aqui (não recomendado).
+#define LED_FLASH_PIN 4
+// Bomba (MOSFET): evite 1/3/2/12/15; 14 é estável no ESP32-CAM
+#define PUMP_PIN 14
+
+// ===================== ESTADO =====================
+String g_mode = "manual";
+bool   g_ledOn = false;
+bool   g_pumpOn = false;
+float  g_joyX = 0.0f, g_joyY = 0.0f;
+
+static httpd_handle_t stream_httpd = NULL;
+WebServer server(80);
+
+// ===================== CAMERA (AI THINKER) =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ===================== UTILS =====================
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  if (now < 8 * 3600 * 2) {
+    unsigned long ms = millis();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "\"uptime_ms\":%lu", ms);
+    return String("{") + buf + "}";
+  }
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char buf[64];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &timeinfo);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return "\"" + ts + "\"";
+}
+
+void sendCORSHeaders(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+}
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ===================== BOMBA (PWM via ESP-IDF LEDC) =====================
+static const ledc_channel_t PUMP_CH   = LEDC_CHANNEL_0;
+static const ledc_timer_t   PUMP_TMR  = LEDC_TIMER_0;
+static const ledc_mode_t    PUMP_MODE = LEDC_HIGH_SPEED_MODE;
+
+void pumpPwmInit() {
+  ledc_timer_config_t tcfg = {};
+  tcfg.speed_mode      = PUMP_MODE;
+  tcfg.timer_num       = PUMP_TMR;
+  tcfg.duty_resolution = LEDC_TIMER_8_BIT; // 0..255
+  tcfg.freq_hz         = 5000;            // 5 kHz
+  tcfg.clk_cfg         = LEDC_AUTO_CLK;
+  ledc_timer_config(&tcfg);
+
+  ledc_channel_config_t ccfg = {};
+  ccfg.gpio_num   = PUMP_PIN;
+  ccfg.speed_mode = PUMP_MODE;
+  ccfg.channel    = PUMP_CH;
+  ccfg.intr_type  = LEDC_INTR_DISABLE;
+  ccfg.timer_sel  = PUMP_TMR;
+  ccfg.duty       = 0;
+  ccfg.hpoint     = 0;
+  ledc_channel_config(&ccfg);
+
+  g_pumpOn = false;
+}
+
+static inline void pumpWriteDuty(uint8_t duty) {
+  ledc_set_duty(PUMP_MODE, PUMP_CH, duty);
+  ledc_update_duty(PUMP_MODE, PUMP_CH);
+}
+
+void pumpSetOnOff(bool on) {
+  g_pumpOn = on;
+  pumpWriteDuty(on ? 255 : 0);
+}
+
+void pumpSetDuty(uint8_t duty) {
+  if (duty > 255) duty = 255;
+  g_pumpOn = (duty > 0);
+  pumpWriteDuty(duty);
+}
+
+// ===================== STREAM (/stream) =====================
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+static const char* _STREAM_BOUNDARY = "\r\n--frame\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
+  sendCORSHeaders(req);
+  camera_fb_t * fb = NULL;
+  esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) return ESP_FAIL;
+    if (fb->format != PIXFORMAT_JPEG) { esp_camera_fb_return(fb); continue; }
+
+    res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    if (res == ESP_OK) {
+      char part_buf[64];
+      size_t hlen = snprintf(part_buf, 64, _STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+    }
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+  return res;
+}
+
+void startCameraStreamServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.ctrl_port = 32768;
+  config.max_open_sockets = 3;
+  config.task_priority = 5;
+
+  httpd_uri_t stream_uri = { .uri="/stream", .method=HTTP_GET, .handler=jpg_stream_httpd_handler, .user_ctx=NULL };
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+    Serial.println("Stream em :81/stream");
+  }
+}
+
+// ===================== API =====================
+void api_status() {
+  sendCORS();
+  String ts = isoTimestamp();
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"mode\":\"" + g_mode + "\",";
+  json += "\"led\":" + String(g_ledOn ? "true":"false") + ",";
+  json += "\"pump\":" + String(g_pumpOn ? "true":"false") + ",";
+  json += "\"uptime\":" + String(millis()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"ts\":" + ts;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void api_led() {
+  sendCORS();
+  bool on = server.arg("on") == "1" || server.arg("on") == "true";
+  g_ledOn = on;
+  digitalWrite(LED_FLASH_PIN, g_ledOn ? HIGH : LOW);
+  server.send(200, "application/json", String("{\"ok\":true,\"led\":") + (g_ledOn?"true":"false") + "}");
+}
+
+void api_pump() { // on/off rápido
+  sendCORS();
+  bool on = server.arg("on") == "1" || server.arg("on") == "true";
+  pumpSetOnOff(on);
+  server.send(200, "application/json", String("{\"ok\":true,\"pump\":") + (g_pumpOn?"true":"false") + "}");
+}
+
+void api_pump_pwm() { // duty 0..255
+  sendCORS();
+  int duty = server.hasArg("duty") ? server.arg("duty").toInt() : -1;
+  if (duty < 0 || duty > 255) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"duty 0..255\"}");
+    return;
+  }
+  pumpSetDuty((uint8_t)duty);
+  server.send(200, "application/json", String("{\"ok\":true,\"duty\":") + duty + "}");
+}
+
+void api_mode() {
+  sendCORS();
+  String v = server.arg("v"); if (v.length()==0) v = server.arg("mode");
+  if (v != "manual" && v != "auto" && v != "patrol") {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"mode must be manual|auto|patrol\"}");
+    return;
+  }
+  g_mode = v;
+  server.send(200, "application/json", String("{\"ok\":true,\"mode\":\"") + g_mode + "\"}");
+}
+
+void api_joystick() {
+  sendCORS();
+  float x = server.arg("x").toFloat();
+  float y = server.arg("y").toFloat();
+  if (x < -1) x = -1; if (x > 1) x = 1;
+  if (y < -1) y = -1; if (y > 1) y = 1;
+  g_joyX = x; g_joyY = y;
+  server.send(200, "application/json", String("{\"ok\":true,\"x\":") + x + ",\"y\":" + y + "}");
+}
+
+void handleCORS() {
+  sendCORS();
+  server.send(200);
+}
+
+// ===== NOVO: /snapshot (JPEG único para o app React Native) =====
+void api_snapshot() {
+  sendCORS();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}");
+    return;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
+    return;
+  }
+
+  // Desabilita cache no cliente
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");            // inicia resposta
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);                // envia bytes do JPEG
+  esp_camera_fb_return(fb);
+}
+
+// ===================== SETUP =====================
+void setupNTP() {
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 15;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+void startAPOnly() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
+  Serial.println("AP iniciado:");
+  Serial.print(" SSID: "); Serial.println(AP_SSID);
+  Serial.print(" PASS: "); Serial.println(AP_PASS);
+  Serial.print(" IP: ");   Serial.println(WiFi.softAPIP());
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  Serial.println("\n=== HYDROBOT CAM (AP ONLY / SEM SENSORES) ===");
+
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  pumpPwmInit();
+
+  if (!initCamera()) {
+    Serial.println("Camera FAIL");
+    delay(3000);
+    ESP.restart();
+  }
+
+  startAPOnly();
+  setupNTP();
+
+  // Rotas
+  server.on("/status",    HTTP_GET, api_status);
+  server.on("/led",       HTTP_GET, api_led);
+  server.on("/led",       HTTP_POST, api_led);
+  server.on("/pump",      HTTP_GET, api_pump);
+  server.on("/pump",      HTTP_POST, api_pump);
+  server.on("/pump_pwm",  HTTP_GET, api_pump_pwm);
+  server.on("/pump_pwm",  HTTP_POST, api_pump_pwm);
+  server.on("/mode",      HTTP_GET, api_mode);
+  server.on("/mode",      HTTP_POST, api_mode);
+  server.on("/joystick",  HTTP_GET, api_joystick);
+  server.on("/joystick",  HTTP_POST, api_joystick);
+
+  // NOVO: snapshot
+  server.on("/snapshot",  HTTP_GET, api_snapshot);
+
+  // CORS (OPTIONS)
+  server.on("/status",    HTTP_OPTIONS, handleCORS);
+  server.on("/led",       HTTP_OPTIONS, handleCORS);
+  server.on("/pump",      HTTP_OPTIONS, handleCORS);
+  server.on("/pump_pwm",  HTTP_OPTIONS, handleCORS);
+  server.on("/mode",      HTTP_OPTIONS, handleCORS);
+  server.on("/joystick",  HTTP_OPTIONS, handleCORS);
+  server.on("/snapshot",  HTTP_OPTIONS, handleCORS);
+
+  server.begin();
+  Serial.println("HTTP :80 pronto");
+  startCameraStreamServer();
+  Serial.println("=== PRONTO ===");
+}
+
+void loop() {
+  server.handleClient();
+  delay(10);
+}
+
+
+
+
+Se quiser, eu também adiciono (num próximo passo) o envio do joystick do app para o ESP com um fetch periódico em GET /joystick?x=..&y=.. quando o knob se mover. Quer?
+
