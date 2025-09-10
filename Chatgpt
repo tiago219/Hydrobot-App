@@ -1,3 +1,734 @@
+Perfeito! Aqui estão os dois arquivos completos com as alterações para reduzir o “picote” e deixar a detecção mais frequente:
+
+
+
+1) server_heuristic.py (grabber contínuo do MJPEG + snapshot instantâneo)
+
+
+# server_heuristic.py
+# FastAPI com "grabber" contínuo do MJPEG do ESP32-CAM (porta 81/stream).
+# Lê o stream em uma thread, guarda o último JPEG e serve instantaneamente em /snapshot e /detect.
+
+import time
+import threading
+from typing import Optional, List
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ---------------- CONFIG GERAL ----------------
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+BOUNDARY = b"--frame"    # boundary do ESP
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 3.0
+JPEG_QUALITY = 85
+SCORE_THRESHOLD = 0.60
+
+# ---------------- FASTAPI ----------------
+app = FastAPI(title="HydroBot Fire (Grabber contínuo)", version="0.4.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ---------------- PLACEHOLDER ----------------
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ---------------- GRABBER CONTÍNUO ----------------
+class MJPEGGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        # reconecta automaticamente em caso de erro
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.6)
+                        continue
+
+                    buf = b""
+                    MAX_BYTES = 4_000_000
+                    self._frames = 0
+                    self._last_fps_tick = time.time()
+
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set():
+                            break
+                        if not chunk:
+                            continue
+                        buf += chunk
+                        if len(buf) > MAX_BYTES:
+                            buf = b""  # evita crescimento infinito
+
+                        # encontre boundary
+                        i = buf.find(BOUNDARY)
+                        if i == -1:
+                            continue
+
+                        # pule CRLF após boundary
+                        hdr_start = i + len(BOUNDARY)
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                            hdr_start += 2
+
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        if headers_end == -1:
+                            continue
+
+                        headers_bytes = buf[hdr_start:headers_end]
+                        headers_text = headers_bytes.decode("latin1", errors="ignore")
+
+                        content_length = None
+                        for line in headers_text.split("\r\n"):
+                            if line.lower().startswith("content-length:"):
+                                try:
+                                    content_length = int(line.split(":", 1)[1].strip())
+                                except:
+                                    pass
+                                break
+
+                        img_start = headers_end + 4
+                        jpeg_bytes = None
+                        if content_length is not None:
+                            if len(buf) < img_start + content_length:
+                                continue
+                            jpeg_bytes = buf[img_start:img_start + content_length]
+                            buf = buf[img_start + content_length:]
+                        else:
+                            j = buf.find(BOUNDARY, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                buf = buf[j:]
+                            else:
+                                continue
+
+                        if jpeg_bytes:
+                            ts_ms = int(time.time() * 1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg_bytes
+                                self._last_ts_ms = ts_ms
+                            # FPS
+                            self._frames += 1
+                            now = time.time()
+                            if now - self._last_fps_tick >= 1.0:
+                                self._fps = self._frames / (now - self._last_fps_tick)
+                                self._frames = 0
+                                self._last_fps_tick = now
+            except requests.exceptions.RequestException:
+                time.sleep(0.6)
+            except Exception:
+                time.sleep(0.6)
+
+    def get_latest_jpeg(self, max_age_ms: int = 3000) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None:
+                return None
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms:
+                return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {
+                "ip": self._ip,
+                "hasFrame": self._last_jpeg is not None,
+                "age_ms": age_ms,
+                "fps_in": round(self._fps, 2),
+                "ts_ms": self._last_ts_ms,
+            }
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ---------------- FIRE HEURISTIC ----------------
+def decode_jpeg_to_bgr(jpeg_bytes: bytes):
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def fire_score(frame) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# ---------------- ENDPOINTS ----------------
+@app.get("/status")
+def status():
+    s = grabber.status()
+    return {"ok": True, "model": "grabber_continuo", "threshold": SCORE_THRESHOLD, **s}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)  # reinicia o grabber no novo IP
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=5000)
+    if jpeg is None:
+        jpeg = placeholder_jpeg("NO LIVE FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=5000)
+    if jpeg is None:
+        return {"ok": False, "error": "no recent frame"}
+    frame = decode_jpeg_to_bgr(jpeg)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    s = fire_score(frame)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "threshold": SCORE_THRESHOLD,
+        "boxes": fire_boxes(frame) if is_fire else [],
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+
+2) app/screens/CameraScreen.tsx (double-buffer com trava + polling mais rápido)
+
+
+
+
+Snapshots agora em ~6–7 fps (FPS_INTERVAL = 150).
+
+
+Detecção em ~5 Hz (200 ms).
+
+
+Mantém crossfade sem flicker.
+
+
+
+
+// app/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Animated,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+// -------- Crossfade com trava: só muda quando o próximo terminar de carregar --------
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {currentUri ? (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      ) : null}
+
+      {showNext ? (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => {
+              // fallback: promove mesmo assim; servidor tende a devolver placeholder JPEG
+              onNextShown();
+            }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 120, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
+  );
+}
+
+const textsByLang = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi e IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ENC.", ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.", pumpOff: "BOMBA APAG.", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // registro automático
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // vídeo (double buffer + trava)
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo via snapshots — mais rápido e SEM flicker =====
+  useEffect(() => {
+    let stop = false;
+    const FPS_INTERVAL = 150; // ~6–7 fps
+
+    // primeiro frame (placeholder/real) para não ficar tela preta
+    setCurrentFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+
+    return () => { stop = true; };
+  }, [server]);
+
+  function onNextLoadStart() {
+    loadingNextRef.current = true;
+  }
+  function onNextShown() {
+    if (nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    loadingNextRef.current = false;
+  }
+
+  // ===== DETECT =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 200); // ~5 Hz
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Registro automático =====
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+        </View>
+      )}
+
+      {/* Vídeo (sem flicker) */}
+      <CrossfadeImage
+        currentUri={currentFrameUri}
+        nextUri={nextFrameUri}
+        onNextLoadStart={onNextLoadStart}
+        onNextShown={onNextShown}
+      />
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.bg,
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  // Vídeo
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+Dicas rápidas
+
+
+
+
+No app, Servidor = http://IP_DO_PC:8000.
+
+
+Confirme /status mostra fps_in > 0 e hasFrame: true.
+
+
+Se o Android físico não carregar: verifique Firewall do Windows (libere Python/uvicorn na rede privada).
+
+
+
+
+Se quiser, posso te mandar também um requirements.txt para fixar versões das libs do servidor.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Beleza — isso costuma acontecer porque o app está trocando a URL do próximo frame enquanto ele ainda está carregando, então nenhum chega a “finalizar” e nada aparece. Vamos consertar com um double-buffer com trava de carregamento:
 
 
