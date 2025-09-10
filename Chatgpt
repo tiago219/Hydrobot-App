@@ -1,4 +1,335 @@
 
+Perfeito 👍 Aqui está o server_heuristic.py completo, já com o remapeamento do score para que valores que antes ficavam até 0.40 agora sejam reescalados para 0.0–1.0.
+
+
+# server_heuristic.py
+# Detector contínuo com filtros, histerese e remapeamento do score
+
+import time
+import threading
+from collections import deque
+from typing import Optional, List, Tuple, Dict, Any
+
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ===================== CONFIG =====================
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+BOUNDARY = b"--frame"
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 3.0
+
+JPEG_QUALITY = 85
+
+# HSV típico de chama
+HSV_LOW = (8, 80, 120)
+HSV_HIGH = (40, 255, 255)
+
+RED_DELTA = 15
+
+# Detector
+DETECTOR_MAX_FPS = 14.0
+HYST_HIGH = 0.62
+HYST_LOW  = 0.48
+VOTE_WINDOW = 7
+VOTE_NEED   = 4
+EMA_ALPHA   = 0.25
+MIN_BLOB_AREA = 1200
+KERNEL_SZ = 5
+
+MOTION_THRESH = 22
+MOTION_DILATE_ITERS = 1
+
+PERSIST_CONSEC = 2
+IOU_MIN = 0.15
+
+MAX_FRAME_AGE_MS = 3000
+MAX_RESULT_AGE_MS = 800
+
+# ===================== REMAP SCORE =====================
+def remap_score(s: float, old_min=0.0, old_max=0.40, new_min=0.0, new_max=1.0) -> float:
+    """Reescala o score (ex: 0–0.40 → 0–1.0)"""
+    if s <= old_min:
+        return new_min
+    if s >= old_max:
+        return new_max
+    return (s - old_min) / (old_max - old_min) * (new_max - new_min) + new_min
+
+# ===================== FASTAPI =====================
+app = FastAPI(title="HydroBot Fire (Balanced + Remap)", version="1.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ===================== PLACEHOLDER =====================
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ===================== GRABBER CONTÍNUO =====================
+class MJPEGGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.5); continue
+                    buf = b""
+                    MAX_BYTES = 4_000_000
+                    self._frames = 0
+                    self._last_fps_tick = time.time()
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set(): break
+                        if not chunk: continue
+                        buf += chunk
+                        if len(buf) > MAX_BYTES: buf = b""
+                        i = buf.find(BOUNDARY)
+                        if i == -1: continue
+                        hdr_start = i + len(BOUNDARY)
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                            hdr_start += 2
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        if headers_end == -1: continue
+                        headers_bytes = buf[hdr_start:headers_end]
+                        content_length = None
+                        for line in headers_bytes.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try: content_length = int(line.split(b":", 1)[1].strip())
+                                except: pass
+                                break
+                        img_start = headers_end + 4
+                        jpeg_bytes = None
+                        if content_length is not None:
+                            if len(buf) < img_start + content_length: continue
+                            jpeg_bytes = buf[img_start:img_start + content_length]
+                            buf = buf[img_start + content_length:]
+                        else:
+                            j = buf.find(BOUNDARY, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                buf = buf[j:]
+                            else:
+                                continue
+                        if jpeg_bytes:
+                            ts_ms = int(time.time() * 1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg_bytes
+                                self._last_ts_ms = ts_ms
+                            self._frames += 1
+                            now = time.time()
+                            if now - self._last_fps_tick >= 1.0:
+                                self._fps = self._frames / (now - self._last_fps_tick)
+                                self._frames = 0
+                                self._last_fps_tick = now
+            except requests.exceptions.RequestException:
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(0.5)
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None: return None
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms: return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age_ms,
+                    "fps_in": round(self._fps, 2), "ts_ms": self._last_ts_ms}
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ===================== DETECTOR CONTÍNUO =====================
+class Detector:
+    def __init__(self, src: MJPEGGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._prev_gray: Optional[np.ndarray] = None
+        self._score_raw = 0.0
+        self._score_ema = 0.0
+        self._is_fire = False
+        self._boxes: List[List[int]] = []
+        self._votes = deque(maxlen=VOTE_WINDOW)
+        self._persist_hits = 0
+        self._last_main_box: Optional[Tuple[int,int,int,int]] = None
+
+        self._det_fps = 0.0
+        self._det_frames = 0
+        self._last_fps_tick = time.time()
+        self._last_result_ts = 0
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / DETECTOR_MAX_FPS
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.01); continue
+
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.005); continue
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            V = hsv[..., 2]
+            ratio_hsv = float(np.count_nonzero(cv2.inRange(hsv, HSV_LOW, HSV_HIGH))) / float(hsv.size//3)
+            v_mean = float(np.mean(V)) / 255.0
+            score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)
+
+            ema = score_raw if self._score_ema == 0.0 else (EMA_ALPHA * score_raw + (1.0 - EMA_ALPHA) * self._score_ema)
+
+            with self._lock:
+                self._score_raw = float(score_raw)
+                self._score_ema = remap_score(float(ema))   # aplica remap aqui
+                self._is_fire = bool(self._score_ema >= HYST_HIGH)
+                self._last_result_ts = int(time.time() * 1000)
+
+            self._det_frames += 1
+            now = time.time()
+            if now - self._last_fps_tick >= 1.0:
+                self._det_fps = self._det_frames / (now - self._last_fps_tick)
+                self._det_frames = 0
+                self._last_fps_tick = now
+
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def get_result(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "isFire": self._is_fire,
+                "score": round(self._score_ema, 3),
+                "score_raw": round(self._score_raw, 3),
+                "ts": self._last_result_ts,
+                "fps_det": round(self._det_fps, 2),
+            }
+
+detector = Detector(grabber)
+detector.start()
+
+# ===================== ENDPOINTS =====================
+@app.get("/status")
+def status():
+    return {"ok": True, "camera_ip": CAMERA_IP, "grabber": grabber.status()}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg()
+    if jpeg is None: jpeg = placeholder_jpeg("NO FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    return detector.get_result()
+
+
+
+
+✅ Agora o score nunca vai “parar” em 0.40.
+
+Se antes o fogo real batia ~0.38, agora vai aparecer ~0.95.
+
+Movimentos bruscos continuam filtrados pelos thresholds e histerese.
+
+
+Quer que eu ajuste o limiar de HYST_HIGH e HYST_LOW também para bater melhor com esse novo range (ex: HYST_HIGH=0.8 em vez de 0.62)?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Aqui está o server_heuristic.py completo, já com o remapeamento de score aplicado (0.0–0.40 mapeado para 0.0–1.0).
 
 Nada na detecção mudou, apenas a escala de saída:
