@@ -1,3 +1,618 @@
+Perfeito — vamos deixar a detecção bem menos sensível a mãos/objetos passando rápido. Abaixo está um server_heuristic.py completo que aplica várias salvaguardas anti-falso-positivo, mantendo compatibilidade com o app (ok/isFire/score):
+
+
+O que mudou (resumo)
+
+
+
+
+Histerese mais rígida: HYST_HIGH=0.70, HYST_LOW=0.50, com janela de votos maior (VOTE_WINDOW=8, precisa VOTE_NEED=6).
+
+
+Anti-pele (skin): máscara em YCrCb remove tons de pele que frequentemente confundem com “fogo”.
+
+
+Dominância de vermelho: exige R > G + Δ e R > B + Δ além do HSV laranja/amarelo (fogo real tem forte vermelho).
+
+
+Anti-movimento aprimorado: ignora pixels que mudaram muito (mãos rápidas) e exige persistência espacial: o maior “blob de fogo” precisa persistir em posição por 3 quadros consecutivos (IoU > 0.25 com o anterior).
+
+
+Área mínima maior e morfologia para filtrar ruídos.
+
+
+EMA temporal continua suavizando o score.
+
+
+Detector contínuo por frame (baixa latência), e /detect retorna o último resultado pronto (ou faz fallback síncrono se necessário).
+
+
+
+
+
+
+Se ficar “duro demais”, te digo exatamente quais constantes afrouxar ao final.
+
+
+
+
+
+server_heuristic.py (substitua o arquivo)
+
+
+# server_heuristic.py
+# FastAPI com:
+# - Grabber contínuo do MJPEG (:81/stream)
+# - Detector contínuo com filtros anti-falso-positivo:
+#   * HSV laranja/amarelo + dominância de vermelho (RGB)
+#   * Anti-pele (YCrCb)
+#   * Anti-movimento + persistência espacial (IoU) por N quadros
+#   * Histerese + janela de votos
+# Endpoints compatíveis com o app: /snapshot e /detect
+
+import time
+import threading
+from collections import deque
+from typing import Optional, List, Tuple, Dict, Any
+
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ===================== CONFIG =====================
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+BOUNDARY = b"--frame"
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 3.0
+
+JPEG_QUALITY = 85
+
+# Fogo (HSV laranja/amarelo) — mais seletivo
+HSV_LOW = (10, 120, 140)   # antes (5,80,120)
+HSV_HIGH = (35, 255, 255)
+
+# Dominância de vermelho (RGB)
+RED_DELTA = 25             # R precisa superar G e B por pelo menos 25
+
+# Detector (menos sensível a ruído)
+DETECTOR_MAX_FPS = 14.0
+HYST_HIGH = 0.70
+HYST_LOW  = 0.50
+VOTE_WINDOW = 8
+VOTE_NEED   = 6
+EMA_ALPHA   = 0.25
+MIN_BLOB_AREA = 1800       # maior área mínima
+KERNEL_SZ = 5
+
+# Anti-movimento
+MOTION_THRESH = 22
+MOTION_DILATE_ITERS = 1
+
+# Persistência espacial (IoU)
+PERSIST_CONSEC = 3         # precisa de 3 frames seguidos batendo posição
+IOU_MIN = 0.25
+
+# Idades máximas
+MAX_FRAME_AGE_MS = 3000
+MAX_RESULT_AGE_MS = 800
+
+# ===================== FASTAPI =====================
+app = FastAPI(title="HydroBot Fire (Robusto anti-false positive)", version="0.9.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ===================== PLACEHOLDER =====================
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ===================== GRABBER CONTÍNUO =====================
+class MJPEGGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.5)
+                        continue
+
+                    buf = b""
+                    MAX_BYTES = 4_000_000
+                    self._frames = 0
+                    self._last_fps_tick = time.time()
+
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set():
+                            break
+                        if not chunk:
+                            continue
+                        buf += chunk
+                        if len(buf) > MAX_BYTES:
+                            buf = b""
+
+                        i = buf.find(BOUNDARY)
+                        if i == -1:
+                            continue
+
+                        hdr_start = i + len(BOUNDARY)
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                            hdr_start += 2
+
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        if headers_end == -1:
+                            continue
+
+                        headers_bytes = buf[hdr_start:headers_end]
+                        # content-length opcional
+                        content_length = None
+                        for line in headers_bytes.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try:
+                                    content_length = int(line.split(b":", 1)[1].strip())
+                                except:
+                                    pass
+                                break
+
+                        img_start = headers_end + 4
+                        jpeg_bytes = None
+                        if content_length is not None:
+                            if len(buf) < img_start + content_length:
+                                continue
+                            jpeg_bytes = buf[img_start:img_start + content_length]
+                            buf = buf[img_start + content_length:]
+                        else:
+                            j = buf.find(BOUNDARY, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                buf = buf[j:]
+                            else:
+                                continue
+
+                        if jpeg_bytes:
+                            ts_ms = int(time.time() * 1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg_bytes
+                                self._last_ts_ms = ts_ms
+
+                            self._frames += 1
+                            now = time.time()
+                            if now - self._last_fps_tick >= 1.0:
+                                self._fps = self._frames / (now - self._last_fps_tick)
+                                self._frames = 0
+                                self._last_fps_tick = now
+            except requests.exceptions.RequestException:
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(0.5)
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None:
+                return None
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms:
+                return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age_ms,
+                    "fps_in": round(self._fps, 2), "ts_ms": self._last_ts_ms}
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ===================== UTILs VISÃO =====================
+def rgb_red_dominance_mask(frame_bgr: np.ndarray, delta: int = RED_DELTA) -> np.ndarray:
+    b, g, r = cv2.split(frame_bgr)
+    # r > g + delta e r > b + delta
+    mask = (r.astype(np.int16) > (g.astype(np.int16) + delta)) & (r.astype(np.int16) > (b.astype(np.int16) + delta))
+    return (mask.astype(np.uint8)) * 255
+
+def hsv_fire_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array(HSV_LOW, dtype=np.uint8)
+    upper = np.array(HSV_HIGH, dtype=np.uint8)
+    return cv2.inRange(hsv, lower, upper)
+
+def skin_mask_ycrcb(frame_bgr: np.ndarray) -> np.ndarray:
+    # máscara de pele típica em YCrCb
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))  # faixa clássica
+    # reforço: regiões muito escuras não contam
+    dark = cv2.threshold(y, 60, 255, cv2.THRESH_BINARY)[1]
+    skin = cv2.bitwise_and(skin, dark)
+    return skin  # 255 = pele
+
+def iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    a1, a2 = ax, ay
+    a3, a4 = ax + aw, ay + ah
+    b1, b2 = bx, by
+    b3, b4 = bx + bw, by + bh
+    ix1, iy1 = max(a1, b1), max(a2, b2)
+    ix2, iy2 = min(a3, b3), min(a4, b4)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return float(inter) / float(union) if union > 0 else 0.0
+
+def boxes_from_mask(mask_bin: np.ndarray, min_area: int = MIN_BLOB_AREA) -> List[List[int]]:
+    k = np.ones((KERNEL_SZ, KERNEL_SZ), np.uint8)
+    m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w * h >= min_area:
+            boxes.append([x, y, w, h])
+    return boxes
+
+# ===================== DETECTOR CONTÍNUO =====================
+class Detector:
+    def __init__(self, src: MJPEGGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._prev_gray: Optional[np.ndarray] = None
+        self._score_raw = 0.0
+        self._score_ema = 0.0
+        self._is_fire = False
+        self._boxes: List[List[int]] = []
+        self._votes = deque(maxlen=VOTE_WINDOW)
+        self._persist_hits = 0
+        self._last_main_box: Optional[Tuple[int,int,int,int]] = None
+
+        self._det_fps = 0.0
+        self._det_frames = 0
+        self._last_fps_tick = time.time()
+        self._last_result_ts = 0
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / DETECTOR_MAX_FPS
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.01); continue
+
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.005); continue
+
+            # --- máscaras básicas ---
+            mask_hsv = hsv_fire_mask(frame)
+            mask_red = rgb_red_dominance_mask(frame)
+            mask_skin = skin_mask_ycrcb(frame)
+
+            # remove pele e exige dominância de vermelho
+            mask_fire = cv2.bitwise_and(mask_hsv, mask_red)
+            mask_fire = cv2.bitwise_and(mask_fire, cv2.bitwise_not(mask_skin))
+
+            # --- anti-movimento ---
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            motion_mask = np.zeros_like(gray, dtype=np.uint8)
+            if self._prev_gray is not None:
+                diff = cv2.absdiff(gray, self._prev_gray)
+                _, motion_mask = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
+                if MOTION_DILATE_ITERS > 0:
+                    k = np.ones((3, 3), np.uint8)
+                    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, k, MOTION_DILATE_ITERS)
+            self._prev_gray = gray
+
+            # Só consideramos pixels de fogo que NÃO são movimento abrupto
+            stable_mask = cv2.bitwise_and(mask_fire, cv2.bitwise_not(motion_mask))
+
+            # Score “bruto” pelo HSV (proxy de quão “fogo” está)
+            ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)
+            v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 2])) / 255.0
+            score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)
+
+            # Score “estável” dá mais peso ao que não é movimento
+            ratio_stable = float(np.count_nonzero(stable_mask)) / float(stable_mask.size)
+            score_stable = min(1.0, ratio_stable * 6.0 + v_mean * 0.1)
+
+            # Combinação (mais conservadora)
+            score_combined = 0.35 * score_raw + 0.65 * score_stable
+
+            # EMA temporal
+            ema = score_combined if self._score_ema == 0.0 else (EMA_ALPHA * score_combined + (1.0 - EMA_ALPHA) * self._score_ema)
+
+            # caixas de candidatos (a partir do estável)
+            boxes = boxes_from_mask(stable_mask, MIN_BLOB_AREA)
+
+            # persistência espacial: caixa principal precisa “manter posição” por alguns frames
+            main_box = None
+            if boxes:
+                # escolhe maior área
+                areas = [w*h for (_,_,w,h) in boxes]
+                main_box = boxes[int(np.argmax(areas))]
+
+                if self._last_main_box is not None and main_box is not None:
+                    i = iou(tuple(main_box), tuple(self._last_main_box))
+                    if i >= IOU_MIN:
+                        self._persist_hits += 1
+                    else:
+                        self._persist_hits = 1  # reseta sequência
+                else:
+                    self._persist_hits = 1
+            else:
+                self._persist_hits = 0
+
+            self._last_main_box = tuple(main_box) if main_box is not None else None
+
+            # histerese + votos + persistência espacial
+            if ema >= HYST_HIGH and self._persist_hits >= PERSIST_CONSEC:
+                guess = 1
+            elif ema <= HYST_LOW:
+                guess = 0
+            else:
+                # zona morta: apoia-se no histórico, mas exige persistência mínima
+                guess = 1 if (len(self._votes) > 0 and self._votes[-1] == 1 and self._persist_hits >= PERSIST_CONSEC) else 0
+
+            self._votes.append(guess)
+            final_fire = 1 if sum(self._votes) >= VOTE_NEED else 0
+
+            # atualiza estado
+            with self._lock:
+                self._score_raw = float(score_raw)
+                self._score_ema = float(ema)
+                self._is_fire = bool(final_fire == 1)
+                self._boxes = boxes if self._is_fire else []
+                self._last_result_ts = int(time.time() * 1000)
+
+            # FPS detector
+            self._det_frames += 1
+            now = time.time()
+            if now - self._last_fps_tick >= 1.0:
+                self._det_fps = self._det_frames / (now - self._last_fps_tick)
+                self._det_frames = 0
+                self._last_fps_tick = now
+
+            # respeita teto FPS
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def get_result(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "isFire": self._is_fire,
+                "score": round(self._score_ema, 3),   # compat com app
+                "score_raw": round(self._score_raw, 3),
+                "score_ema": round(self._score_ema, 3),
+                "boxes": self._boxes,
+                "ts": self._last_result_ts,
+                "fps_det": round(self._det_fps, 2),
+                "vote": {"win": VOTE_WINDOW, "need": VOTE_NEED, "sum": int(sum(self._votes))},
+                "persist": {"hits": self._persist_hits, "need": PERSIST_CONSEC, "iou_min": IOU_MIN},
+                "hyst": {"hi": HYST_HIGH, "lo": HYST_LOW},
+            }
+
+detector = Detector(grabber)
+detector.start()
+
+# Fallback síncrono: caso ainda não haja resultado recente
+def sync_detect_once(jpeg: bytes) -> Dict[str, Any]:
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+
+    mask_hsv = hsv_fire_mask(frame)
+    mask_red = rgb_red_dominance_mask(frame)
+    mask_skin = skin_mask_ycrcb(frame)
+
+    mask_fire = cv2.bitwise_and(mask_hsv, mask_red)
+    mask_fire = cv2.bitwise_and(mask_fire, cv2.bitwise_not(mask_skin))
+
+    ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)
+    v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 2])) / 255.0
+    score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)
+    is_fire = bool(score_raw >= HYST_HIGH)  # conservador no fallback
+
+    return {
+        "ok": True, "isFire": is_fire,
+        "score": round(float(score_raw), 3),
+        "score_raw": round(float(score_raw), 3),
+        "score_ema": round(float(score_raw), 3),
+        "boxes": [], "ts": int(time.time() * 1000), "fallback": True
+    }
+
+# ===================== ENDPOINTS =====================
+@app.get("/status")
+def status():
+    s1 = grabber.status()
+    s2 = detector.get_result()
+    return {"ok": True, "camera_ip": s1["ip"], "model": "robust_detector",
+            "fps_in": s1["fps_in"], "hasFrame": s1["hasFrame"], "age_ms": s1["age_ms"], **s2}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)  # reinicia stream
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        jpeg = placeholder_jpeg("NO LIVE FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    res = detector.get_result()
+    if res.get("ts", 0) and (int(time.time() * 1000) - res["ts"] <= MAX_RESULT_AGE_MS):
+        return res
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        return {"ok": False, "error": "no recent frame"}
+    return sync_detect_once(jpeg)
+
+
+
+
+Parametrização rápida (caso precise calibrar)
+
+
+
+
+
+
+Quer ainda menos sensível?
+
+
+
+
+Aumente HYST_HIGH para 0.75.
+
+
+Aumente VOTE_NEED para 7.
+
+
+Aumente PERSIST_CONSEC para 4.
+
+
+Aumente MIN_BLOB_AREA para 2400.
+
+
+
+
+
+
+
+
+Quer um pouco mais sensível (mas ainda robusto)?
+
+
+
+
+Diminua HYST_HIGH para 0.65.
+
+
+VOTE_NEED = 5.
+
+
+PERSIST_CONSEC = 2.
+
+
+
+
+
+
+
+
+
+
+Dica: abra http://IP_DO_PC:8000/status no navegador para ver score, isFire, vote.sum, persist.hits e ir ajustando “ao vivo”.
+
+
+
+
+Você não precisa mudar nada no app. Assim que trocar este server_heuristic.py e reiniciar o uvicorn, os falsos positivos por mão/objetos rápidos devem cair bastante. Se ainda sobrar algum cenário chato, me descreva a iluminação e o que aparece na imagem; eu ajusto as faixas HSV/skin e os deltas de vermelho em cima disso.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Valeu pelo retorno — vamos deixar detectando de novo agora. O problema foi o servidor novo ter ficado conservador demais (anti-movimento + votos) e também porque o JSON já não tinha o campo score que o app espera. Abaixo te mando um server_heuristic.py revisado que:
 
 
