@@ -1,3 +1,871 @@
+# server_heuristic.py  
+# Detector contínuo com filtros e sensibilidade ajustados para detectar fogo real  
+# sem voltar aos falsos positivos comuns (mãos rápidas etc).  
+  
+import time  
+import threading  
+from collections import deque  
+from typing import Optional, List, Tuple, Dict, Any  
+  
+import numpy as np  
+import cv2  
+import requests  
+from fastapi import FastAPI, Response  
+from fastapi.middleware.cors import CORSMiddleware  
+from pydantic import BaseModel  
+  
+# ===================== CONFIG =====================  
+CAMERA_IP = "192.168.4.1"  
+STREAM_URL_FMT = "http://{}:81/stream"  
+BOUNDARY = b"--frame"  
+CONNECT_TIMEOUT = 3.0  
+READ_TIMEOUT = 3.0  
+  
+JPEG_QUALITY = 85  
+  
+# HSV mais amplo p/ fogo real (amarelo/laranja)  
+HSV_LOW = (8, 80, 120)  
+HSV_HIGH = (40, 255, 255)  
+  
+# Dominância de vermelho (reforço, não bloqueio)  
+RED_DELTA = 15  # R deve ser ao menos 15 maior que G e B para reforço  
+  
+# Detector (equilíbrio sensibilidade/robustez)  
+DETECTOR_MAX_FPS = 14.0  
+HYST_HIGH = 0.18   # <<< ativa fogo a partir de 0.40
+HYST_LOW  = 0.15   # <<< desativa abaixo de 0.30 (histerese)
+VOTE_WINDOW = 7  
+VOTE_NEED   = 4  
+EMA_ALPHA   = 0.25  
+MIN_BLOB_AREA = 1200  
+KERNEL_SZ = 5  
+  
+# Anti-movimento  
+MOTION_THRESH = 22  
+MOTION_DILATE_ITERS = 1  
+  
+# Persistência espacial  
+PERSIST_CONSEC = 2  
+IOU_MIN = 0.15  
+  
+# Idades máximas  
+MAX_FRAME_AGE_MS = 3000  
+MAX_RESULT_AGE_MS = 800  
+  
+# ===================== FASTAPI =====================  
+app = FastAPI(title="HydroBot Fire (Balanced)", version="1.0.0")  
+app.add_middleware(  
+    CORSMiddleware,  
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]  
+)  
+  
+class ConfigIn(BaseModel):  
+    camera_ip: str  
+  
+# ===================== PLACEHOLDER =====================  
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:  
+    img = np.zeros((270, 480, 3), dtype=np.uint8)  
+    img[:, :] = (40, 40, 200)  
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)  
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)  
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])  
+    return buf.tobytes()  
+  
+# ===================== GRABBER CONTÍNUO =====================  
+class MJPEGGrabber:  
+    def __init__(self):  
+        self._lock = threading.Lock()  
+        self._stop = threading.Event()  
+        self._thread: Optional[threading.Thread] = None  
+        self._ip = CAMERA_IP  
+        self._last_jpeg: Optional[bytes] = None  
+        self._last_ts_ms: int = 0  
+        self._frames = 0  
+        self._fps = 0.0  
+        self._last_fps_tick = time.time()  
+  
+    def start(self, ip: Optional[str] = None):  
+        if ip:  
+            self._ip = ip  
+        self.stop()  
+        self._stop.clear()  
+        self._thread = threading.Thread(target=self._run, daemon=True)  
+        self._thread.start()  
+  
+    def stop(self):  
+        self._stop.set()  
+        if self._thread and self._thread.is_alive():  
+            self._thread.join(timeout=1.0)  
+        self._thread = None  
+  
+    def _run(self):  
+        while not self._stop.is_set():  
+            url = STREAM_URL_FMT.format(self._ip)  
+            try:  
+                with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:  
+                    if r.status_code != 200:  
+                        time.sleep(0.5); continue  
+                    buf = b""  
+                    MAX_BYTES = 4_000_000  
+                    self._frames = 0  
+                    self._last_fps_tick = time.time()  
+                    for chunk in r.iter_content(chunk_size=4096):  
+                        if self._stop.is_set(): break  
+                        if not chunk: continue  
+                        buf += chunk  
+                        if len(buf) > MAX_BYTES: buf = b""  
+                        i = buf.find(BOUNDARY)  
+                        if i == -1: continue  
+                        hdr_start = i + len(BOUNDARY)  
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":  
+                            hdr_start += 2  
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)  
+                        if headers_end == -1: continue  
+                        headers_bytes = buf[hdr_start:headers_end]  
+                        content_length = None  
+                        for line in headers_bytes.split(b"\r\n"):  
+                            if line.lower().startswith(b"content-length:"):  
+                                try: content_length = int(line.split(b":", 1)[1].strip())  
+                                except: pass  
+                                break  
+                        img_start = headers_end + 4  
+                        jpeg_bytes = None  
+                        if content_length is not None:  
+                            if len(buf) < img_start + content_length: continue  
+                            jpeg_bytes = buf[img_start:img_start + content_length]  
+                            buf = buf[img_start + content_length:]  
+                        else:  
+                            j = buf.find(BOUNDARY, img_start)  
+                            if j != -1:  
+                                jpeg_bytes = buf[img_start:j]  
+                                buf = buf[j:]  
+                            else:  
+                                continue  
+                        if jpeg_bytes:  
+                            ts_ms = int(time.time() * 1000)  
+                            with self._lock:  
+                                self._last_jpeg = jpeg_bytes  
+                                self._last_ts_ms = ts_ms  
+                            self._frames += 1  
+                            now = time.time()  
+                            if now - self._last_fps_tick >= 1.0:  
+                                self._fps = self._frames / (now - self._last_fps_tick)  
+                                self._frames = 0  
+                                self._last_fps_tick = now  
+            except requests.exceptions.RequestException:  
+                time.sleep(0.5)  
+            except Exception:  
+                time.sleep(0.5)  
+  
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:  
+        with self._lock:  
+            if self._last_jpeg is None: return None  
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms: return None  
+            return self._last_jpeg  
+  
+    def status(self):  
+        with self._lock:  
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None  
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age_ms,  
+                    "fps_in": round(self._fps, 2), "ts_ms": self._last_ts_ms}  
+  
+grabber = MJPEGGrabber()  
+grabber.start(CAMERA_IP)  
+  
+# ===================== UTILs VISÃO =====================  
+def rgb_red_dominance_mask(frame_bgr: np.ndarray, delta: int = RED_DELTA) -> np.ndarray:  
+    b, g, r = cv2.split(frame_bgr)  
+    mask = (r.astype(np.int16) > (g.astype(np.int16) + delta)) & (r.astype(np.int16) > (b.astype(np.int16) + delta))  
+    return (mask.astype(np.uint8)) * 255  
+  
+def hsv_fire_mask(frame_bgr: np.ndarray) -> np.ndarray:  
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)  
+    lower = np.array(HSV_LOW, dtype=np.uint8)  
+    upper = np.array(HSV_HIGH, dtype=np.uint8)  
+    return cv2.inRange(hsv, lower, upper)  
+  
+def skin_mask_ycrcb(frame_bgr: np.ndarray) -> np.ndarray:  
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)  
+    y, cr, cb = cv2.split(ycrcb)  
+    skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))  
+    dark = cv2.threshold(y, 60, 255, cv2.THRESH_BINARY)[1]  
+    skin = cv2.bitwise_and(skin, dark)  
+    return skin  
+  
+def iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:  
+    ax, ay, aw, ah = a; bx, by, bw, bh = b  
+    ax2, ay2 = ax + aw, ay + ah; bx2, by2 = bx + bw, by + bh  
+    ix1, iy1 = max(ax, bx), max(ay, by)  
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)  
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)  
+    inter = iw * ih; union = aw*ah + bw*bh - inter  
+    return float(inter) / float(union) if union > 0 else 0.0  
+  
+def boxes_from_mask(mask_bin: np.ndarray, min_area: int = MIN_BLOB_AREA) -> List[List[int]]:  
+    k = np.ones((KERNEL_SZ, KERNEL_SZ), np.uint8)  
+    m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)  
+    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)  
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  
+    boxes: List[List[int]] = []  
+    for c in cnts:  
+        x, y, w, h = cv2.boundingRect(c)  
+        if w * h >= min_area:  
+            boxes.append([x, y, w, h])  
+    return boxes  
+  
+# ===================== DETECTOR CONTÍNUO =====================  
+class Detector:  
+    def __init__(self, src: MJPEGGrabber):  
+        self.src = src  
+        self._lock = threading.Lock()  
+        self._stop = threading.Event()  
+        self._thread: Optional[threading.Thread] = None  
+  
+        self._prev_gray: Optional[np.ndarray] = None  
+        self._score_raw = 0.0  
+        self._score_ema = 0.0  
+        self._is_fire = False  
+        self._boxes: List[List[int]] = []  
+        self._votes = deque(maxlen=VOTE_WINDOW)  
+        self._persist_hits = 0  
+        self._last_main_box: Optional[Tuple[int,int,int,int]] = None  
+  
+        self._det_fps = 0.0  
+        self._det_frames = 0  
+        self._last_fps_tick = time.time()  
+        self._last_result_ts = 0  
+  
+    def start(self):  
+        self.stop()  
+        self._stop.clear()  
+        self._thread = threading.Thread(target=self._run, daemon=True)  
+        self._thread.start()  
+  
+    def stop(self):  
+        self._stop.set()  
+        if self._thread and self._thread.is_alive():  
+            self._thread.join(timeout=1.0)  
+        self._thread = None  
+  
+    def _run(self):  
+        min_interval = 1.0 / DETECTOR_MAX_FPS  
+        while not self._stop.is_set():  
+            t0 = time.time()  
+            jpeg = self.src.get_latest_jpeg()  
+            if jpeg is None:  
+                time.sleep(0.01); continue  
+  
+            arr = np.frombuffer(jpeg, dtype=np.uint8)  
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)  
+            if frame is None:  
+                time.sleep(0.005); continue  
+  
+            # --- máscaras base ---  
+            mask_hsv = hsv_fire_mask(frame)  
+            mask_skin = skin_mask_ycrcb(frame)  
+            mask_red  = rgb_red_dominance_mask(frame)  
+  
+            # anti-movimento  
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)  
+            motion_mask = np.zeros_like(gray, dtype=np.uint8)  
+            if self._prev_gray is not None:  
+                diff = cv2.absdiff(gray, self._prev_gray)  
+                _, motion_mask = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)  
+                if MOTION_DILATE_ITERS > 0:  
+                    k = np.ones((3, 3), np.uint8)  
+                    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, k, MOTION_DILATE_ITERS)  
+            self._prev_gray = gray  
+  
+            # combinação principal: HSV ∧ ¬pele ∧ ¬movimento  
+            stable = cv2.bitwise_and(mask_hsv, cv2.bitwise_not(mask_skin))  
+            stable = cv2.bitwise_and(stable, cv2.bitwise_not(motion_mask))  
+  
+            # reforço: se pixel for muito claro e tiver dominância de vermelho, adiciona  
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)  
+            V = hsv[..., 2]  
+            bright = cv2.threshold(V, 200, 255, cv2.THRESH_BINARY)[1]  # bem claro  
+            red_boost = cv2.bitwise_and(mask_red, bright)  
+            combined = cv2.bitwise_or(stable, red_boost)  
+  
+            # scores  
+            ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)  
+            v_mean = float(np.mean(V)) / 255.0  
+            score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)  
+  
+            ratio_combined = float(np.count_nonzero(combined)) / float(combined.size)  
+            score_combined = min(1.0, ratio_combined * 5.0 + v_mean * 0.1)  
+  
+            ema = score_combined if self._score_ema == 0.0 else (EMA_ALPHA * score_combined + (1.0 - EMA_ALPHA) * self._score_ema)  
+  
+            # caixas com base no combined (mais sensível que só stable)  
+            boxes = boxes_from_mask(combined, MIN_BLOB_AREA)  
+  
+            # persistência espacial leve  
+            main_box = None  
+            if boxes:  
+                areas = [w*h for (_,_,w,h) in boxes]  
+                main_box = boxes[int(np.argmax(areas))]  
+                if self._last_main_box is not None:  
+                    if iou(tuple(main_box), tuple(self._last_main_box)) >= IOU_MIN:  
+                        self._persist_hits += 1  
+                    else:  
+                        self._persist_hits = 1  
+                else:  
+                    self._persist_hits = 1  
+            else:  
+                self._persist_hits = 0  
+            self._last_main_box = tuple(main_box) if main_box is not None else None  
+  
+            # histerese + votos + persistência (agora com HIGH=0.40)  
+            if ema >= HYST_HIGH and self._persist_hits >= PERSIST_CONSEC:  
+                guess = 1  
+            elif ema <= HYST_LOW:  
+                guess = 0  
+            else:  
+                guess = (1 if (len(self._votes) > 0 and self._votes[-1] == 1 and self._persist_hits >= PERSIST_CONSEC) else 0)  
+  
+            self._votes.append(guess)  
+            final_fire = 1 if sum(self._votes) >= VOTE_NEED else 0  
+  
+            with self._lock:  
+                self._score_raw = float(score_raw)  
+                self._score_ema = float(ema)  
+                self._is_fire = bool(final_fire == 1)  
+                self._boxes = boxes if self._is_fire else []  
+                self._last_result_ts = int(time.time() * 1000)  
+  
+            # FPS detector  
+            self._det_frames += 1  
+            now = time.time()  
+            if now - self._last_fps_tick >= 1.0:  
+                self._det_fps = self._det_frames / (now - self._last_fps_tick)  
+                self._det_frames = 0  
+                self._last_fps_tick = now  
+  
+            elapsed = time.time() - t0  
+            if elapsed < min_interval:  
+                time.sleep(min_interval - elapsed)  
+  
+    def get_result(self) -> Dict[str, Any]:  
+        with self._lock:  
+            return {  
+                "ok": True,  
+                "isFire": self._is_fire,  
+                "score": round(self._score_ema, 3),  
+                "score_raw": round(self._score_raw, 3),  
+                "score_ema": round(self._score_ema, 3),  
+                "boxes": self._boxes,  
+                "ts": self._last_result_ts,  
+                "fps_det": round(self._det_fps, 2),  
+                "vote": {"win": VOTE_WINDOW, "need": VOTE_NEED, "sum": int(sum(self._votes))},  
+                "persist": {"hits": self._persist_hits, "need": PERSIST_CONSEC, "iou_min": IOU_MIN},  
+                "hyst": {"hi": HYST_HIGH, "lo": HYST_LOW},  
+            }  
+  
+detector = Detector(grabber)  
+detector.start()  
+  
+# Fallback síncrono se não houver resultado recente  
+def sync_detect_once(jpeg: bytes) -> Dict[str, Any]:  
+    arr = np.frombuffer(jpeg, dtype=np.uint8)  
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)  
+    if frame is None:  
+        return {"ok": False, "error": "decode failed"}  
+    mask_hsv = hsv_fire_mask(frame)  
+    ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)  
+    v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 2])) / 255.0  
+    score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)  
+    is_fire = bool(score_raw >= HYST_HIGH)  
+    return {  
+        "ok": True, "isFire": is_fire,  
+        "score": round(float(score_raw), 3),  
+        "score_raw": round(float(score_raw), 3),  
+        "score_ema": round(float(score_raw), 3),  
+        "boxes": [], "ts": int(time.time() * 1000), "fallback": True  
+    }  
+  
+# ===================== ENDPOINTS =====================  
+@app.get("/status")  
+def status():  
+    s1 = grabber.status()  
+    s2 = detector.get_result()  
+    return {"ok": True, "camera_ip": s1["ip"], "model": "balanced_detector",  
+            "fps_in": s1["fps_in"], "hasFrame": s1["hasFrame"], "age_ms": s1["age_ms"], **s2}  
+  
+@app.post("/config")  
+def set_config(cfg: ConfigIn):  
+    global CAMERA_IP  
+    CAMERA_IP = cfg.camera_ip  
+    grabber.start(CAMERA_IP)  
+    return {"ok": True, "camera_ip": CAMERA_IP}  
+  
+@app.get("/snapshot")  
+def snapshot():  
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)  
+    if jpeg is None:  
+        jpeg = placeholder_jpeg("NO LIVE FRAME")  
+    return Response(content=jpeg, media_type="image/jpeg")  
+  
+@app.get("/detect")  
+def detect():  
+    res = detector.get_result()  
+    if res.get("ts", 0) and (int(time.time() * 1000) - res["ts"] <= MAX_RESULT_AGE_MS):  
+        return res  
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)  
+    if jpeg is None:  
+        return {"ok": False, "error": "no recent frame"}  
+    return sync_detect_once(jpeg)  
+
+
+
+
+
+
+// app/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Animated,
+} from "react-native";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+// -------- Crossfade com trava: só muda quando o próximo terminar de carregar --------
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {currentUri ? (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      ) : null}
+
+      {showNext ? (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => {
+              // fallback: promove mesmo assim; servidor tende a devolver placeholder JPEG
+              onNextShown();
+            }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 120, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
+  );
+}
+
+const textsByLang = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi e IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ENC.", ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.", pumpOff: "BOMBA APAG.", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // registro automático
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // vídeo (double buffer + trava)
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo via snapshots — mais rápido e SEM flicker =====
+  useEffect(() => {
+    let stop = false;
+    const FPS_INTERVAL = 150; // ~6–7 fps
+
+    // primeiro frame (placeholder/real) para não ficar tela preta
+    setCurrentFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+
+    return () => { stop = true; };
+  }, [server]);
+
+  function onNextLoadStart() {
+    loadingNextRef.current = true;
+  }
+  function onNextShown() {
+    if (nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    loadingNextRef.current = false;
+  }
+
+  // ===== DETECT =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+        }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 120); // ~5 Hz
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Registro automático =====
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+        </View>
+      )}
+
+      {/* Vídeo (sem flicker) */}
+      <CrossfadeImage
+        currentUri={currentFrameUri}
+        nextUri={nextFrameUri}
+        onNextLoadStart={onNextLoadStart}
+        onNextShown={onNextShown}
+      />
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.bg,
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  // Vídeo
+  video: { flex: 1, backgroundColor: "black", width: "100%" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 Ótimo 🚀 Vou te mandar os dois códigos completos, já ajustados para garantir 20 FPS mínimos no app sem alterar a lógica de detecção de fogo.
 
