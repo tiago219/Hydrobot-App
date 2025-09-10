@@ -1,3 +1,247 @@
+
+Sim — eu ajustei o server_heuristic.py para ler o MJPEG manualmente (sem cv2.VideoCapture) e para sempre devolver um JPEG em /snapshot (com placeholder quando falhar), o que evita que o app quebre e elimina flicker quando combinado com o crossfade no app.
+
+
+Aqui está o arquivo completo:
+
+
+# server_heuristic.py
+# FastAPI lendo MJPEG do ESP32-CAM manualmente (sem cv2.VideoCapture).
+# /snapshot e /detect: abre :81/stream, extrai 1 JPEG e fecha.
+# Em falha, /snapshot retorna um JPEG placeholder (status 200) para o app não quebrar.
+
+import time
+from typing import Optional, List
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ---------- CONFIG ----------
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+SCORE_THRESHOLD = 0.60
+CONNECT_TIMEOUT = 3.0   # seg para conectar
+READ_TIMEOUT = 3.0      # seg para ler primeiro frame
+BOUNDARY = b"--frame"   # boundary usado no ESP
+JPEG_QUALITY = 85
+
+# ---------- FASTAPI ----------
+app = FastAPI(title="HydroBot Fire (MJPEG manual)", version="0.3.1")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ---------- MJPEG READER ----------
+def read_one_jpeg_from_mjpeg(ip: str) -> Optional[bytes]:
+    """
+    Abre http://<ip>:81/stream e extrai o PRIMEIRO JPEG usando o boundary '--frame'.
+    Retorna bytes do JPEG ou None se falhar.
+    """
+    url = STREAM_URL_FMT.format(ip)
+    t0 = time.time()
+    try:
+        with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+            if r.status_code != 200:
+                return None
+
+            buf = b""
+            MAX_BYTES = 2_000_000
+            while time.time() - t0 < READ_TIMEOUT:
+                for chunk in r.iter_content(chunk_size=4096):
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    if len(buf) > MAX_BYTES:
+                        return None
+
+                    # procura boundary
+                    i = buf.find(BOUNDARY)
+                    if i == -1:
+                        continue
+
+                    # pula \r\n após boundary (se houver)
+                    hdr_start = i + len(BOUNDARY)
+                    while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                        hdr_start += 2
+
+                    # fim dos headers
+                    headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                    if headers_end == -1:
+                        continue
+
+                    headers_bytes = buf[hdr_start:headers_end]
+                    headers_text = headers_bytes.decode("latin1", errors="ignore")
+
+                    content_length = None
+                    for line in headers_text.split("\r\n"):
+                        if line.lower().startswith("content-length:"):
+                            try:
+                                content_length = int(line.split(":", 1)[1].strip())
+                            except:
+                                pass
+                            break
+
+                    img_start = headers_end + 4
+                    if content_length is not None:
+                        # temos tamanho => espere tudo chegar
+                        if len(buf) < img_start + content_length:
+                            continue
+                        return buf[img_start:img_start + content_length]
+                    else:
+                        # delimita até o próximo boundary
+                        j = buf.find(BOUNDARY, img_start)
+                        if j != -1:
+                            jpeg = buf[img_start:j]
+                            # tenta cortar até marcador de fim JPEG
+                            end = jpeg.rfind(b"\xff\xd9")
+                            if end != -1:
+                                jpeg = jpeg[:end+2]
+                            return jpeg
+            return None
+    except requests.exceptions.RequestException:
+        return None
+
+def decode_jpeg_to_bgr(jpeg_bytes: bytes):
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+# ---------- FIRE HEURISTIC ----------
+def fire_score(frame) -> float:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # faixa laranja/amarela comum em chamas
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[..., 2])) / 255.0
+    return min(1.0, ratio * 4.0 + v_mean * 0.2)
+
+def fire_boxes(frame) -> List[List[int]]:
+    h, w = frame.shape[:2]
+    scl = min(640, w)
+    rs = cv2.resize(frame, (scl, int(h * scl / w)))
+    hsv = cv2.cvtColor(rs, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (5, 80, 120), (40, 255, 255))
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rx = w / float(scl)
+    ry = h / float(rs.shape[0])
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh < 600:
+            continue
+        boxes.append([int(x * rx), int(y * ry), int(bw * rx), int(bh * ry)])
+    return boxes
+
+# ---------- HELPERS ----------
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)  # BGR
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ---------- ENDPOINTS ----------
+@app.get("/status")
+def status():
+    return {"ok": True, "camera_ip": CAMERA_IP, "model": "mjpeg_manual", "threshold": SCORE_THRESHOLD}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        # devolve SEMPRE um JPEG para não quebrar o <Image>
+        jpeg = placeholder_jpeg("NO FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    jpeg = read_one_jpeg_from_mjpeg(CAMERA_IP)
+    if jpeg is None:
+        return {"ok": False, "error": "no frame"}
+    frame = decode_jpeg_to_bgr(jpeg)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    s = fire_score(frame)
+    is_fire = bool(s >= SCORE_THRESHOLD)
+    return {
+        "ok": True,
+        "isFire": is_fire,
+        "score": round(float(s), 3),
+        "threshold": SCORE_THRESHOLD,
+        "boxes": fire_boxes(frame) if is_fire else [],
+        "ts": int(time.time() * 1000),
+    }
+
+
+
+Como rodar (lembrando):
+
+
+pip install fastapi uvicorn numpy opencv-python requests
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+No app, o campo Servidor deve apontar para http://IP_DO_SEU_PC:8000.
+
+
+/snapshot sempre entrega um JPEG (placeholder se a câmera falhar).
+
+
+Combine isso com o crossfade (double-buffer) que te mandei no CameraScreen.tsx para eliminar o flicker visual no app.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito 👍 Vamos fazer isso organizado.
 
 Como você está na Opção A (servidor intermediário), só precisa alterar dois arquivos:
