@@ -1,39 +1,526 @@
+Boa! Esse erro da sua print é de TypeScript:
 
-boa! vi sua árvore:
-
-
-
-
-hydrobot-server/ (com server_heuristic.py e models/)
-
-
-HydroBotApp2/ (com src/screens/CameraScreen.tsx)
+> Cannot find name 'True' (ts2304)
 
 
 
+Eu deixei passar um “True” (estilo Python) numa linha do CameraScreen.tsx. Em TS/JS é true.
+Ajuste rápido abaixo 👇
 
-Vou te mandar tudo completo já ajustado para essa estrutura + um modo “forçar SSD” (fica 100% sem Darknet) e um endpoint de debug pra você ver no navegador se os modelos foram achados e qual backend está ativo.
+Arquivo para corrigir (completo)
+
+Substitua HydroBotApp2/src/screens/CameraScreen.tsx pelo arquivo abaixo (é igual ao que te mandei, só corrigi a função parseObjects e removi o True):
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Animated,
+} from "react-native";
+import { WebView } from "react-native-webview";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+function LiveMJPEG({ ip }: { ip: string }) {
+  const html = `
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;}
+        .wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+        img{max-width:100%;max-height:100%;object-fit:contain;background:#000;}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <img src="http://${ip}:81/stream" />
+      </div>
+    </body></html>
+  `;
+  return (
+    <WebView
+      originWhitelist={["*"]}
+      source={{ html }}
+      javaScriptEnabled
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      automaticallyAdjustContentInsets={false}
+      style={{ flex: 1, backgroundColor: "black" }}
+    />
+  );
+}
+
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {currentUri ? (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      ) : null}
+
+      {showNext ? (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
+  );
+}
+
+const textsByLang = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi e IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Visão:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "View:",
+    stream: "STREAM (fast)",
+    snapshot: "SNAPSHOT (fallback)",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ENC.", ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.", pumpOff: "BOMBA APAG.", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Vista:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+type ObjItem = { label?: string; conf?: number; box?: number[] };
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  const [hasPerson, setHasPerson] = useState(false);
+  const [animals, setAnimals] = useState<string[]>([]);
+  const [objFps, setObjFps] = useState<number>(0);
+  const [objCount, setObjCount] = useState<number>(0);
+  const [objOk, setObjOk] = useState<boolean>(false);
+
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  const [useStream, setUseStream] = useState(true);
+
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // --------- CORREÇÃO AQUI: nada de "True", só boolean JS ----------
+  function parseObjects(payload: any): { list: ObjItem[]; ok: boolean; fps: number } {
+    if (!payload) return { list: [], ok: false, fps: 0 };
+    let list: ObjItem[] = [];
+    let ok = false;
+    let fps = 0;
+    if (Array.isArray(payload)) { list = payload as ObjItem[]; ok = true; }
+    if (payload.objects) {
+      if (Array.isArray(payload.objects)) list = payload.objects as ObjItem[];
+      else if (Array.isArray(payload.objects?.objects)) list = payload.objects.objects as ObjItem[];
+      ok = !!(payload.ok ?? payload.objects?.ok ?? true);
+      fps = Number(payload.fps_obj ?? payload.objects?.fps_obj ?? 0) || 0;
+    }
+    return { list, ok, fps };
+  }
+  // ---------------------------------------------------------------
+
+  const ANIMAL_NAMES = ["dog","cat","bird","horse","sheep","cow","elephant","bear","zebra","giraffe"];
+
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  useEffect(() => {
+    if (useStream) return;
+    let stop = false;
+    const FPS_INTERVAL = 40;
+    setCurrentFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server, useStream]);
+
+  function onNextLoadStart() { loadingNextRef.current = true; }
+  function onNextShown() { if (nextFrameUri) setCurrentFrameUri(nextFrameUri); loadingNextRef.current = false; }
+
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+          const { list, ok, fps } = parseObjects(j.objects);
+          if (ok) {
+            const labels = list.map(o => (o.label || "").toLowerCase());
+            setHasPerson(labels.includes("person"));
+            const anims = Array.from(new Set(labels.filter(l => ANIMAL_NAMES.includes(l)))).slice(0, 3);
+            setAnimals(anims);
+            setObjCount(list.length);
+            setObjFps(fps);
+            setObjOk(true);
+          } else {
+            setObjOk(false);
+          }
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false); setFireScore(0);
+          setObjOk(false); setHasPerson(false); setAnimals([]); setObjCount(0); setObjFps(0);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 140);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  useEffect(() => {
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/objects`, { method: "GET" });
+        const j = await r.json();
+        const { list, ok, fps } = parseObjects(j);
+        if (!stop && ok) {
+          const labels = list.map(o => (o.label || "").toLowerCase());
+          setHasPerson(labels.includes("person"));
+          const anims = Array.from(new Set(labels.filter(l => ANIMAL_NAMES.includes(l)))).slice(0, 3);
+          setAnimals(anims);
+          setObjCount(list.length);
+          setObjFps(fps);
+          setObjOk(true);
+        }
+      } catch {}
+      finally {
+        if (!stop) setTimeout(loop, 500);
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [server]);
+
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder={T.placeholderIp} autoCapitalize="none" autoCorrect={false} style={styles.input} keyboardType="numeric" />
+        <Pressable onPress={pingStatus} style={styles.btn}><Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text></Pressable>
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text></Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text></Pressable>
+      </View>
+
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput value={server} onChangeText={setServer} placeholder={T.placeholderServer} autoCapitalize="none" autoCorrect={false} style={[styles.input, { flex: 1 }]} />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      <View style={[styles.statusRow, { gap: 6 }]}>
+        <Text style={styles.label}>{T.view}</Text>
+        <Pressable onPress={() => setUseStream(true)} style={[styles.btn, useStream ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{T.stream}</Text></Pressable>
+        <Pressable onPress={() => setUseStream(false)} style={[styles.btn, !useStream ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{T.snapshot}</Text></Pressable>
+      </View>
+
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+        </View>
+      )}
+
+      {hasPerson && (
+        <View style={[styles.infoBanner, { backgroundColor: "#143b7a" }]}>
+          <Text style={styles.infoText}>👤 Pessoa detectada</Text>
+        </View>
+      )}
+      {!!animals.length && (
+        <View style={[styles.infoBanner, { backgroundColor: "#225c2a" }]}>
+          <Text style={styles.infoText}>🐾 Animais: {animals.join(", ")}</Text>
+        </View>
+      )}
+
+      <View style={{ flex: 1 }}>
+        {useStream ? (
+          <LiveMJPEG ip={ip} />
+        ) : (
+          <CrossfadeImage currentUri={currentFrameUri} nextUri={nextFrameUri} onNextLoadStart={onNextLoadStart} onNextShown={onNextShown} />
+        )}
+      </View>
+
+      <View pointerEvents="none" style={styles.objHud}>
+        <Text style={styles.objHudText}>OBJ: {objOk ? `${objCount} itens` : "—"} {objFps ? `@ ${objFps} fps` : ""}</Text>
+      </View>
+
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }] } {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View style={[styles.joyKnob, { width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R, transform: [{ translateX: knobLeft }, { translateY: knobTop }], opacity: dragging ? 1 : 0.9 }]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" }, fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  infoBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  infoText: { color: "white", fontWeight: "700" },
+  objHud: { position: "absolute", right: 10, top: 10, backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: 1, borderColor: "rgba(255,255,255,0.18)" },
+  objHudText: { color: "#e5e7eb", fontSize: 12, fontWeight: "600" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+Passo a passo rápido
+
+1. Salve o arquivo acima em HydroBotApp2/src/screens/CameraScreen.tsx.
+
+
+2. Reinicie o bundler (isso ajuda a limpar cache do Metro):
+
+Pare o app/Expo.
+
+Rode: npx expo start -c (ou npm start -- --reset-cache).
+
+
+
+3. Abra o app, confirme o IP do servidor no campo “Servidor:”.
+
+
+4. Ative “Detectar” — agora os banners de Pessoa detectada e Animais devem aparecer quando o servidor retornar objetos.
+
+
+
+Se aparecer outro erro, me diga a linha/coluna que o VSCode mostra (como na sua print) que eu já corrijo.
 
 
 
 
-Motivo do erro que você viu no navegador: em muitas builds do OpenCV, o parser Darknet dá “Unknown layer type” com certos .cfg do YOLOv4. Por isso, além de manter o YOLOv4-tiny como tentativa, eu adicionei um fallback automático para SSD e a opção de forçar SSD (que não usa o parser Darknet).
 
 
 
 
 
-1) hydrobot-server/server_heuristic.py — COMPLETO
 
 
 
 
-Substitua o seu por este arquivo (mesmo nome e pasta). Ele mantém toda a detecção de fogo igual e adiciona:
 
 
 
 
-pessoas/animais com YOLOv4-tiny → fallback para MobileNet-SSD;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 flag FORCE_SSD para pular o YOLO e garantir que suba;
