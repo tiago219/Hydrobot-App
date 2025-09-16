@@ -1,3 +1,654 @@
+
+Vamos direto ao ponto: o servidor está ok, mas a tela Câmera não estava exibindo o feedback de pessoas/animais que o endpoint já envia. Abaixo te passo:
+
+
+
+
+como testar o servidor rapidinho (para confirmar que ele está detectando),
+
+
+o arquivo completo CameraScreen.tsx com as mudanças para mostrar contagem estável de pessoas e animais quando você clica em Detectar (sem depender de novas libs nem desenhar caixas).
+
+
+
+
+
+1) Teste rápido do servidor (confirma se está detectando)
+
+
+No PC do servidor, com a câmera apontando para alguém/animal:
+
+
+
+
+
+
+Abra http://SEU_PC:8000/debug_models
+
+→ Deve ter: "objects_backend":"mobilenet-ssd", "objects_ok": true.
+
+
+
+
+
+
+Abra http://SEU_PC:8000/objects
+
+→ Deve aparecer algo assim quando há alguém no quadro:
+
+
+{
+  "ok": true,
+  "backend": "mobilenet-ssd",
+  "objects": [
+    {"label":"person","conf":0.82,"box":[...]}
+  ]
+}
+
+
+
+
+
+
+
+Se /objects trouxer lista vazia mesmo com pessoa no quadro, me diga que ajusto os thresholds; mas normalmente aparece.
+
+
+
+2) Substitua sua tela por ESTE CameraScreen.tsx (COMPLETO)
+
+
+Coloque em:
+
+HydroBotApp2/src/screens/CameraScreen.tsx
+
+
+
+
+O que muda: enquanto Detectar estiver ativo, o app consulta /detect ~5 Hz e mostra dois badges com contagem de 👤 Pessoas e 🐾 Animais. Não precisa de bibliotecas novas. O vídeo continua com STREAM (rápido) ≥20 fps ou SNAPSHOT (fallback), como você já tinha.
+
+
+
+
+// HydrobotApp2/src/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Animated,
+} from "react-native";
+import { WebView } from "react-native-webview";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#ffffff" };
+
+/* ============================
+   A) VISUAL 1 — STREAM (≥20fps)
+   ============================ */
+function LiveMJPEG({ ip }: { ip: string }) {
+  const html = `
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;}
+        .wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+        img{max-width:100%;max-height:100%;object-fit:contain;background:#000;}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <img src="http://${ip}:81/stream" />
+      </div>
+    </body></html>
+  `;
+  return (
+    <WebView
+      originWhitelist={["*"]}
+      source={{ html }}
+      javaScriptEnabled
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      automaticallyAdjustContentInsets={false}
+      style={{ flex: 1, backgroundColor: "black" }}
+    />
+  );
+}
+
+/* ==========================================
+   B) VISUAL 2 — SNAPSHOT com crossfade (fallback)
+   ========================================== */
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {currentUri ? (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      ) : null}
+
+      {showNext ? (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
+  );
+}
+
+/* ============================
+   TEXTOS
+   ============================ */
+const textsByLang = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi e IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Visão:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    people: (n:number)=>`👤 Pessoas: ${n}`,
+    animals: (n:number)=>`🐾 Animais: ${n}`,
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "View:",
+    stream: "STREAM (fast)",
+    snapshot: "SNAPSHOT (fallback)",
+    people: (n:number)=>`👤 People: ${n}`,
+    animals: (n:number)=>`🐾 Animals: ${n}`,
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ENC.", ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.", pumpOff: "BOMBA APAG.", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Vista:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    people: (n:number)=>`👤 Personas: ${n}`,
+    animals: (n:number)=>`🐾 Animales: ${n}`,
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+type ObjDet = { label: string; conf: number; box: [number, number, number, number] };
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // pessoas/animais (feedback visual)
+  const [peopleCount, setPeopleCount] = useState(0);
+  const [animalCount, setAnimalCount] = useState(0);
+
+  // registro automático
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // modo de visualização
+  const [useStream, setUseStream] = useState(true);
+
+  // vídeo (snapshot double-buffer)
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  /* ===== ESP STATUS ===== */
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  /* ===== Vídeo via snapshots — ~25fps (fallback) ===== */
+  useEffect(() => {
+    if (useStream) return;
+    let stop = false;
+    const FPS_INTERVAL = 40;
+    setCurrentFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server, useStream]);
+
+  function onNextLoadStart() { loadingNextRef.current = true; }
+  function onNextShown() {
+    if (nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    loadingNextRef.current = false;
+  }
+
+  /* ===== DETECT LOOP ===== */
+  useEffect(() => {
+    if (!detectOn) { setPeopleCount(0); setAnimalCount(0); return; }
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j && j.ok) {
+          // fogo
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+
+          // pessoas/animais vindos do servidor
+          const objsRoot = (j.objects && j.objects.objects) ? j.objects.objects : [];
+          const people = (objsRoot as ObjDet[]).filter(o => o.label === "person").length;
+          const animals = (objsRoot as ObjDet[]).filter(o => o.label !== "person").length;
+
+          setPeopleCount(people);
+          setAnimalCount(animals);
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false); setFireScore(0);
+          setPeopleCount(0); setAnimalCount(0);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 120); // ~8–9 Hz de estado (leve)
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  /* ===== Registro automático ===== */
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  /* ===== Joystick ===== */
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor IA + Detectar + Modo de Visão */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Seletor de visão */}
+      <View style={[styles.statusRow, { gap: 6 }]}>
+        <Text style={styles.label}>{T.view}</Text>
+        <Pressable onPress={() => setUseStream(true)}  style={[styles.btn, useStream ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{T.stream}</Text>
+        </Pressable>
+        <Pressable onPress={() => setUseStream(false)} style={[styles.btn, !useStream ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{T.snapshot}</Text>
+        </Pressable>
+      </View>
+
+      {/* Banners de estado */}
+      {detectOn && (
+        <>
+          <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+            <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+          </View>
+
+          {/* NOVO: badges de pessoas / animais */}
+          <View style={styles.badgesRow}>
+            <View style={[styles.badge, { backgroundColor: "#1b2a4b" }]}>
+              <Text style={styles.badgeTxt}>{T.people(peopleCount)}</Text>
+            </View>
+            <View style={[styles.badge, { backgroundColor: "#2b3a1b" }]}>
+              <Text style={styles.badgeTxt}>{T.animals(animalCount)}</Text>
+            </View>
+          </View>
+        </>
+      )}
+
+      {/* Vídeo (STREAM rápido OU SNAPSHOT fallback) */}
+      <View style={{ flex: 1 }}>
+        {useStream ? (
+          <LiveMJPEG ip={ip} />
+        ) : (
+          <CrossfadeImage
+            currentUri={currentFrameUri}
+            nextUri={nextFrameUri}
+            onNextLoadStart={onNextLoadStart}
+            onNextShown={onNextShown}
+          />
+        )}
+      </View>
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2, height: KNOB_R * 2, borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.bg,
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#1e2a4d",
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  // NOVO: badges de pessoas/animais
+  badgesRow: {
+    flexDirection: "row",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: "#0b0f1e",
+  },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  badgeTxt: { color: "white", fontWeight: "700" },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+Checklist rápido
+
+
+
+
+Servidor rodando (/debug_models com objects_ok: true).
+
+
+App: “Servidor” = http://SEU_PC:8000.
+
+
+Câmera → botão Detectar.
+
+
+Veja os badges atualizando: 👤 Pessoas: N e 🐾 Animais: M.
+
+
+
+
+Se /objects mostra itens, mas o app ainda não conta, me manda um exemplo de JSON retornado por /detect (primeiras linhas) para eu alinhar o path exato (j.objects.objects).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 (.venv) PS D:\loud2025\hydrobot-server> uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload   
 INFO:     Will watch for changes in these directories: ['D:\\loud2025\\hydrobot-server']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
