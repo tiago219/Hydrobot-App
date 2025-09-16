@@ -1,3 +1,202 @@
+boa! explico rapidinho o que são os arquivos e deixo um passo-a-passo enxuto pra baixar/colocar no lugar certo.
+
+
+O que são esses arquivos?
+
+
+
+
+MobileNetSSD_deploy.prototxt(.txt) → arquivo de arquitetura (camadas) do modelo MobileNet-SSD em Caffe.
+
+
+MobileNetSSD_deploy.caffemodel → arquivo com os pesos treinados (aprendidos).
+
+Juntos, o OpenCV DNN consegue detectar person, dog, cat, horse, sheep, bird… (VOC-20 classes) com boa precisão e leve.
+
+
+
+
+Onde colocar
+
+
+Dentro do seu projeto do servidor:
+
+
+LOU D2025/
+└─ hydrobot-server/
+   ├─ server_heuristic.py
+   └─ models/
+      ├─ MobileNetSSD_deploy.prototxt   (ou .prototxt.txt)
+      └─ MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+Os nomes devem ser exatamente esses (o nosso código procura .prototxt ou .prototxt.txt).
+
+
+
+
+
+Como baixar (escolha 1 método)
+
+
+Método A — Windows (PowerShell)
+
+
+Abra o PowerShell dentro de hydrobot-server e rode:
+
+
+mkdir models -ErrorAction SilentlyContinue
+
+# PROTOTXT (arquitetura)
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/opencv/opencv_extra/4.x/testdata/dnn/MobileNetSSD_deploy.prototxt" `
+  -OutFile "models/MobileNetSSD_deploy.prototxt"
+
+# CAFFEMODEL (pesos ~23 MB)
+Invoke-WebRequest `
+  -Uri "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel" `
+  -OutFile "models/MobileNetSSD_deploy.caffemodel"
+
+
+
+Método B — Linux/macOS (Terminal)
+
+
+Entre na pasta hydrobot-server e:
+
+
+mkdir -p models
+
+# PROTOTXT
+curl -L "https://raw.githubusercontent.com/opencv/opencv_extra/4.x/testdata/dnn/MobileNetSSD_deploy.prototxt" \
+  -o models/MobileNetSSD_deploy.prototxt
+
+# CAFFEMODEL (~23 MB)
+curl -L "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel" \
+  -o models/MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+Se o GitHub renomear o prototxt para .txt, deixe assim mesmo (MobileNetSSD_deploy.prototxt.txt). Nosso código aceita os dois.
+
+
+
+
+
+Teste rápido
+
+
+
+
+(opcional) confira se os dois arquivos existem:
+
+
+
+
+ls -lh models/
+
+
+
+
+
+rode o servidor:
+
+
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+no navegador do PC do servidor abra:
+
+
+
+
+
+
+http://SEU_PC:8000/debug_models → deve mostrar
+
+"objects_backend":"mobilenet-ssd", "objects_ok": true.
+
+
+http://SEU_PC:8000/objects → deve listar objects com label e conf.
+
+
+
+
+
+
+no app (tela Câmera):
+
+
+
+
+
+
+Servidor = http://SEU_PC:8000
+
+
+Visão = STREAM (rápido)
+
+
+toque Detectar → banners de Pessoa e Animais ficam estáveis.
+
+
+
+
+
+Problemas comuns (e solução)
+
+
+
+
+prototxt not found ou caffemodel not found
+
+→ Nome/pasta errados. Garanta hydrobot-server/models/... e nomes exatamente iguais.
+
+
+load failed no /debug_models
+
+→ Atualize OpenCV: pip install --upgrade opencv-python (4.x).
+
+
+Nada aparece no app, mas /objects tem dados
+
+→ IP do servidor no app está errado. Use o IP local do PC na mesma rede do celular.
+
+
+
+
+Se preferir, posso te passar um terceiro link alternativo para cada arquivo caso algum desses seja bloqueado na sua rede.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 Perfeito — vamos trocar o detector de pessoas/animais do servidor por um DNN MobileNet-SSD (Caffe), que é muito mais estável e preciso que HOG/Haar e não usa Darknet/YOLO (então aquele erro “Unknown layer type” some).
 
