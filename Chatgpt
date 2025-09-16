@@ -1,3 +1,309 @@
+
+Entendi — alguns links “raw” do GitHub podem dar 404 (ou serem bloqueados) por causa de LFS/espelhos. A forma mais segura e que sempre funciona é clonar o repositório oficial e copiar os 2 arquivos para a pasta models/.
+
+
+Abaixo vai o passo-a-passo enxuto para Windows (PowerShell) e Linux/macOS (Terminal).
+
+
+
+✅ Passo a passo (recomendado): clonar e copiar
+
+
+A) Windows (PowerShell)
+
+
+
+
+Abra o PowerShell dentro da pasta do servidor (onde está server_heuristic.py):
+
+
+
+
+.../hydrobot-server>
+
+
+
+
+
+Crie a pasta de modelos (se ainda não existir):
+
+
+
+
+New-Item -ItemType Directory -Force -Path .\models | Out-Null
+
+
+
+
+
+Clone o repositório do MobileNet-SSD:
+
+
+
+
+git clone https://github.com/chuanqi305/MobileNet-SSD.git .\_mnet_tmp
+
+
+
+
+
+Se aparecer “git não é reconhecido…”, instale o Git for Windows (site: git-scm.com), feche e reabra o PowerShell.
+
+
+
+
+
+
+Copie os arquivos necessários para models/:
+
+
+
+
+Copy-Item .\_mnet_tmp\MobileNetSSD_deploy.prototxt   .\models\MobileNetSSD_deploy.prototxt -Force
+Copy-Item .\_mnet_tmp\MobileNetSSD_deploy.caffemodel .\models\MobileNetSSD_deploy.caffemodel -Force
+
+
+
+
+
+(Opcional) Remova a pasta temporária:
+
+
+
+
+Remove-Item .\_mnet_tmp -Recurse -Force
+
+
+
+
+
+Confirme que os arquivos estão lá (e com tamanho ok):
+
+
+
+
+Get-Item .\models\MobileNetSSD_deploy* | Format-List Name, Length, FullName
+
+
+
+Você deve ver algo assim:
+
+
+
+
+MobileNetSSD_deploy.prototxt → alguns KB
+
+
+MobileNetSSD_deploy.caffemodel → ~23 MB
+
+
+
+
+
+
+Inicie o servidor:
+
+
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+Teste no navegador (no PC do servidor):
+
+
+
+
+
+
+http://SEU_PC:8000/debug_models → deve mostrar "objects_backend":"mobilenet-ssd", "objects_ok": true
+
+
+http://SEU_PC:8000/objects → lista objects com label/conf
+
+
+
+
+B) Linux/macOS (Terminal)
+
+
+cd hydrobot-server
+mkdir -p models
+git clone https://github.com/chuanqi305/MobileNet-SSD.git _mnet_tmp
+cp -f _mnet_tmp/MobileNetSSD_deploy.prototxt   models/MobileNetSSD_deploy.prototxt
+cp -f _mnet_tmp/MobileNetSSD_deploy.caffemodel models/MobileNetSSD_deploy.caffemodel
+rm -rf _mnet_tmp
+ls -lh models/MobileNetSSD_deploy*
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+Alternativas se o git clone for bloqueado
+
+
+
+
+
+
+Baixar pelo navegador: abra o repositório chuanqi305/MobileNet-SSD no GitHub, clique nos dois arquivos e use “Download raw file”. Salve com os nomes:
+
+
+
+
+MobileNetSSD_deploy.prototxt
+
+
+MobileNetSSD_deploy.caffemodel
+
+Coloque em hydrobot-server/models/.
+
+
+
+
+
+
+
+
+Script Python (contorna bloqueios do PowerShell):
+
+
+
+
+Crie hydrobot-server/download_models.py com:
+
+import os, urllib.request
+os.makedirs("models", exist_ok=True)
+base = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/"
+for name in ["MobileNetSSD_deploy.prototxt","MobileNetSSD_deploy.caffemodel"]:
+    url = base + name
+    print("Baixando:", url)
+    req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as r, open("models/"+name, "wb") as f:
+        f.write(r.read())
+print("Feito.")
+
+
+
+
+
+Execute:
+
+python download_models.py
+
+
+
+
+
+
+
+
+
+
+
+
+Checklist rápido se algo não der certo
+
+
+
+
+
+
+/debug_models mostra error: "prototxt not found" ou "caffemodel not found"
+
+→ Nome ou caminho errado. Os arquivos precisam estar exatamente em:
+
+
+hydrobot-server/models/MobileNetSSD_deploy.prototxt
+hydrobot-server/models/MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+
+
+/debug_models mostra objects_ok: false com error: load failed
+
+→ Atualize o OpenCV: pip install --upgrade opencv-python.
+
+
+
+
+
+
+O app não mostra banners mas /objects mostra dados
+
+→ Corrigir o IP do servidor no app (usar o IP do PC, mesma rede do celular).
+
+
+
+
+
+
+Se travar em algum passo, me diga qual comando falhou e o texto do erro que eu te destrincho rapidinho.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Valeu pela foto—o erro é 404/ conexão fechada no PowerShell. Vamos baixar por links alternativos e com TLS 1.2 + User-Agent, ou até direto pelo navegador. Siga um destes métodos (o A costuma resolver já):
 
 
