@@ -1,4 +1,630 @@
 
+valeu — vamos deixar isso infalível no app sem mexer na detecção do servidor.
+
+
+Abaixo vai um CameraScreen.tsx com a lógica simplificada e robusta:
+
+
+
+
+Quando você clica Detect, ele inicia dois loops independentes:
+
+
+
+/detect só para fogo (5 Hz, leve).
+
+
+/objects para pessoas/animais (até ~7 Hz).
+
+
+
+
+
+
+O app trata todos os formatos de resposta possíveis e mostra banners mesmo que o servidor demore a “esquentar”.
+
+
+Também exibe um HUD com contagem de objetos e FPS do detector.
+
+
+
+
+
+
+Você só precisa substituir o arquivo abaixo em:
+
+HydroBotApp2/src/screens/CameraScreen.tsx
+
+(não mude nada no servidor agora)
+
+
+
+
+
+HydroBotApp2/src/screens/CameraScreen.tsx (COMPLETO)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, PanResponder,
+  GestureResponderEvent, PanResponderGestureState, Image, Animated,
+} from "react-native";
+import { WebView } from "react-native-webview";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a" };
+
+function LiveMJPEG({ ip }: { ip: string }) {
+  const html = `
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;}
+        .wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+        img{max-width:100%;max-height:100%;object-fit:contain;background:#000;}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <img src="http://${ip}:81/stream" />
+      </div>
+    </body></html>
+  `;
+  return (
+    <WebView
+      originWhitelist={["*"]}
+      source={{ html }}
+      javaScriptEnabled
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      automaticallyAdjustContentInsets={false}
+      style={{ flex: 1, backgroundColor: "black" }}
+    />
+  );
+}
+
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {currentUri ? (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      ) : null}
+
+      {showNext ? (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
+  );
+}
+
+const textsByLang = {
+  pt: {
+    espIp: "ESP IP:", test: "Testar", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "BOMBA ON", pumpOff: "BOMBA OFF", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi/IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.0.50:8000",
+    view: "Visão:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    person: "👤 Pessoa detectada",
+    animals: "🐾 Animais:",
+  },
+  en: {
+    espIp: "ESP IP:", test: "Test", ledOn: "LED ON", ledOff: "LED OFF",
+    pumpOn: "PUMP ON", pumpOff: "PUMP OFF", server: "Server:",
+    detect: "Detect", detecting: "Detecting", saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`, fireOff: (s:number)=>`No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.0.50:8000",
+    view: "View:",
+    stream: "STREAM (fast)",
+    snapshot: "SNAPSHOT (fallback)",
+    person: "👤 Person detected",
+    animals: "🐾 Animals:",
+  },
+  es: {
+    espIp: "ESP IP:", test: "Probar", ledOn: "LED ENC.", ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.", pumpOff: "BOMBA APAG.", server: "Servidor:",
+    detect: "Detectar", detecting: "Detectando", saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`, fireOff: (s:number)=>`Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts:string)=>`Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.0.50:8000",
+    view: "Vista:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    person: "👤 Persona detectada",
+    animals: "🐾 Animales:",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.0.50:8000";
+
+type ObjItem = { label?: string; conf?: number; box?: number[] };
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  // detecção
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // objetos
+  const [hasPerson, setHasPerson] = useState(false);
+  const [animals, setAnimals] = useState<string[]>([]);
+  const [objFps, setObjFps] = useState<number>(0);
+  const [objCount, setObjCount] = useState<number>(0);
+
+  // registro automático (fogo)
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // vídeo (snapshot fallback)
+  const [useStream, setUseStream] = useState(true);
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // URLs do ESP
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  // ===== util: normaliza payloads de /objects e /detect.objects =====
+  function normalizeObjects(payload: any): { list: ObjItem[]; fps: number } {
+    if (!payload) return { list: [], fps: 0 };
+    // formatos aceitos:
+    // 1) { ok, backend, objects:[...] , fps_obj }
+    // 2) { ok, objects:{ ok, backend, objects:[...], fps_obj } }
+    // 3) [ {...}, {...} ]
+    if (Array.isArray(payload)) return { list: payload as ObjItem[], fps: 0 };
+    if (Array.isArray(payload.objects)) return { list: payload.objects as ObjItem[], fps: Number(payload.fps_obj || 0) };
+    if (payload.objects && Array.isArray(payload.objects.objects))
+      return { list: payload.objects.objects as ObjItem[], fps: Number(payload.objects.fps_obj || 0) };
+    return { list: [], fps: 0 };
+  }
+
+  // ===== ESP STATUS =====
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl, { method: "GET" });
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() { try { const t = !ledOn; await fetch(ledUrl(t)); setLedOn(t); } catch { setStatusText(T.statusFail); } }
+  async function togglePump() { try { const t = !pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); } catch { setStatusText(T.statusFail); } }
+
+  useEffect(() => { pingStatus(); const id = setInterval(pingStatus, 5000); return () => clearInterval(id); }, [statusUrl]);
+
+  // ===== Vídeo via snapshots — ≥20fps fallback (STREAM usa WebView)
+  useEffect(() => {
+    if (useStream) return;
+    let stop = false;
+    const FPS_INTERVAL = 40; // ~25fps
+    setCurrentFrameUri(`${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`);
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${server.replace(/\/+$/, "")}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [server, useStream]);
+
+  function onNextLoadStart() { loadingNextRef.current = true; }
+  function onNextShown() { if (nextFrameUri) setCurrentFrameUri(nextFrameUri); loadingNextRef.current = false; }
+
+  // ===== LOOP 1: FOGO (ativa só com Detect) =====
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/detect`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j) {
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || j.score_ema || 0));
+        }
+      } catch {
+        if (!stop) { setIsFire(false); setFireScore(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 200); // 5 Hz
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== LOOP 2: PESSOAS/ANIMAIS (ativa só com Detect) =====
+  useEffect(() => {
+    if (!detectOn) {
+      setHasPerson(false); setAnimals([]); setObjCount(0); setObjFps(0);
+      return;
+    }
+    let stop = false;
+    const loop = async () => {
+      try {
+        const r = await fetch(`${server.replace(/\/+$/, "")}/objects`, { method: "GET" });
+        const j = await r.json();
+        if (!stop && j) {
+          const { list, fps } = normalizeObjects(j);
+          const labels = list.map(o => (o.label || "").toLowerCase());
+          const ANIMALS = ["dog","cat","bird","horse","sheep","cow","elephant","bear","zebra","giraffe"];
+          setHasPerson(labels.includes("person"));
+          setAnimals(Array.from(new Set(labels.filter(l => ANIMALS.includes(l)))).slice(0, 3));
+          setObjCount(list.length);
+          setObjFps(Number(fps || 0));
+        }
+      } catch {
+        if (!stop) { setHasPerson(false); setAnimals([]); setObjCount(0); setObjFps(0); }
+      } finally {
+        if (!stop) setTimeout(loop, 140); // ~7 Hz
+      }
+    };
+    loop();
+    return () => { stop = true; };
+  }, [detectOn, server]);
+
+  // ===== Registro automático no “rising edge” de fogo =====
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(textsByLang[lang].eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(textsByLang[lang].noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, lang]);
+
+  // joystick
+  const RADIUS = 64, KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS, ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny); if (len > 1) { nx /= len; ny /= len; }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+      onPanResponderTerminate: () => { setDragging(false); setJoy({ x: 0, y: 0 }); },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS, knobTop = -joy.y * RADIUS;
+
+  return (
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder={T.placeholderIp} autoCapitalize="none" autoCorrect={false} style={styles.input} keyboardType="numeric" />
+        <Pressable onPress={pingStatus} style={styles.btn}><Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text></Pressable>
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text></Pressable>
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text></Pressable>
+      </View>
+
+      {/* Linha: Servidor + Detect + Modo de visão */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput value={server} onChangeText={setServer} placeholder={T.placeholderServer} autoCapitalize="none" autoCorrect={false} style={[styles.input, { flex: 1 }]} />
+        <Pressable onPress={() => setDetectOn(v => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
+        </Pressable>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText}</Text>
+      </View>
+
+      {/* Seletor de visão */}
+      <View style={[styles.statusRow, { gap: 6 }]}>
+        <Text style={styles.label}>{T.view}</Text>
+        <Pressable onPress={() => setUseStream(true)} style={[styles.btn, useStream ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{T.stream}</Text></Pressable>
+        <Pressable onPress={() => setUseStream(false)} style={[styles.btn, !useStream ? styles.btnOn : styles.btnOff]}><Text style={styles.btnText}>{T.snapshot}</Text></Pressable>
+      </View>
+
+      {/* Banners de feedback */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+        </View>
+      )}
+      {detectOn && hasPerson && (
+        <View style={[styles.infoBanner, { backgroundColor: "#143b7a" }]}>
+          <Text style={styles.infoText}>{T.person}</Text>
+        </View>
+      )}
+      {detectOn && !!animals.length && (
+        <View style={[styles.infoBanner, { backgroundColor: "#225c2a" }]}>
+          <Text style={styles.infoText}>{T.animals} {animals.join(", ")}</Text>
+        </View>
+      )}
+
+      {/* Vídeo */}
+      <View style={{ flex: 1 }}>
+        {useStream ? (
+          <LiveMJPEG ip={ip} />
+        ) : (
+          <CrossfadeImage
+            currentUri={currentFrameUri}
+            nextUri={nextFrameUri}
+            onNextLoadStart={onNextLoadStart}
+            onNextShown={onNextShown}
+          />
+        )}
+      </View>
+
+      {/* HUD de objetos */}
+      <View pointerEvents="none" style={styles.objHud}>
+        <Text style={styles.objHudText}>OBJ: {objCount} @ {objFps} fps</Text>
+      </View>
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: 64 * 2 + 24, height: 64 * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: 128, height: 128, borderRadius: 64 }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              { width: 44, height: 44, borderRadius: 22, transform: [{ translateX: joy.x * 64 }, { translateY: -joy.y * 64 }] },
+            ]}
+          />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)}   y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+  topbar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 10, gap: 8, backgroundColor: PALETTE.card },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: { backgroundColor: PALETTE.bg, color: "white", borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: "#1e2a4d", minWidth: 110 },
+  btn: { backgroundColor: "#2b48ff", paddingHorizontal: 10, paddingVertical: 10, borderRadius: 10 },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+  statusRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: "#0f1730" },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" }, fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+  infoBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  infoText: { color: "white", fontWeight: "700" },
+  objHud: { position: "absolute", right: 10, top: 10, backgroundColor: "rgba(0,0,0,0.55)", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: 1, borderColor: "rgba(255,255,255,0.18)" },
+  objHudText: { color: "#e5e7eb", fontSize: 12, fontWeight: "600" },
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: { position: "absolute", backgroundColor: "rgba(255,255,255,0.08)", borderWidth: 2, borderColor: "rgba(255,255,255,0.14)" },
+  joyKnob: { position: "absolute", backgroundColor: "rgba(43,72,255,0.9)", borderWidth: 2, borderColor: "rgba(255,255,255,0.85)" },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+
+Passo a passo rapidinho
+
+
+
+
+Cole o arquivo acima em HydroBotApp2/src/screens/CameraScreen.tsx.
+
+
+Reinicie o bundler para limpar o cache:
+
+
+
+Expo: npx expo start -c
+
+
+React Native CLI: npm start -- --reset-cache
+
+
+
+
+
+
+No app:
+
+
+
+Em Servidor, use o IP do PC rodando o FastAPI (ex.: http://192.168.0.50:8000).
+
+
+Em Visão, deixe STREAM (rápido).
+
+
+Clique Detect.
+
+• O banner de fogo atualiza.
+
+• Pessoas/animais aparecem em banners próprios.
+
+• No canto, HUD “OBJ: X @ Y fps”.
+
+
+
+
+
+
+
+
+Se mesmo assim não surgir, abra no navegador do celular/PC:
+
+
+
+
+http://SEU_PC:8000/objects → deve listar objetos;
+
+
+http://SEU_PC:8000/debug_models → confirme que backend é ssd ou yolo e obj_ok: true.
+
+
+
+
+Me diga o que aparece nesses endpoints (principalmente backend, obj_ok e possíveis obj_error) que eu ajusto o que faltar.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 https://github.com/expo/expo-go-releases/releases/download/Expo-Go-2.33.22/Expo-Go-2.33.22.apk
 
 
