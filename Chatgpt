@@ -1,3 +1,248 @@
+Valeu pela foto—o erro é 404/ conexão fechada no PowerShell. Vamos baixar por links alternativos e com TLS 1.2 + User-Agent, ou até direto pelo navegador. Siga um destes métodos (o A costuma resolver já):
+
+
+
+Método A — PowerShell (com TLS + mirrors)
+
+
+
+
+
+
+Abra o PowerShell dentro de hydrobot-server (onde fica server_heuristic.py).
+
+
+
+
+
+
+Rode estes comandos (copie/cole tudo):
+
+
+
+
+
+
+# 1) Garantir TLS 1.2 (evita "conexão fechada" com GitHub/CDNs)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 2) Pasta de modelos
+New-Item -ItemType Directory -Force -Path .\models | Out-Null
+
+# 3) URLs (mirrors confiáveis)
+$protoUrl = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt"
+$weightsUrl = "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel"
+
+# 4) Tenta baixar do GitHub com User-Agent
+$ua = "Mozilla/5.0"
+Invoke-WebRequest -Uri $protoUrl   -OutFile ".\models\MobileNetSSD_deploy.prototxt"   -UserAgent $ua -UseBasicParsing
+Invoke-WebRequest -Uri $weightsUrl -OutFile ".\models\MobileNetSSD_deploy.caffemodel" -UserAgent $ua -UseBasicParsing
+
+
+
+Se qualquer um dos dois ainda der erro, baixe pelos espelhos CDN:
+
+
+# Espelhos (CDN) — usa se o passo anterior falhar
+$protoCdn   = "https://cdn.jsdelivr.net/gh/chuanqi305/MobileNet-SSD@master/MobileNetSSD_deploy.prototxt"
+$weightsCdn = "https://cdn.jsdelivr.net/gh/chuanqi305/MobileNet-SSD@master/MobileNetSSD_deploy.caffemodel"
+
+Invoke-WebRequest -Uri $protoCdn   -OutFile ".\models\MobileNetSSD_deploy.prototxt"   -UserAgent $ua -UseBasicParsing
+Invoke-WebRequest -Uri $weightsCdn -OutFile ".\models\MobileNetSSD_deploy.caffemodel" -UserAgent $ua -UseBasicParsing
+
+
+
+
+
+Confirme que os arquivos chegaram:
+
+
+
+
+Get-Item .\models\MobileNetSSD_deploy* | Format-List Name, Length, FullName
+
+
+
+Você deve ver algo como:
+
+
+
+
+MobileNetSSD_deploy.prototxt ~ 4–10 KB
+
+
+MobileNetSSD_deploy.caffemodel ~ 23 MB
+
+
+
+
+
+Método B — Navegador (mais simples)
+
+
+
+
+Abra estes links no navegador (caso o PowerShell esteja bloqueado):
+
+
+
+
+
+
+Prototxt:
+
+https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt
+
+
+Caffemodel (~23 MB):
+
+https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+
+Salve os arquivos com esses nomes exatos dentro da pasta:
+
+
+
+
+hydrobot-server/models/
+  MobileNetSSD_deploy.prototxt
+  MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+Se o navegador salvar o prototxt como .txt, pode deixar ou renomear para .prototxt — o nosso código aceita ambos.
+
+
+
+
+
+Método C — Script Python (contorna bloqueios do PowerShell)
+
+
+Crie hydrobot-server/download_models.py com o conteúdo abaixo e execute python download_models.py:
+
+
+import os, urllib.request
+
+os.makedirs("models", exist_ok=True)
+
+urls = [
+  ("models/MobileNetSSD_deploy.prototxt",
+   ["https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt",
+    "https://cdn.jsdelivr.net/gh/chuanqi305/MobileNet-SSD@master/MobileNetSSD_deploy.prototxt"]),
+  ("models/MobileNetSSD_deploy.caffemodel",
+   ["https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel",
+    "https://cdn.jsdelivr.net/gh/chuanqi305/MobileNet-SSD@master/MobileNetSSD_deploy.caffemodel"]),
+]
+
+ua = "Mozilla/5.0"
+for path, mirrors in urls:
+    for url in mirrors:
+        try:
+            print("Baixando:", url)
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
+                f.write(r.read())
+            print("OK ->", path)
+            break
+        except Exception as e:
+            print("Falhou:", e)
+    else:
+        raise SystemExit("Não foi possível baixar " + path)
+
+print("Feito.")
+
+
+
+
+Depois de baixar
+
+
+
+
+Rode o servidor:
+
+
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+Teste no navegador do PC:
+
+
+
+
+
+
+http://SEU_PC:8000/debug_models → deve mostrar "objects_backend": "mobilenet-ssd", "objects_ok": true.
+
+
+http://SEU_PC:8000/objects → deve listar objects com label e conf.
+
+
+
+
+
+
+No app (tela Câmera), servidor = http://SEU_PC:8000, visão = STREAM (rápido), clique Detectar.
+
+
+
+
+
+Se ainda der erro no PowerShell
+
+
+
+
+Verifique se a rede bloqueia GitHub. Se sim, use o Método B (navegador) ou C (Python).
+
+
+Se aparecer “prototxt not found” no /debug_models, é nome ou pasta errados. Os arquivos precisam estar exatamente em:
+
+hydrobot-server/models/MobileNetSSD_deploy.prototxt
+hydrobot-server/models/MobileNetSSD_deploy.caffemodel
+
+
+
+
+
+
+
+Me diga qual método você usou e o que aparece em /debug_models — se mostrar algum error, eu ajusto imediatamente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 boa! explico rapidinho o que são os arquivos e deixo um passo-a-passo enxuto pra baixar/colocar no lugar certo.
 
 
