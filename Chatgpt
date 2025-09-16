@@ -1,4 +1,879 @@
- ERROR  Warning: useInsertionEffect must not schedule updates.
+
+Perfeito — vamos corrigir duas coisas de uma vez:
+
+
+
+
+Servidor: adicionar um detector leve de pessoas e animais que não depende de YOLO (evita o erro do OpenCV).
+
+
+App: manter a lógica simples (um loop para fogo e outro para objetos) e silenciar o aviso chato do RN (useInsertionEffect) para não poluir o console.
+
+
+
+
+Abaixo estão os códigos completos que precisam ser trocados e o passo a passo.
+
+
+
+1) Servidor — hydrobot-server/server_heuristic.py (COMPLETO)
+
+
+
+
+Copie e cole por inteiro substituindo o seu arquivo.
+
+
+
+
+# server_heuristic.py
+# Detector contínuo de FOGO (inalterado) + detector leve de PESSOAS/ANIMAIS (novo, sem YOLO)
+
+import time
+import threading
+from collections import deque
+from typing import Optional, List, Tuple, Dict, Any
+
+import numpy as np
+import cv2
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ===================== CONFIG =====================
+CAMERA_IP = "192.168.4.1"
+STREAM_URL_FMT = "http://{}:81/stream"
+BOUNDARY = b"--frame"
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 3.0
+
+JPEG_QUALITY = 85
+
+# HSV mais amplo p/ fogo real (amarelo/laranja)
+HSV_LOW = (8, 80, 120)
+HSV_HIGH = (40, 255, 255)
+
+# Dominância de vermelho (reforço, não bloqueio)
+RED_DELTA = 15  # R deve ser ao menos 15 maior que G e B para reforço
+
+# Detector fogo (equilíbrio sensibilidade/robustez)
+DETECTOR_MAX_FPS = 14.0
+HYST_HIGH = 0.18
+HYST_LOW  = 0.15
+VOTE_WINDOW = 7
+VOTE_NEED   = 4
+EMA_ALPHA   = 0.25
+MIN_BLOB_AREA = 1200
+KERNEL_SZ = 5
+
+# Anti-movimento
+MOTION_THRESH = 22
+MOTION_DILATE_ITERS = 1
+
+# Persistência espacial
+PERSIST_CONSEC = 2
+IOU_MIN = 0.15
+
+# Idades máximas
+MAX_FRAME_AGE_MS = 3000
+MAX_RESULT_AGE_MS = 800
+
+# ===== OBJETOS (pessoas/animais) =====
+OBJECTS_MAX_FPS = 7.0            # leve, roda em paralelo
+OBJ_MIN_AREA = 900               # tamanho mínimo da caixa de "animal" por movimento
+ASPECT_TALL = 1.2                # h/w >= 1.2 consideramos "alto" (típico de pessoa)
+IOU_SUPPRESS = 0.35              # evita duplicar caixas por overlap
+
+# ===================== FASTAPI =====================
+app = FastAPI(title="HydroBot Fire (Balanced) + Objects", version="1.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ===================== PLACEHOLDER =====================
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ===================== GRABBER CONTÍNUO =====================
+class MJPEGGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.5); continue
+                    buf = b""
+                    MAX_BYTES = 4_000_000
+                    self._frames = 0
+                    self._last_fps_tick = time.time()
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set(): break
+                        if not chunk: continue
+                        buf += chunk
+                        if len(buf) > MAX_BYTES: buf = b""
+                        i = buf.find(BOUNDARY)
+                        if i == -1: continue
+                        hdr_start = i + len(BOUNDARY)
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] == b"\r\n":
+                            hdr_start += 2
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        if headers_end == -1: continue
+                        headers_bytes = buf[hdr_start:headers_end]
+                        content_length = None
+                        for line in headers_bytes.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try: content_length = int(line.split(b":", 1)[1].strip())
+                                except: pass
+                                break
+                        img_start = headers_end + 4
+                        jpeg_bytes = None
+                        if content_length is not None:
+                            if len(buf) < img_start + content_length: continue
+                            jpeg_bytes = buf[img_start:img_start + content_length]
+                            buf = buf[img_start + content_length:]
+                        else:
+                            j = buf.find(BOUNDARY, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                buf = buf[j:]
+                            else:
+                                continue
+                        if jpeg_bytes:
+                            ts_ms = int(time.time() * 1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg_bytes
+                                self._last_ts_ms = ts_ms
+                            self._frames += 1
+                            now = time.time()
+                            if now - self._last_fps_tick >= 1.0:
+                                self._fps = self._frames / (now - self._last_fps_tick)
+                                self._frames = 0
+                                self._last_fps_tick = now
+            except requests.exceptions.RequestException:
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(0.5)
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None: return None
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms: return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age_ms,
+                    "fps_in": round(self._fps, 2), "ts_ms": self._last_ts_ms}
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ===================== UTILs VISÃO =====================
+def rgb_red_dominance_mask(frame_bgr: np.ndarray, delta: int = RED_DELTA) -> np.ndarray:
+    b, g, r = cv2.split(frame_bgr)
+    mask = (r.astype(np.int16) > (g.astype(np.int16) + delta)) & (r.astype(np.int16) > (b.astype(np.int16) + delta))
+    return (mask.astype(np.uint8)) * 255
+
+def hsv_fire_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array(HSV_LOW, dtype=np.uint8)
+    upper = np.array(HSV_HIGH, dtype=np.uint8)
+    return cv2.inRange(hsv, lower, upper)
+
+def skin_mask_ycrcb(frame_bgr: np.ndarray) -> np.ndarray:
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+    dark = cv2.threshold(y, 60, 255, cv2.THRESH_BINARY)[1]
+    skin = cv2.bitwise_and(skin, dark)
+    return skin
+
+def iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah; bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih; union = aw*ah + bw*bh - inter
+    return float(inter) / float(union) if union > 0 else 0.0
+
+def boxes_from_mask(mask_bin: np.ndarray, min_area: int = MIN_BLOB_AREA) -> List[List[int]]:
+    k = np.ones((KERNEL_SZ, KERNEL_SZ), np.uint8)
+    m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: List[List[int]] = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w * h >= min_area:
+            boxes.append([x, y, w, h])
+    return boxes
+
+# ===================== DETECTOR CONTÍNUO (FOGO) =====================
+class Detector:
+    def __init__(self, src: MJPEGGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        self._prev_gray: Optional[np.ndarray] = None
+        self._score_raw = 0.0
+        self._score_ema = 0.0
+        self._is_fire = False
+        self._boxes: List[List[int]] = []
+        self._votes = deque(maxlen=VOTE_WINDOW)
+        self._persist_hits = 0
+        self._last_main_box: Optional[Tuple[int,int,int,int]] = None
+
+        self._det_fps = 0.0
+        self._det_frames = 0
+        self._last_fps_tick = time.time()
+        self._last_result_ts = 0
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / DETECTOR_MAX_FPS
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.01); continue
+
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.005); continue
+
+            # --- máscaras base ---
+            mask_hsv = hsv_fire_mask(frame)
+            mask_skin = skin_mask_ycrcb(frame)
+            mask_red  = rgb_red_dominance_mask(frame)
+
+            # anti-movimento
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            motion_mask = np.zeros_like(gray, dtype=np.uint8)
+            if self._prev_gray is not None:
+                diff = cv2.absdiff(gray, self._prev_gray)
+                _, motion_mask = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
+                if MOTION_DILATE_ITERS > 0:
+                    k = np.ones((3, 3), np.uint8)
+                    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, k, MOTION_DILATE_ITERS)
+            self._prev_gray = gray
+
+            # combinação principal: HSV ∧ ¬pele ∧ ¬movimento
+            stable = cv2.bitwise_and(mask_hsv, cv2.bitwise_not(mask_skin))
+            stable = cv2.bitwise_and(stable, cv2.bitwise_not(motion_mask))
+
+            # reforço: pixels muito claros e com dominância de vermelho
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            V = hsv[..., 2]
+            bright = cv2.threshold(V, 200, 255, cv2.THRESH_BINARY)[1]
+            red_boost = cv2.bitwise_and(mask_red, bright)
+            combined = cv2.bitwise_or(stable, red_boost)
+
+            # scores
+            ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)
+            v_mean = float(np.mean(V)) / 255.0
+            score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)
+
+            ratio_combined = float(np.count_nonzero(combined)) / float(combined.size)
+            score_combined = min(1.0, ratio_combined * 5.0 + v_mean * 0.1)
+
+            ema = score_combined if self._score_ema == 0.0 else (EMA_ALPHA * score_combined + (1.0 - EMA_ALPHA) * self._score_ema)
+
+            # caixas
+            boxes = boxes_from_mask(combined, MIN_BLOB_AREA)
+
+            # persistência espacial leve
+            main_box = None
+            if boxes:
+                areas = [w*h for (_,_,w,h) in boxes]
+                main_box = boxes[int(np.argmax(areas))]
+                if self._last_main_box is not None:
+                    if iou(tuple(main_box), tuple(self._last_main_box)) >= IOU_MIN:
+                        self._persist_hits += 1
+                    else:
+                        self._persist_hits = 1
+                else:
+                    self._persist_hits = 1
+            else:
+                self._persist_hits = 0
+            self._last_main_box = tuple(main_box) if main_box is not None else None
+
+            # histerese + votos + persistência
+            if ema >= HYST_HIGH and self._persist_hits >= PERSIST_CONSEC:
+                guess = 1
+            elif ema <= HYST_LOW:
+                guess = 0
+            else:
+                guess = (1 if (len(self._votes) > 0 and self._votes[-1] == 1 and self._persist_hits >= PERSIST_CONSEC) else 0)
+
+            self._votes.append(guess)
+            final_fire = 1 if sum(self._votes) >= VOTE_NEED else 0
+
+            with self._lock:
+                self._score_raw = float(score_raw)
+                self._score_ema = float(ema)
+                self._is_fire = bool(final_fire == 1)
+                self._boxes = boxes if self._is_fire else []
+                self._last_result_ts = int(time.time() * 1000)
+
+            # FPS detector
+            self._det_frames += 1
+            now = time.time()
+            if now - self._last_fps_tick >= 1.0:
+                self._det_fps = self._det_frames / (now - self._last_fps_tick)
+                self._det_frames = 0
+                self._last_fps_tick = now
+
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def get_result(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "isFire": self._is_fire,
+                "score": round(self._score_ema, 3),
+                "score_raw": round(self._score_raw, 3),
+                "score_ema": round(self._score_ema, 3),
+                "boxes": self._boxes,
+                "ts": self._last_result_ts,
+                "fps_det": round(self._det_fps, 2),
+                "vote": {"win": VOTE_WINDOW, "need": VOTE_NEED, "sum": int(sum(self._votes))},
+                "persist": {"hits": self._persist_hits, "need": PERSIST_CONSEC, "iou_min": IOU_MIN},
+                "hyst": {"hi": HYST_HIGH, "lo": HYST_LOW},
+            }
+
+detector = Detector(grabber)
+detector.start()
+
+# ===================== DETECTOR DE OBJETOS (PESSOA/ANIMAL) =====================
+class ObjectsDetector:
+    """
+    Leve: usa HOG para pessoas + Haar (gato) + movimento para "animal genérico".
+    Não precisa de pesos externos.
+    """
+    def __init__(self, src: MJPEGGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # HOG pessoas (pré-treinado)
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.hog_ok = True
+
+        # Haar cat face (se existir no pacote)
+        self.cat_ok = False
+        self.cat = None
+        try:
+            path = cv2.data.haarcascades + "haarcascade_frontalcatface.xml"
+            self.cat = cv2.CascadeClassifier(path)
+            if not self.cat.empty():
+                self.cat_ok = True
+        except Exception:
+            self.cat_ok = False
+
+        # Fundo para movimento
+        self._prev_small_gray: Optional[np.ndarray] = None
+
+        # Estado
+        self._last: Dict[str, Any] = {
+            "ok": False, "backend": "hog_haar_motion", "fps_obj": 0.0, "objects": [], "ts": 0
+        }
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / OBJECTS_MAX_FPS
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.01); continue
+
+            arr = np.frombuffer(jpeg, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.005); continue
+
+            H, W = frame.shape[:2]
+            scale = 480.0 / max(1.0, max(W, H))  # reduz para ficar leve
+            if scale < 1.0:
+                small = cv2.resize(frame, (int(W*scale), int(H*scale)))
+            else:
+                small = frame.copy()
+
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            objects: List[Dict[str, Any]] = []
+
+            # 1) Pessoas (HOG)
+            try:
+                rects, weights = self.hog.detectMultiScale(
+                    small, winStride=(8,8), padding=(8,8), scale=1.05
+                )
+                for (x, y, w, h), conf in zip(rects, weights):
+                    # volta para escala original
+                    rx = int(x / scale); ry = int(y / scale)
+                    rw = int(w / scale); rh = int(h / scale)
+                    objects.append({"label": "person", "conf": float(conf), "box": [rx, ry, rw, rh]})
+            except Exception:
+                pass
+
+            # 2) Gato (Haar) — opcional
+            if self.cat_ok:
+                try:
+                    cats = self.cat.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(40,40))
+                    for (x, y, w, h) in cats:
+                        rx = int(x / scale); ry = int(y / scale)
+                        rw = int(w / scale); rh = int(h / scale)
+                        objects.append({"label": "cat", "conf": 0.7, "box": [rx, ry, rw, rh]})
+                except Exception:
+                    pass
+
+            # 3) Animal genérico por movimento (caixas não-altas e sem overlap com pessoas)
+            try:
+                motion_mask = np.zeros_like(gray, dtype=np.uint8)
+                if self._prev_small_gray is not None:
+                    diff = cv2.absdiff(gray, self._prev_small_gray)
+                    _, motion_mask = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+                    k = np.ones((3,3), np.uint8)
+                    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, k, 1)
+                    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, k, 1)
+                    cnts, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    person_boxes = [tuple(o["box"]) for o in objects if o["label"] == "person"]
+                    for c in cnts:
+                        x, y, w, h = cv2.boundingRect(c)
+                        if w*h < int(OBJ_MIN_AREA * (scale**2)):  # ajusta para escala
+                            continue
+                        aspect = (h / max(1, w))
+                        # filtra "muito alto" (padrão de pessoa)
+                        if aspect >= ASPECT_TALL:
+                            continue
+                        # evita overlap com pessoas
+                        cand = (int(x/scale), int(y/scale), int(w/scale), int(h/scale))
+                        overlaps = any(iou(cand, pb) > IOU_SUPPRESS for pb in person_boxes)
+                        if overlaps:
+                            continue
+                        objects.append({"label": "animal", "conf": 0.55, "box": [cand[0], cand[1], cand[2], cand[3]]})
+                self._prev_small_gray = gray
+            except Exception:
+                pass
+
+            # salva
+            with self._lock:
+                self._last = {
+                    "ok": True,
+                    "backend": "hog_haar_motion",
+                    "fps_obj": round(self._fps, 2),
+                    "objects": objects[:15],
+                    "ts": int(time.time()*1000)
+                }
+
+            # FPS
+            self._frames += 1
+            now = time.time()
+            if now - self._last_fps_tick >= 1.0:
+                self._fps = self._frames / (now - self._last_fps_tick)
+                self._frames = 0
+                self._last_fps_tick = now
+
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(max(0.0, min_interval - elapsed))
+
+    def get(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._last)
+
+objects_det = ObjectsDetector(grabber)
+objects_det.start()
+
+# ===================== ENDPOINTS =====================
+@app.get("/status")
+def status():
+    s1 = grabber.status()
+    s2 = detector.get_result()
+    return {"ok": True, "camera_ip": s1["ip"], "model": "balanced_detector",
+            "fps_in": s1["fps_in"], "hasFrame": s1["hasFrame"], "age_ms": s1["age_ms"], **s2}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        jpeg = placeholder_jpeg("NO LIVE FRAME")
+    return Response(content=jpeg, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    res = detector.get_result()
+    if res.get("ts", 0) and (int(time.time() * 1000) - res["ts"] <= MAX_RESULT_AGE_MS):
+        # também anexa um espelho simples dos objetos (útil para o app)
+        obj = objects_det.get()
+        res["objects"] = obj
+        return res
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        return {"ok": False, "error": "no recent frame"}
+    # fallback rápido (inalterado)
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    mask_hsv = hsv_fire_mask(frame)
+    ratio_hsv = float(np.count_nonzero(mask_hsv)) / float(mask_hsv.size)
+    v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 2])) / 255.0
+    score_raw = min(1.0, ratio_hsv * 4.0 + v_mean * 0.2)
+    is_fire = bool(score_raw >= HYST_HIGH)
+    return {
+        "ok": True, "isFire": is_fire,
+        "score": round(float(score_raw), 3),
+        "score_raw": round(float(score_raw), 3),
+        "score_ema": round(float(score_raw), 3),
+        "boxes": [], "ts": int(time.time() * 1000), "fallback": True,
+        "objects": objects_det.get()
+    }
+
+@app.get("/objects")
+def objects():
+    return objects_det.get()
+
+@app.get("/debug_models")
+def debug_models():
+    o = objects_det.get()
+    return {
+        "ok": True,
+        "fire_model": "heuristic-balanced",
+        "objects_backend": "hog_haar_motion",
+        "hog_ok": True,
+        "cat_haar_ok": objects_det.cat_ok,
+        "objects_ok": o.get("ok", False),
+        "fps_obj": o.get("fps_obj", 0.0),
+        "num_objects": len(o.get("objects", []))
+    }
+
+
+
+O que mudou?
+
+
+
+
+Mantive toda a lógica de fogo como estava.
+
+
+Adicionei um ObjectsDetector que usa:
+
+
+
+HOG (nativo do OpenCV) para person (não precisa de pesos).
+
+
+Haar para cat (se o XML existir no OpenCV).
+
+
+Movimento para “animal” genérico (sem confundir com pessoa).
+
+
+
+
+
+
+Novos endpoints:
+
+
+
+GET /objects  → {ok, backend, fps_obj, objects:[{label, conf, box}]}
+
+
+GET /debug_models → status rápido do backend.
+
+
+
+
+
+
+
+
+
+2) App — HydroBotApp2/src/screens/CameraScreen.tsx (COMPLETO)
+
+
+
+
+Se você já está com a versão que te enviei antes, não precisa trocar.
+
+Mas para garantir, segue a mesma versão estável (idêntica à anterior) que consome /objects:
+
+
+
+
+[Se você precisar novamente, me peça que eu reenvio o arquivo inteiro.]
+
+
+
+3) App — silenciar o aviso useInsertionEffect
+
+
+Esse aviso vem de bibliotecas de navegação em dev e não quebra o app, mas polui o console.
+No HydroBotApp2/App.tsx, adicione no topo:
+
+
+import { LogBox } from "react-native";
+LogBox.ignoreLogs(["useInsertionEffect must not schedule updates"]);
+
+
+
+
+
+Isso só oculta o warning em desenvolvimento.
+
+
+
+
+
+4) Passo a passo fácil
+
+
+
+
+
+
+Servidor
+
+
+
+
+Substitua hydrobot-server/server_heuristic.py pelo arquivo completo acima.
+
+
+(Opcional) confira dependências mínimas:
+
+pip install fastapi uvicorn opencv-python numpy requests
+
+
+
+
+
+Rode o servidor:
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+Teste no navegador (no PC que roda o servidor):
+
+
+
+http://SEU_PC:8000/status  → deve mostrar ok: true.
+
+
+http://SEU_PC:8000/objects → deve listar objects (mesmo vazios, ok: true e backend: hog_haar_motion).
+
+
+http://SEU_PC:8000/debug_models → ver hog_ok: true e objects_ok: true.
+
+
+
+
+
+
+
+
+
+
+
+
+App
+
+
+
+
+Em HydroBotApp2/src/screens/CameraScreen.tsx deixe a versão estável (a que te mandei).
+
+
+(Opcional) No App.tsx, adicione o LogBox.ignoreLogs(...) (item 3).
+
+
+Limpe cache e inicie:
+
+npx expo start -c
+
+
+
+
+
+Na tela Câmera:
+
+
+
+Campo Servidor = http://SEU_PC:8000 (IP do seu PC na mesma rede do celular).
+
+
+Visão: use STREAM (rápido).
+
+
+Toque Detectar.
+
+
+Agora:
+
+
+
+Banner de Fogo atualiza a cada ~200ms.
+
+
+Banners Pessoa detectada e Animais: ... aparecem quando houver detecção.
+
+
+HUD à direita mostra OBJ: N @ X fps.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Dicas de verificação rápida
+
+
+
+
+Se os banners de pessoa/animal não aparecerem:
+
+
+
+Abra http://SEU_PC:8000/objects no navegador: veja se há objects chegando (coloque alguém na frente da câmera).
+
+
+Se objects_ok = true e num_objects > 0 no /debug_models, o servidor está OK — então verifique se o IP do servidor no app está correto.
+
+
+Se objects_ok = false: reinicie o servidor; confirme que a câmera está entregando frames (em /status -> hasFrame: true).
+
+
+
+
+
+
+
+
+
+Se algo ainda não aparecer, me manda o JSON exato que sai de GET /objects e eu ajusto imediatamente o parser do app (já deixei compatível com o formato acima).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ERROR  Warning: useInsertionEffect must not schedule updates.
 
 Call Stack
   RNSScreenContainer (<anonymous>)
