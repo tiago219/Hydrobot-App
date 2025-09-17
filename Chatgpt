@@ -1,3 +1,205 @@
+// HydroBotApp2/src/screens/DashboardScreen.tsx
+import { useEffect, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  Image,
+  Pressable,
+  Alert,
+  TextInput,
+  Modal,
+  TouchableOpacity,
+  SafeAreaView,
+  Share,
+} from "react-native";
+import * as FileSystem from "expo-file-system";
+import * as MediaLibrary from "expo-media-library";
+import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = {
+  bg: "#0a0a0a",
+  card: "#121212",
+  card2: "#0e0e10",
+  border: "#232323",
+  text: "#e5e7eb",
+  sub: "#9ca3af",
+  accent: "#2b48ff",
+  danger: "#ef4444",
+  row: "#0f1730",
+  chip: "#182033",
+  chipText: "#b7c6ff",
+};
+
+const texts = {
+  pt: {
+    title: "Dashboard",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar agora",
+    saving: "Salvando...",
+    empty1: "Sem eventos ainda.",
+    empty2:
+      "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
+    fire: "Detecção de fogo",
+    clear: "Limpar",
+    confirmClearTitle: "Limpar tudo",
+    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
+    cancel: "Cancelar",
+    delete: "Excluir",
+    confirmDeleteTitle: "Excluir registro",
+    confirmDeleteBody: "Deseja excluir este evento?",
+    fail: "Falha ao salvar",
+    failBody: "Verifique o servidor /snapshot e a rede.",
+    details: "Detalhes",
+    share: "Compartilhar",
+    show: "Mostrar",
+    hide: "Ocultar",
+    download: "Baixar",
+    downloadedTo: (p: string) => `Imagem salva em:\n${p}`,
+    savedToGallery: "Imagem salva na galeria 📸",
+  },
+  en: {
+    title: "Dashboard",
+    server: "Server:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Save now",
+    saving: "Saving...",
+    empty1: "No events yet.",
+    empty2:
+      "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
+    fire: "Fire detection",
+    clear: "Clear",
+    confirmClearTitle: "Clear all",
+    confirmClearBody: "This will delete all events and images. Continue?",
+    cancel: "Cancel",
+    delete: "Delete",
+    confirmDeleteTitle: "Delete entry",
+    confirmDeleteBody: "Do you want to delete this event?",
+    fail: "Failed to save",
+    failBody: "Check the /snapshot endpoint and network.",
+    details: "Details",
+    share: "Share",
+    show: "Show",
+    hide: "Hide",
+    download: "Download",
+    downloadedTo: (p: string) => `Image saved to:\n${p}`,
+    savedToGallery: "Image saved to gallery 📸",
+  },
+  es: {
+    title: "Panel",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar ahora",
+    saving: "Guardando...",
+    empty1: "Sin eventos aún.",
+    empty2:
+      "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
+    fire: "Detección de fuego",
+    clear: "Limpiar",
+    confirmClearTitle: "Limpiar todo",
+    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
+    cancel: "Cancelar",
+    delete: "Eliminar",
+    confirmDeleteTitle: "Eliminar registro",
+    confirmDeleteBody: "¿Deseas eliminar este evento?",
+    fail: "Error al guardar",
+    failBody: "Revisa /snapshot y la red.",
+    details: "Detalles",
+    share: "Compartir",
+    show: "Mostrar",
+    hide: "Ocultar",
+    download: "Descargar",
+    downloadedTo: (p: string) => `Imagen guardada en:\n${p}`,
+    savedToGallery: "Imagen guardada en la galería 📸",
+  },
+};
+
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+// Permite expandir/colapsar múltiplos cards
+type EventWithMeta = FireEvent & { meta?: any };
+
+export default function DashboardScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  const [server, setServer] = useState<string>(DEFAULT_SERVER);
+  const [items, setItems] = useState<EventWithMeta[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [preview, setPreview] = useState<EventWithMeta | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  async function load() {
+    setRefreshing(true);
+    try {
+      const list = (await getEvents()) as EventWithMeta[];
+      setItems(list);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function handleRegisterNow() {
+    try {
+      setBusy(true);
+      const ev = (await saveEventFromServer(server)) as EventWithMeta;
+      setItems((prev) => [ev, ...prev]);
+    } catch {
+      Alert.alert(T.fail, T.failBody);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmDelete(ev: EventWithMeta) {
+    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
+      { text: T.cancel, style: "cancel" },
+      {
+        text: T.delete,
+        style: "destructive",
+        onPress: async () => {
+          await deleteEvent(ev.id);
+          setItems((prev) => prev.filter((x) => x.id !== ev.id));
+          setExpanded((s) => {
+            const n = new Set(s);
+            n.delete(ev.id);
+            return n;
+          });
+        },
+      },
+    ]);
+  }
+
+  function confirmClearAll() {
+    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
+      { text: T.cancel, style: "cancel" },
+      {
+        text: T.clear,
+        style: "destructive",
+        onPress: async () => {
+          await clearAllEvents();
+          setItems([]);
+          setExpanded(new Set());
+        },
+      },
+    ]);
+  }
+
+  function toggleExpand(item: EventWithMeta) {
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(item.id)) n.delete(item.id);
+      else n.add(item.id);
+      return n;
+    });
+  }
 
 async function downloadImage(uri: string, id: string) {
   try {
@@ -44,296 +246,6 @@ async function downloadImage(uri: string, id: string) {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-show! Aqui está o arquivo completo do DashboardScreen.tsx já com:
-
-
-
-
-cards que expandem/colapsam;
-
-
-painel expandido enxuto (imagem grande + data/hora);
-
-
-botão Baixar (tenta salvar na Galeria; se não conseguir, salva na pasta do app e mostra o caminho);
-
-
-botão Compartilhar;
-
-
-sem infos técnicas poluidoras.
-
-
-
-
-Cole tudo abaixo no lugar do seu arquivo atual.
-
-
-// HydroBotApp2/src/screens/DashboardScreen.tsx
-import { useEffect, useState } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  FlatList,
-  Image,
-  Pressable,
-  Alert,
-  TextInput,
-  Modal,
-  TouchableOpacity,
-  SafeAreaView,
-  Share,
-} from "react-native";
-import * as FileSystem from "expo-file-system";
-import * as MediaLibrary from "expo-media-library";
-import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = {
-  bg: "#0a0a0a",
-  card: "#121212",
-  card2: "#0e0e10",
-  border: "#232323",
-  text: "#e5e7eb",
-  sub: "#9ca3af",
-  accent: "#2b48ff",
-  danger: "#ef4444",
-  row: "#0f1730",
-  chip: "#182033",
-  chipText: "#b7c6ff",
-};
-
-const texts = {
-  pt: {
-    title: "Dashboard",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar agora",
-    saving: "Salvando...",
-    empty1: "Sem eventos ainda.",
-    empty2:
-      "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
-    fire: "Detecção de fogo",
-    clear: "Limpar",
-    confirmClearTitle: "Limpar tudo",
-    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
-    cancel: "Cancelar",
-    delete: "Excluir",
-    confirmDeleteTitle: "Excluir registro",
-    confirmDeleteBody: "Deseja excluir este evento?",
-    fail: "Falha ao salvar",
-    failBody: "Verifique o servidor /snapshot e a rede.",
-    details: "Detalhes",
-    share: "Compartilhar",
-    show: "Mostrar",
-    hide: "Ocultar",
-    download: "Baixar",
-    downloadedTo: (p: string) => `Imagem salva em:\n${p}`,
-    savedToGallery: "Imagem salva na galeria 📸",
-  },
-  en: {
-    title: "Dashboard",
-    server: "Server:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Save now",
-    saving: "Saving...",
-    empty1: "No events yet.",
-    empty2:
-      "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
-    fire: "Fire detection",
-    clear: "Clear",
-    confirmClearTitle: "Clear all",
-    confirmClearBody: "This will delete all events and images. Continue?",
-    cancel: "Cancel",
-    delete: "Delete",
-    confirmDeleteTitle: "Delete entry",
-    confirmDeleteBody: "Do you want to delete this event?",
-    fail: "Failed to save",
-    failBody: "Check the /snapshot endpoint and network.",
-    details: "Details",
-    share: "Share",
-    show: "Show",
-    hide: "Hide",
-    download: "Download",
-    downloadedTo: (p: string) => `Image saved to:\n${p}`,
-    savedToGallery: "Image saved to gallery 📸",
-  },
-  es: {
-    title: "Panel",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar ahora",
-    saving: "Guardando...",
-    empty1: "Sin eventos aún.",
-    empty2:
-      "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
-    fire: "Detección de fuego",
-    clear: "Limpiar",
-    confirmClearTitle: "Limpiar todo",
-    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
-    cancel: "Cancelar",
-    delete: "Eliminar",
-    confirmDeleteTitle: "Eliminar registro",
-    confirmDeleteBody: "¿Deseas eliminar este evento?",
-    fail: "Error al guardar",
-    failBody: "Revisa /snapshot y la red.",
-    details: "Detalles",
-    share: "Compartir",
-    show: "Mostrar",
-    hide: "Ocultar",
-    download: "Descargar",
-    downloadedTo: (p: string) => `Imagen guardada en:\n${p}`,
-    savedToGallery: "Imagen guardada en la galería 📸",
-  },
-};
-
-const DEFAULT_SERVER = "http://192.168.4.2:8000";
-
-// Permite expandir/colapsar múltiplos cards
-type EventWithMeta = FireEvent & { meta?: any };
-
-export default function DashboardScreen() {
-  const { lang } = useLanguage();
-  const T = texts[lang];
-
-  const [server, setServer] = useState<string>(DEFAULT_SERVER);
-  const [items, setItems] = useState<EventWithMeta[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
-  const [preview, setPreview] = useState<EventWithMeta | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-
-  async function load() {
-    setRefreshing(true);
-    try {
-      const list = (await getEvents()) as EventWithMeta[];
-      setItems(list);
-    } finally {
-      setRefreshing(false);
-    }
-  }
-  useEffect(() => {
-    load();
-  }, []);
-
-  async function handleRegisterNow() {
-    try {
-      setBusy(true);
-      const ev = (await saveEventFromServer(server)) as EventWithMeta;
-      setItems((prev) => [ev, ...prev]);
-    } catch {
-      Alert.alert(T.fail, T.failBody);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function confirmDelete(ev: EventWithMeta) {
-    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.delete,
-        style: "destructive",
-        onPress: async () => {
-          await deleteEvent(ev.id);
-          setItems((prev) => prev.filter((x) => x.id !== ev.id));
-          setExpanded((s) => {
-            const n = new Set(s);
-            n.delete(ev.id);
-            return n;
-          });
-        },
-      },
-    ]);
-  }
-
-  function confirmClearAll() {
-    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.clear,
-        style: "destructive",
-        onPress: async () => {
-          await clearAllEvents();
-          setItems([]);
-          setExpanded(new Set());
-        },
-      },
-    ]);
-  }
-
-  function toggleExpand(item: EventWithMeta) {
-    setExpanded((prev) => {
-      const n = new Set(prev);
-      if (n.has(item.id)) n.delete(item.id);
-      else n.add(item.id);
-      return n;
-    });
-  }
-
-  async function downloadImage(uri: string, id: string) {
-    try {
-      // 1) baixa para a pasta do app
-      const localPath = FileSystem.documentDirectory + `${id}.jpg`;
-      await FileSystem.downloadAsync(uri, localPath);
-
-      // 2) tenta salvar na galeria (Android/iOS nativos)
-      try {
-        const perm = await MediaLibrary.requestPermissionsAsync();
-        if (perm.status === "granted") {
-          await MediaLibrary.saveToLibraryAsync(localPath);
-          Alert.alert("OK", T.savedToGallery);
-          return;
-        }
-      } catch {
-        // se falhar, continuamos e mostramos caminho do app
-      }
-
-      // 3) fallback: informa o caminho local
-      Alert.alert("OK", T.downloadedTo(localPath));
-    } catch {
-      Alert.alert("Erro", "Falha ao baixar imagem");
-    }
-  }
-
   const renderItem = ({ item }: { item: EventWithMeta }) => {
     const dateStr = new Date(item.ts).toLocaleString();
     const isOpen = expanded.has(item.id);
@@ -577,7 +489,6 @@ const styles = StyleSheet.create({
 
 
 
-Se preferir sempre salvar apenas na pasta do app (sem pedir permissão de galeria), posso simplificar a função downloadImage — mas a versão acima já tenta o melhor dos dois mundos.
 
 
 
@@ -586,1493 +497,858 @@ Se preferir sempre salvar apenas na pasta do app (sem pedir permissão de galeri
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-show! Aqui está o arquivo completo do DashboardScreen.tsx já com:
-
-
-
-
-cards que expandem/colapsam;
-
-
-painel expandido enxuto (imagem grande + data/hora);
-
-
-botão Baixar (tenta salvar na Galeria; se não conseguir, salva na pasta do app e mostra o caminho);
-
-
-botão Compartilhar;
-
-
-sem infos técnicas poluidoras.
-
-
-
-
-Cole tudo abaixo no lugar do seu arquivo atual.
-
-
-// HydroBotApp2/src/screens/DashboardScreen.tsx
-import { useEffect, useState } from "react";
-import {
-  View,
-  Text,
-  StyleSheet,
-  FlatList,
-  Image,
-  Pressable,
-  Alert,
-  TextInput,
-  Modal,
-  TouchableOpacity,
-  SafeAreaView,
-  Share,
-} from "react-native";
-import * as FileSystem from "expo-file-system";
-import * as MediaLibrary from "expo-media-library";
-import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = {
-  bg: "#0a0a0a",
-  card: "#121212",
-  card2: "#0e0e10",
-  border: "#232323",
-  text: "#e5e7eb",
-  sub: "#9ca3af",
-  accent: "#2b48ff",
-  danger: "#ef4444",
-  row: "#0f1730",
-  chip: "#182033",
-  chipText: "#b7c6ff",
-};
-
-const texts = {
-  pt: {
-    title: "Dashboard",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar agora",
-    saving: "Salvando...",
-    empty1: "Sem eventos ainda.",
-    empty2:
-      "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
-    fire: "Detecção de fogo",
-    clear: "Limpar",
-    confirmClearTitle: "Limpar tudo",
-    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
-    cancel: "Cancelar",
-    delete: "Excluir",
-    confirmDeleteTitle: "Excluir registro",
-    confirmDeleteBody: "Deseja excluir este evento?",
-    fail: "Falha ao salvar",
-    failBody: "Verifique o servidor /snapshot e a rede.",
-    details: "Detalhes",
-    share: "Compartilhar",
-    show: "Mostrar",
-    hide: "Ocultar",
-    download: "Baixar",
-    downloadedTo: (p: string) => `Imagem salva em:\n${p}`,
-    savedToGallery: "Imagem salva na galeria 📸",
-  },
-  en: {
-    title: "Dashboard",
-    server: "Server:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Save now",
-    saving: "Saving...",
-    empty1: "No events yet.",
-    empty2:
-      "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
-    fire: "Fire detection",
-    clear: "Clear",
-    confirmClearTitle: "Clear all",
-    confirmClearBody: "This will delete all events and images. Continue?",
-    cancel: "Cancel",
-    delete: "Delete",
-    confirmDeleteTitle: "Delete entry",
-    confirmDeleteBody: "Do you want to delete this event?",
-    fail: "Failed to save",
-    failBody: "Check the /snapshot endpoint and network.",
-    details: "Details",
-    share: "Share",
-    show: "Show",
-    hide: "Hide",
-    download: "Download",
-    downloadedTo: (p: string) => `Image saved to:\n${p}`,
-    savedToGallery: "Image saved to gallery 📸",
-  },
-  es: {
-    title: "Panel",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar ahora",
-    saving: "Guardando...",
-    empty1: "Sin eventos aún.",
-    empty2:
-      "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
-    fire: "Detección de fuego",
-    clear: "Limpiar",
-    confirmClearTitle: "Limpiar todo",
-    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
-    cancel: "Cancelar",
-    delete: "Eliminar",
-    confirmDeleteTitle: "Eliminar registro",
-    confirmDeleteBody: "¿Deseas eliminar este evento?",
-    fail: "Error al guardar",
-    failBody: "Revisa /snapshot y la red.",
-    details: "Detalles",
-    share: "Compartir",
-    show: "Mostrar",
-    hide: "Ocultar",
-    download: "Descargar",
-    downloadedTo: (p: string) => `Imagen guardada en:\n${p}`,
-    savedToGallery: "Imagen guardada en la galería 📸",
-  },
-};
-
-const DEFAULT_SERVER = "http://192.168.4.2:8000";
-
-// Permite expandir/colapsar múltiplos cards
-type EventWithMeta = FireEvent & { meta?: any };
-
-export default function DashboardScreen() {
-  const { lang } = useLanguage();
-  const T = texts[lang];
-
-  const [server, setServer] = useState<string>(DEFAULT_SERVER);
-  const [items, setItems] = useState<EventWithMeta[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
-  const [preview, setPreview] = useState<EventWithMeta | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-
-  async function load() {
-    setRefreshing(true);
-    try {
-      const list = (await getEvents()) as EventWithMeta[];
-      setItems(list);
-    } finally {
-      setRefreshing(false);
-    }
-  }
-  useEffect(() => {
-    load();
-  }, []);
-
-  async function handleRegisterNow() {
-    try {
-      setBusy(true);
-      const ev = (await saveEventFromServer(server)) as EventWithMeta;
-      setItems((prev) => [ev, ...prev]);
-    } catch {
-      Alert.alert(T.fail, T.failBody);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function confirmDelete(ev: EventWithMeta) {
-    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.delete,
-        style: "destructive",
-        onPress: async () => {
-          await deleteEvent(ev.id);
-          setItems((prev) => prev.filter((x) => x.id !== ev.id));
-          setExpanded((s) => {
-            const n = new Set(s);
-            n.delete(ev.id);
-            return n;
-          });
-        },
-      },
-    ]);
-  }
-
-  function confirmClearAll() {
-    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.clear,
-        style: "destructive",
-        onPress: async () => {
-          await clearAllEvents();
-          setItems([]);
-          setExpanded(new Set());
-        },
-      },
-    ]);
-  }
-
-  function toggleExpand(item: EventWithMeta) {
-    setExpanded((prev) => {
-      const n = new Set(prev);
-      if (n.has(item.id)) n.delete(item.id);
-      else n.add(item.id);
-      return n;
-    });
-  }
-
-  async function downloadImage(uri: string, id: string) {
-    try {
-      // 1) baixa para a pasta do app
-      const localPath = FileSystem.documentDirectory + `${id}.jpg`;
-      await FileSystem.downloadAsync(uri, localPath);
-
-      // 2) tenta salvar na galeria (Android/iOS nativos)
-      try {
-        const perm = await MediaLibrary.requestPermissionsAsync();
-        if (perm.status === "granted") {
-          await MediaLibrary.saveToLibraryAsync(localPath);
-          Alert.alert("OK", T.savedToGallery);
-          return;
-        }
-      } catch {
-        // se falhar, continuamos e mostramos caminho do app
-      }
-
-      // 3) fallback: informa o caminho local
-      Alert.alert("OK", T.downloadedTo(localPath));
-    } catch {
-      Alert.alert("Erro", "Falha ao baixar imagem");
-    }
-  }
-
-  const renderItem = ({ item }: { item: EventWithMeta }) => {
-    const dateStr = new Date(item.ts).toLocaleString();
-    const isOpen = expanded.has(item.id);
-
-    return (
-      <View style={styles.cardWrap}>
-        {/* Cabeçalho do card */}
-        <Pressable onPress={() => toggleExpand(item)} style={styles.cardHeader}>
-          <Image source={{ uri: item.imageUri }} style={styles.thumb} />
-          <View style={{ flex: 1 }}>
-            <Text style={styles.title}>{T.fire}</Text>
-            <Text style={styles.time}>{dateStr}</Text>
-            <Text style={styles.path} numberOfLines={1}>
-              {item.imageUri}
-            </Text>
-          </View>
-
-          <View style={{ alignItems: "flex-end", gap: 8 }}>
-            <Pressable onPress={() => toggleExpand(item)} style={[styles.expandBtn, isOpen && styles.expandBtnOn]}>
-              <Text style={styles.expandTxt}>{isOpen ? "▾ " + T.hide : "▸ " + T.show}</Text>
-            </Pressable>
-            <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
-              <Text style={styles.trashTxt}>{T.delete}</Text>
-            </Pressable>
-          </View>
-        </Pressable>
-
-        {/* Painel expandido – simples: imagem grande + hora + ações */}
-        {isOpen && (
-          <View style={styles.expandPanel}>
-            <Pressable onPress={() => setPreview(item)} style={styles.bigImageWrap}>
-              <Image source={{ uri: item.imageUri }} style={styles.bigImage} resizeMode="contain" />
-            </Pressable>
-
-            <View style={styles.detailsBox}>
-              <Text style={styles.detailsTitle}>{T.details}</Text>
-              <Text style={styles.timeBig}>{dateStr}</Text>
-            </View>
-
-            <View style={styles.actionsRow}>
-              <Pressable
-                style={[styles.actionBtn, { backgroundColor: PALETTE.accent }]}
-                onPress={() => downloadImage(item.imageUri, item.id)}
-              >
-                <Text style={[styles.actionTxt, { color: "white" }]}>⬇ {T.download}</Text>
-              </Pressable>
-
-              <Pressable
-                style={[styles.actionBtn, { backgroundColor: "#444" }]}
-                onPress={() => Share.share({ url: item.imageUri, message: `${T.fire} • ${dateStr}` })}
-              >
-                <Text style={[styles.actionTxt, { color: "#fff" }]}>{T.share}</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-      </View>
-    );
-  };
-
-  return (
-    <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>{T.title}</Text>
-        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
-          <Text style={styles.clearAllTxt}>{T.clear}</Text>
-        </Pressable>
-      </View>
-
-      {/* Linha do servidor + Registrar */}
-      <View style={styles.row}>
-        <Text style={styles.label}>{T.server}</Text>
-        <TextInput
-          value={server}
-          onChangeText={setServer}
-          placeholder={T.placeholder}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={[styles.input, { flex: 1 }]}
-        />
-        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
-          <Text style={styles.btnTxt}>{busy ? T.saving : T.btnSave}</Text>
-        </Pressable>
-      </View>
-
-      {/* Lista */}
-      <FlatList
-        data={items}
-        keyExtractor={(it) => it.id}
-        renderItem={renderItem}
-        refreshing={refreshing}
-        onRefresh={load}
-        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
-        ListEmptyComponent={
-          <View style={{ alignItems: "center", paddingHorizontal: 16 }}>
-            <Text style={{ color: PALETTE.sub, textAlign: "center" }}>{T.empty1}</Text>
-            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>{T.empty2}</Text>
-          </View>
-        }
-      />
-
-      {/* Modal de zoom (toque na imagem grande) */}
-      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
-        <View style={styles.modalBg}>
-          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
-            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
-          </TouchableOpacity>
-        </View>
-      </Modal>
-    </SafeAreaView>
-  );
-}
-
-/* =========================
-   ESTILOS
-========================= */
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: PALETTE.bg },
-
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PALETTE.border,
-    backgroundColor: PALETTE.card2,
-  },
-  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
-  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
-  clearAllTxt: { color: "white", fontWeight: "700" },
-
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PALETTE.border,
-    backgroundColor: PALETTE.row,
-  },
-  label: { color: PALETTE.sub, fontSize: 12 },
-  input: {
-    backgroundColor: PALETTE.card,
-    color: PALETTE.text,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-    minWidth: 140,
-  },
-  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
-  btnTxt: { color: "white", fontWeight: "700" },
-
-  /* CARD */
-  cardWrap: {
-    backgroundColor: PALETTE.card,
-    marginHorizontal: 10,
-    marginTop: 10,
-    borderRadius: 12,
-    overflow: "hidden",
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-  },
-  cardHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
-  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
-  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
-  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
-
-  expandBtn: {
-    backgroundColor: "#2a2f3d",
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-  },
-  expandBtnOn: { backgroundColor: "#1d2435" },
-  expandTxt: { color: "#cbd5ff", fontWeight: "700", fontSize: 12 },
-
-  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
-
-  expandPanel: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: PALETTE.border,
-    backgroundColor: PALETTE.card2,
-    paddingBottom: 12,
-  },
-
-  bigImageWrap: {
-    marginHorizontal: 12,
-    marginTop: 10,
-    borderRadius: 10,
-    overflow: "hidden",
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-    backgroundColor: "#000",
-  },
-  bigImage: { width: "100%", height: 220 },
-
-  detailsBox: {
-    marginTop: 10,
-    marginHorizontal: 12,
-    padding: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-    backgroundColor: "#0c1020",
-  },
-  detailsTitle: { color: PALETTE.chipText, fontWeight: "800", marginBottom: 6 },
-  timeBig: { color: PALETTE.text, fontSize: 14, fontWeight: "600" },
-
-  actionsRow: {
-    flexDirection: "row",
-    gap: 10,
-    marginHorizontal: 12,
-    marginTop: 10,
-  },
-  actionBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  actionTxt: { fontWeight: "800" },
-
-  /* Modal zoom */
-  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", alignItems: "center", justifyContent: "center" },
-  fullImg: { width: "100%", height: "100%" },
-});
-
-
-
-Se preferir sempre salvar apenas na pasta do app (sem pedir permissão de galeria), posso simplificar a função downloadImage — mas a versão acima já tenta o melhor dos dois mundos.
-
-
-async function ensureLoadedInfo(item: EventWithMeta) {
-  if (loaded[item.id]) return;
-  try {
-    // peça explicitamente o size; em alguns SDKs isso é necessário
-    const info = await FileSystem.getInfoAsync(item.imageUri, { size: true } as any);
-
-    let sizeBytes: number | undefined;
-    // TypeScript-safe: só usa se a prop existir e for número
-    if (info && typeof (info as any).size === "number") {
-      sizeBytes = (info as any).size;
-    }
-
-    let width: number | undefined;
-    let height: number | undefined;
-    await new Promise<void>((resolve) => {
-      Image.getSize(
-        item.imageUri,
-        (w, h) => {
-          width = w;
-          height = h;
-          resolve();
-        },
-        () => resolve()
-      );
-    });
-
-    setLoaded((prev) => ({ ...prev, [item.id]: { sizeBytes, width, height } }));
-  } catch {
-    // silencioso
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Perfeito — segue a Dashboard com “expandir/colapsar” em cada item. Ao tocar no card, ele abre um painel com imagem grande + detalhes (data, caminho, tamanho do arquivo, resolução, servidor, score etc. quando disponíveis). Mantive o botão de excluir e adicionei ações úteis (Abrir / Compartilhar).
-
-
-
-
-Cole este arquivo completo no lugar do seu DashboardScreen atual.
-
-
-
-
-// HydroBotApp2/src/screens/DashboardScreen.tsx
+// HydroBotApp2/src/screens/CameraScreen.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
-  StyleSheet,
-  FlatList,
-  Image,
-  Pressable,
-  Alert,
   TextInput,
-  Modal,
-  TouchableOpacity,
-  SafeAreaView,
-  Share,
-  Linking,
+  Pressable,
+  StyleSheet,
+  PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
+  Image,
+  Animated,
+  LayoutChangeEvent,
 } from "react-native";
-import * as FileSystem from "expo-file-system";
-import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+import { WebView } from "react-native-webview";
+import { saveEventFromServer } from "../storage/fireLog";
 import { useLanguage } from "../context/LanguageContext";
 
 const PALETTE = {
-  bg: "#0a0a0a",
-  card: "#121212",
-  card2: "#0e0e10",
-  border: "#232323",
-  text: "#e5e7eb",
-  sub: "#9ca3af",
-  accent: "#2b48ff",
-  accent2: "#1b39ff",
-  danger: "#ef4444",
-  chip: "#182033",
-  chipText: "#b7c6ff",
-  row: "#0f1730",
-  ok: "#16a34a",
-  warn: "#eab308",
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#ffffff",
 };
 
-const texts = {
+const textsByLang = {
   pt: {
-    title: "Dashboard",
+    espIp: "ESP IP:",
+    test: "Testar",
+    ledOn: "LED ON",
+    ledOff: "LED OFF",
+    pumpOn: "BOMBA ON",
+    pumpOff: "BOMBA OFF",
     server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar agora",
+    detect: "Detectar",
+    detecting: "Detectando",
     saving: "Salvando...",
-    empty1: "Sem eventos ainda.",
-    empty2:
-      "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
-    fire: "Detecção de fogo",
-    clear: "Limpar",
-    confirmClearTitle: "Limpar tudo",
-    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
-    cancel: "Cancelar",
-    delete: "Excluir",
-    confirmDeleteTitle: "Excluir registro",
-    confirmDeleteBody: "Deseja excluir este evento?",
-    fail: "Falha ao salvar",
-    failBody: "Verifique o servidor /snapshot e a rede.",
-    details: "Detalhes",
-    open: "Abrir",
-    share: "Compartilhar",
-    path: "Caminho",
-    date: "Data",
-    size: "Tamanho",
-    res: "Resolução",
-    serverAt: "Servidor (na captura)",
-    score: "Score",
-    model: "Modelo",
-    yes: "sim",
-    no: "não",
-    show: "Mostrar",
-    hide: "Ocultar",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi/IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s: number) => `🔥 FOGO • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Visão:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    persons: "Pessoas",
+    animals: "Animais",
+    boxes: "Caixas",
+    backend: "Modelo",
   },
   en: {
-    title: "Dashboard",
+    espIp: "ESP IP:",
+    test: "Test",
+    ledOn: "LED ON",
+    ledOff: "LED OFF",
+    pumpOn: "PUMP ON",
+    pumpOff: "PUMP OFF",
     server: "Server:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Save now",
+    detect: "Detect",
+    detecting: "Detecting",
     saving: "Saving...",
-    empty1: "No events yet.",
-    empty2:
-      "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
-    fire: "Fire detection",
-    clear: "Clear",
-    confirmClearTitle: "Clear all",
-    confirmClearBody: "This will delete all events and images. Continue?",
-    cancel: "Cancel",
-    delete: "Delete",
-    confirmDeleteTitle: "Delete entry",
-    confirmDeleteBody: "Do you want to delete this event?",
-    fail: "Failed to save",
-    failBody: "Check the /snapshot endpoint and network.",
-    details: "Details",
-    open: "Open",
-    share: "Share",
-    path: "Path",
-    date: "Date",
-    size: "Size",
-    res: "Resolution",
-    serverAt: "Server (at capture)",
-    score: "Score",
-    model: "Model",
-    yes: "yes",
-    no: "no",
-    show: "Show",
-    hide: "Hide",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s: number) => `🔥 FIRE • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "View:",
+    stream: "STREAM (fast)",
+    snapshot: "SNAPSHOT (fallback)",
+    persons: "People",
+    animals: "Animals",
+    boxes: "Boxes",
+    backend: "Model",
   },
   es: {
-    title: "Panel",
+    espIp: "ESP IP:",
+    test: "Probar",
+    ledOn: "LED ENC.",
+    ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.",
+    pumpOff: "BOMBA APAG.",
     server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar ahora",
+    detect: "Detectar",
+    detecting: "Detectando",
     saving: "Guardando...",
-    empty1: "Sin eventos aún.",
-    empty2:
-      "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
-    fire: "Detección de fuego",
-    clear: "Limpiar",
-    confirmClearTitle: "Limpiar todo",
-    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
-    cancel: "Cancelar",
-    delete: "Eliminar",
-    confirmDeleteTitle: "Eliminar registro",
-    confirmDeleteBody: "¿Deseas eliminar este evento?",
-    fail: "Error al guardar",
-    failBody: "Revisa /snapshot y la red.",
-    details: "Detalles",
-    open: "Abrir",
-    share: "Compartir",
-    path: "Ruta",
-    date: "Fecha",
-    size: "Tamaño",
-    res: "Resolución",
-    serverAt: "Servidor (en la captura)",
-    score: "Score",
-    model: "Modelo",
-    yes: "sí",
-    no: "no",
-    show: "Mostrar",
-    hide: "Ocultar",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s: number) => `🔥 FUEGO • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    view: "Vista:",
+    stream: "STREAM (rápido)",
+    snapshot: "SNAPSHOT (fallback)",
+    persons: "Personas",
+    animals: "Animales",
+    boxes: "Cajas",
+    backend: "Modelo",
   },
 };
 
+const DEFAULT_IP = "192.168.4.1";
 const DEFAULT_SERVER = "http://192.168.4.2:8000";
 
-// Tipagem opcional defensiva (caso o storage salve metadados)
-type EventMeta = {
-  server?: string;
-  score?: number;
-  isFire?: boolean;
-  backend?: string;
-  conf_max?: number;
-  frame_wh?: [number, number];
-};
-type EventWithMeta = FireEvent & { meta?: EventMeta };
+/* ===========================
+   Componentes de vídeo
+=========================== */
+function LiveMJPEG({ ip }: { ip: string }) {
+  const html = `
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;}
+        .wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+        img{max-width:100%;max-height:100%;object-fit:contain;background:#000;}
+      </style>
+    </head>
+    <body>
+      <div class="wrap"><img src="http://${ip}:81/stream" /></div>
+    </body></html>
+  `.trim();
 
-// Estado auxiliar carregado ao expandir
-type LoadedInfo = {
-  sizeBytes?: number;
-  width?: number;
-  height?: number;
-};
-
-function fmtBytes(n?: number) {
-  if (!n || n <= 0) return "—";
-  const kb = n / 1024;
-  if (kb < 1024) return `${kb.toFixed(1)} KB`;
-  const mb = kb / 1024;
-  return `${mb.toFixed(2)} MB`;
+  return (
+    <WebView
+      originWhitelist={["*"]}
+      source={{ html }}
+      javaScriptEnabled
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      automaticallyAdjustContentInsets={false}
+      style={{ flex: 1, backgroundColor: "black" }}
+    />
+  );
 }
 
-export default function DashboardScreen() {
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={onNextShown}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+/* ===========================
+   Overlay de caixas
+=========================== */
+
+type BoxType = "fire" | "person" | "animal";
+type SrcBox = { x: number; y: number; w: number; h: number; type: BoxType; conf?: number };
+
+function BoxesOverlay({
+  frameWH,
+  containerWH,
+  boxes,
+}: {
+  frameWH: { w: number; h: number } | null;
+  containerWH: { w: number; h: number } | null;
+  boxes: SrcBox[];
+}) {
+  if (!frameWH || !containerWH || frameWH.w <= 0 || frameWH.h <= 0 || containerWH.w <= 0 || containerWH.h <= 0) {
+    return null;
+  }
+
+  // Simula object-fit: contain
+  const scale = Math.min(containerWH.w / frameWH.w, containerWH.h / frameWH.h);
+  const dispW = frameWH.w * scale;
+  const dispH = frameWH.h * scale;
+  const offsetX = (containerWH.w - dispW) / 2;
+  const offsetY = (containerWH.h - dispH) / 2;
+
+  return (
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+      {/* Área exata onde a imagem aparece */}
+      <View
+        style={{
+          position: "absolute",
+          left: offsetX,
+          top: offsetY,
+          width: dispW,
+          height: dispH,
+        }}
+      >
+        {boxes.map((b, i) => {
+          const left = b.x * scale;
+          const top = b.y * scale;
+          const width = b.w * scale;
+          const height = b.h * scale;
+
+          let borderColor = "#ff3b30"; // fire
+          if (b.type === "person") borderColor = "#00e5ff";
+          else if (b.type === "animal") borderColor = "#7CFC00";
+
+          return (
+            <View
+              key={`${i}-${b.type}`}
+              style={{
+                position: "absolute",
+                left,
+                top,
+                width,
+                height,
+                borderWidth: 3,
+                borderColor,
+                borderRadius: 6,
+                backgroundColor: "transparent",
+              }}
+            >
+              {/* Etiqueta no topo */}
+              <View
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: -18,
+                  paddingHorizontal: 6,
+                  paddingVertical: 2,
+                  borderRadius: 4,
+                  backgroundColor: borderColor,
+                }}
+              >
+                <Text style={{ color: "#000", fontWeight: "800", fontSize: 10 }}>
+                  {b.type.toUpperCase()}
+                  {typeof b.conf === "number" ? ` ${b.conf.toFixed(2)}` : ""}
+                </Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+export default function CameraScreen() {
   const { lang } = useLanguage();
-  const T = texts[lang];
+  const T = textsByLang[lang];
 
-  const [server, setServer] = useState<string>(DEFAULT_SERVER);
-  const [items, setItems] = useState<EventWithMeta[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
-  const [preview, setPreview] = useState<EventWithMeta | null>(null);
-  const [busy, setBusy] = useState(false);
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
 
-  // controle de expansão
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [loaded, setLoaded] = useState<Record<string, LoadedInfo>>({});
+  // estados do ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
 
-  async function load() {
-    setRefreshing(true);
+  // detecção
+  const [detectOn, setDetectOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // pessoas/animais (usando campos estáveis do servidor)
+  const [people, setPeople] = useState(0);
+  const [animals, setAnimals] = useState(0);
+  const [backend, setBackend] = useState<string>("—");
+  const [confMax, setConfMax] = useState<number>(0);
+
+  // caixas para overlay
+  const [overlayBoxes, setOverlayBoxes] = useState<SrcBox[]>([]);
+  const [frameWH, setFrameWH] = useState<{ w: number; h: number } | null>(null);
+  const [videoContainerWH, setVideoContainerWH] = useState<{ w: number; h: number } | null>(null);
+
+  // preview de caixas
+  const [showBoxes, setShowBoxes] = useState(false);
+  const [boxesUri, setBoxesUri] = useState("");
+
+  // registro automático
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // visão
+  const [useStream, setUseStream] = useState(true);
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // helpers URL
+  const cleanServer = (s: string) => s.replace(/\/+$/, "");
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  /* ===== ESP STATUS ===== */
+  async function pingStatus() {
     try {
-      const list = (await getEvents()) as EventWithMeta[];
-      setItems(list);
+      setIsChecking(true);
+      const r = await fetch(statusUrl);
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
     } finally {
-      setRefreshing(false);
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() {
+    try {
+      const t = !ledOn;
+      await fetch(ledUrl(t));
+      setLedOn(t);
+    } catch {
+      setStatusText(T.statusFail);
+    }
+  }
+  async function togglePump() {
+    try {
+      const t = !pumpOn;
+      await fetch(pumpUrl(t));
+      setPumpOn(t);
+    } catch {
+      setStatusText(T.statusFail);
     }
   }
   useEffect(() => {
-    load();
-  }, []);
+    pingStatus();
+    const id = setInterval(pingStatus, 5000);
+    return () => clearInterval(id);
+  }, [statusUrl]);
 
-  async function handleRegisterNow() {
-    try {
-      setBusy(true);
-      const ev = (await saveEventFromServer(server)) as EventWithMeta;
-      setItems((prev) => [ev, ...prev]);
-    } catch {
-      Alert.alert(T.fail, T.failBody);
-    } finally {
-      setBusy(false);
-    }
-  }
+  /* ===== Vídeo SNAPSHOT fallback (25 fps alvo) ===== */
+  useEffect(() => {
+    if (useStream) return;
+    let stop = false;
+    const FPS_INTERVAL = 40; // ~25 fps
 
-  function confirmDelete(ev: EventWithMeta) {
-    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.delete,
-        style: "destructive",
-        onPress: async () => {
-          await deleteEvent(ev.id);
-          setItems((prev) => prev.filter((x) => x.id !== ev.id));
-          setExpanded((s) => {
-            const n = new Set(s);
-            n.delete(ev.id);
-            return n;
-          });
-        },
-      },
-    ]);
-  }
+    setCurrentFrameUri(`${cleanServer(server)}/snapshot?ts=${Date.now()}`);
 
-  function confirmClearAll() {
-    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
-      { text: T.cancel, style: "cancel" },
-      {
-        text: T.clear,
-        style: "destructive",
-        onPress: async () => {
-          await clearAllEvents();
-          setItems([]);
-          setExpanded(new Set());
-          setLoaded({});
-        },
-      },
-    ]);
-  }
-
-  async function ensureLoadedInfo(item: EventWithMeta) {
-    if (loaded[item.id]) return;
-    try {
-      const info = await FileSystem.getInfoAsync(item.imageUri);
-      let width: number | undefined;
-      let height: number | undefined;
-      await new Promise<void>((resolve) => {
-        Image.getSize(
-          item.imageUri,
-          (w, h) => {
-            width = w;
-            height = h;
-            resolve();
-          },
-          () => resolve()
-        );
-      });
-      setLoaded((prev) => ({ ...prev, [item.id]: { sizeBytes: info.size, width, height } }));
-    } catch {
-      // silencioso
-    }
-  }
-
-  function toggleExpand(item: EventWithMeta) {
-    setExpanded((prev) => {
-      const n = new Set(prev);
-      if (n.has(item.id)) {
-        n.delete(item.id);
-      } else {
-        n.add(item.id);
-        ensureLoadedInfo(item);
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${cleanServer(server)}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
       }
-      return n;
-    });
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+
+    return () => {
+      stop = true;
+    };
+  }, [server, useStream]);
+
+  function onNextLoadStart() {
+    loadingNextRef.current = true;
+  }
+  function onNextShown() {
+    if (nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    loadingNextRef.current = false;
   }
 
-  function Row({ k, v }: { k: string; v: string }) {
-    return (
-      <View style={styles.kvRow}>
-        <Text style={styles.kvKey}>{k}</Text>
-        <Text style={styles.kvVal}>{v}</Text>
-      </View>
-    );
+  /* ===== LOOP DE DETECÇÃO + CAIXAS ===== */
+  useEffect(() => {
+    if (!detectOn) return;
+    let stop = false;
+
+    const loop = async () => {
+      try {
+        const r = await fetch(`${cleanServer(server)}/detect`);
+        const j = await r.json();
+
+        if (!stop && j && j.ok !== false) {
+          // fogo
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+
+          // frame size para conversão
+          const wh = Array.isArray(j.frame_wh) && j.frame_wh.length === 2
+            ? { w: Number(j.frame_wh[0]) || 0, h: Number(j.frame_wh[1]) || 0 }
+            : null;
+          if (wh && wh.w > 0 && wh.h > 0) setFrameWH(wh);
+
+          // objetos (estáveis)
+          const o = j.objects || {};
+          const objs = o.objects || [];
+          const peopleStable =
+            typeof o.n_person_stable === "number"
+              ? o.n_person_stable
+              : typeof o.n_person === "number"
+              ? o.n_person
+              : objs.filter((x: any) => x.label === "person").length > 0
+              ? 1
+              : 0;
+          const animalsStable =
+            typeof o.n_animals_stable === "number"
+              ? o.n_animals_stable
+              : typeof o.n_animals === "number"
+              ? o.n_animals
+              : objs.filter((x: any) => x.label !== "person").length > 0
+              ? 1
+              : 0;
+
+          setPeople(peopleStable);
+          setAnimals(animalsStable);
+          setBackend(o.backend || "—");
+          setConfMax(Number(o.conf_max || 0));
+
+          // montar caixas para overlay
+          const boxes: SrcBox[] = [];
+
+          // Caixas de FOGO (j.boxes) — aparecem apenas quando fogo final está ON
+          if (j.isFire && Array.isArray(j.boxes)) {
+            for (const b of j.boxes) {
+              if (!Array.isArray(b) || b.length < 4) continue;
+              const [x, y, w, h] = b.map((n: any) => Number(n) || 0);
+              boxes.push({ x, y, w, h, type: "fire" });
+            }
+          }
+
+          // Caixas de OBJETOS (pessoas/animais)
+          for (const it of objs) {
+            if (!it || !Array.isArray(it.box) || it.box.length < 4) continue;
+            const [x, y, w, h] = it.box.map((n: any) => Number(n) || 0);
+            const label = String(it.label || "").toLowerCase();
+            const conf = typeof it.conf === "number" ? it.conf : undefined;
+            if (label === "person") {
+              boxes.push({ x, y, w, h, type: "person", conf });
+            } else {
+              // qualquer não-person tratado como "animal" (COCO/MNet conjunto)
+              boxes.push({ x, y, w, h, type: "animal", conf });
+            }
+          }
+
+          setOverlayBoxes(boxes);
+
+          // mini preview (opcional)
+          if (showBoxes) {
+            setBoxesUri(`${cleanServer(server)}/objects_frame?conf=0.25&ts=${Date.now()}`);
+          }
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false);
+          setFireScore(0);
+          setPeople(0);
+          setAnimals(0);
+          setOverlayBoxes([]);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 180); // ~5-6Hz
+      }
+    };
+    loop();
+
+    return () => {
+      stop = true;
+    };
+  }, [detectOn, server, showBoxes]);
+
+  /* ===== Registro automático ===== */
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (detectOn && rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [detectOn, isFire, server, saving, T]);
+
+  /* ===== Joystick ===== */
+  const RADIUS = 64,
+    KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS,
+          ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny);
+        if (len > 1) {
+          nx /= len;
+          ny /= len;
+        }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+      onPanResponderTerminate: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+    })
+  ).current;
+
+  const knobLeft = joy.x * RADIUS,
+    knobTop = -joy.y * RADIUS;
+
+  /* ===== Medidas do container do vídeo (para o overlay) ===== */
+  function onVideoLayout(e: LayoutChangeEvent) {
+    const { width, height } = e.nativeEvent.layout;
+    setVideoContainerWH({ w: width, h: height });
   }
-
-  const renderItem = ({ item }: { item: EventWithMeta }) => {
-    const dateStr = new Date(item.ts).toLocaleString();
-    const isOpen = expanded.has(item.id);
-    const ld = loaded[item.id];
-
-    const meta = item.meta || {};
-    const resStr =
-      ld?.width && ld?.height
-        ? `${ld.width}×${ld.height}px`
-        : Array.isArray(meta.frame_wh)
-        ? `${meta.frame_wh[0]}×${meta.frame_wh[1]}px`
-        : "—";
-    const scoreStr =
-      typeof meta.score === "number"
-        ? meta.score.toFixed(3)
-        : "—";
-
-    return (
-      <View style={styles.cardWrap}>
-        {/* Cabeçalho do card */}
-        <Pressable onPress={() => toggleExpand(item)} style={styles.cardHeader}>
-          <Image source={{ uri: item.imageUri }} style={styles.thumb} />
-          <View style={{ flex: 1 }}>
-            <Text style={styles.title}>{T.fire}</Text>
-            <Text style={styles.time}>{dateStr}</Text>
-            <Text style={styles.path} numberOfLines={1}>
-              {item.imageUri}
-            </Text>
-          </View>
-
-          <View style={{ alignItems: "flex-end", gap: 8 }}>
-            <Pressable onPress={() => toggleExpand(item)} style={[styles.expandBtn, isOpen && styles.expandBtnOn]}>
-              <Text style={styles.expandTxt}>{isOpen ? "▾ " + T.hide : "▸ " + T.show}</Text>
-            </Pressable>
-            <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
-              <Text style={styles.trashTxt}>{T.delete}</Text>
-            </Pressable>
-          </View>
-        </Pressable>
-
-        {/* Painel expandido */}
-        {isOpen && (
-          <View style={styles.expandPanel}>
-            <Pressable onPress={() => setPreview(item)} style={styles.bigImageWrap}>
-              <Image source={{ uri: item.imageUri }} style={styles.bigImage} resizeMode="contain" />
-            </Pressable>
-
-            <View style={styles.detailsBox}>
-              <Text style={styles.detailsTitle}>{T.details}</Text>
-              <Row k={T.date} v={dateStr} />
-              <Row k={T.path} v={item.imageUri} />
-              <Row k={T.size} v={fmtBytes(ld?.sizeBytes)} />
-              <Row k={T.res} v={resStr} />
-              <Row k={T.serverAt} v={meta.server || "—"} />
-              <Row k={T.score} v={scoreStr} />
-              <Row k={T.model} v={meta.backend || "—"} />
-              {/* você pode adicionar mais campos do seu storage aqui */}
-            </View>
-
-            <View style={styles.actionsRow}>
-              <Pressable style={[styles.actionBtn, { backgroundColor: PALETTE.chip }]} onPress={() => Linking.openURL(item.imageUri)}>
-                <Text style={[styles.actionTxt, { color: PALETTE.chipText }]}>{T.open}</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionBtn, { backgroundColor: PALETTE.accent }]}
-                onPress={() => Share.share({ url: item.imageUri, message: `${T.fire} • ${dateStr}` })}
-              >
-                <Text style={[styles.actionTxt, { color: "white" }]}>{T.share}</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-      </View>
-    );
-  };
 
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>{T.title}</Text>
-        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
-          <Text style={styles.clearAllTxt}>{T.clear}</Text>
+    <View style={styles.container}>
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
         </Pressable>
       </View>
 
-      {/* Linha do servidor + Registrar */}
-      <View style={styles.row}>
+      {/* Linha: Servidor + Detectar + Seletor de visão */}
+      <View style={styles.statusRow}>
         <Text style={styles.label}>{T.server}</Text>
         <TextInput
           value={server}
           onChangeText={setServer}
-          placeholder={T.placeholder}
+          placeholder={T.placeholderServer}
           autoCapitalize="none"
           autoCorrect={false}
           style={[styles.input, { flex: 1 }]}
         />
-        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
-          <Text style={styles.btnTxt}>{busy ? T.saving : T.btnSave}</Text>
+        <Pressable onPress={() => setDetectOn((v) => !v)} style={[styles.btn, detectOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{detectOn ? (saving ? T.saving : T.detecting) : T.detect}</Text>
         </Pressable>
       </View>
 
-      {/* Lista */}
-      <FlatList
-        data={items}
-        keyExtractor={(it) => it.id}
-        renderItem={renderItem}
-        refreshing={refreshing}
-        onRefresh={load}
-        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
-        ListEmptyComponent={
-          <View style={{ alignItems: "center", paddingHorizontal: 16 }}>
-            <Text style={{ color: PALETTE.sub, textAlign: "center" }}>{T.empty1}</Text>
-            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>{T.empty2}</Text>
-          </View>
-        }
-      />
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>
+          {statusText}
+        </Text>
+      </View>
 
-      {/* Modal de zoom (toque na imagem grande) */}
-      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
-        <View style={styles.modalBg}>
-          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
-            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
-          </TouchableOpacity>
+      {/* Seletor de visão */}
+      <View style={[styles.statusRow, { gap: 6 }]}>
+        <Text style={styles.label}>{T.view}</Text>
+        <Pressable onPress={() => setUseStream(true)} style={[styles.btn, useStream ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{T.stream}</Text>
+        </Pressable>
+        <Pressable onPress={() => setUseStream(false)} style={[styles.btn, !useStream ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{T.snapshot}</Text>
+        </Pressable>
+
+        {/* toggle boxes (mini preview do servidor) */}
+        <Pressable
+          onPress={() => {
+            const val = !showBoxes;
+            setShowBoxes(val);
+            if (val) setBoxesUri(`${cleanServer(server)}/objects_frame?conf=0.25&ts=${Date.now()}`);
+          }}
+          style={[styles.btn, showBoxes ? styles.btnOn : styles.btnOff]}
+        >
+          <Text style={styles.btnText}>{T.boxes}</Text>
+        </Pressable>
+      </View>
+
+      {/* Banner de fogo */}
+      {detectOn && (
+        <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+          <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
         </View>
-      </Modal>
-    </SafeAreaView>
+      )}
+
+      {/* Banner de pessoas/animais + backend */}
+      {detectOn && (
+        <View style={[styles.statusRow, { justifyContent: "space-between" }]}>
+          <Text style={styles.statChip}>
+            {T.persons}: <Text style={styles.statNumber}>{people}</Text>
+          </Text>
+          <Text style={styles.statChip}>
+            {T.animals}: <Text style={styles.statNumber}>{animals}</Text>
+          </Text>
+          <Text style={styles.modelChip}>
+            {T.backend}: {backend} • conf_max {confMax.toFixed(2)}
+          </Text>
+        </View>
+      )}
+
+      {/* Vídeo + Overlay */}
+      <View style={{ flex: 1 }} onLayout={onVideoLayout}>
+        {useStream ? (
+          <LiveMJPEG ip={ip} />
+        ) : (
+          <CrossfadeImage
+            currentUri={currentFrameUri}
+            nextUri={nextFrameUri}
+            onNextLoadStart={onNextLoadStart}
+            onNextShown={onNextShown}
+          />
+        )}
+
+        {/* Overlay das caixas (FOGO/PESSOA/ANIMAL) */}
+        {detectOn && overlayBoxes.length > 0 && (
+          <BoxesOverlay frameWH={frameWH} containerWH={videoContainerWH} boxes={overlayBoxes} />
+        )}
+      </View>
+
+      {/* Mini preview com caixas (opcional) */}
+      {detectOn && showBoxes && (
+        <View style={{ height: 140, backgroundColor: "#000" }}>
+          {!!boxesUri && (
+            <Image
+              source={{ uri: boxesUri }}
+              style={{ flex: 1, width: "100%" }}
+              resizeMode="contain"
+              onError={() => setBoxesUri(`${cleanServer(server)}/objects_frame?conf=0.25&ts=${Date.now()}`)}
+            />
+          )}
+        </View>
+      )}
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: RADIUS * 2 + 24, height: RADIUS * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: RADIUS * 2, height: RADIUS * 2, borderRadius: RADIUS }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: KNOB_R * 2,
+                height: KNOB_R * 2,
+                borderRadius: KNOB_R,
+                transform: [{ translateX: knobLeft }, { translateY: knobTop }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>
+            x: {joy.x.toFixed(2)} y: {joy.y.toFixed(2)}
+          </Text>
+        </View>
+      </View>
+    </View>
   );
 }
 
-/* =========================
-   ESTILOS
-========================= */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: PALETTE.bg },
 
-  header: {
+  topbar: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PALETTE.border,
-    backgroundColor: PALETTE.card2,
-  },
-  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
-  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
-  clearAllTxt: { color: "white", fontWeight: "700" },
-
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
     gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: PALETTE.border,
-    backgroundColor: PALETTE.row,
+    backgroundColor: PALETTE.card,
   },
-  label: { color: PALETTE.sub, fontSize: 12 },
+  label: { color: "#cfd3d8", fontSize: 12 },
   input: {
-    backgroundColor: PALETTE.card,
-    color: PALETTE.text,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-    minWidth: 140,
-  },
-  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
-  btnTxt: { color: "white", fontWeight: "700" },
-
-  /* CARD */
-  cardWrap: {
-    backgroundColor: PALETTE.card,
-    marginHorizontal: 10,
-    marginTop: 10,
-    borderRadius: 12,
-    overflow: "hidden",
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-  },
-  cardHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
-  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
-  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
-  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
-
-  expandBtn: {
-    backgroundColor: "#2a2f3d",
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    backgroundColor: PALETTE.bg,
+    color: "white",
     borderRadius: 8,
-  },
-  expandBtnOn: { backgroundColor: "#1d2435" },
-  expandTxt: { color: "#cbd5ff", fontWeight: "700", fontSize: 12 },
-
-  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
-
-  expandPanel: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: PALETTE.border,
-    backgroundColor: PALETTE.card2,
-    paddingBottom: 12,
-  },
-
-  bigImageWrap: {
-    marginHorizontal: 12,
-    marginTop: 10,
-    borderRadius: 10,
-    overflow: "hidden",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     borderWidth: 1,
-    borderColor: PALETTE.border,
-    backgroundColor: "#000",
+    borderColor: "#1e2a4d",
+    minWidth: 110,
   },
-  bigImage: { width: "100%", height: 220 },
-
-  detailsBox: {
-    marginTop: 10,
-    marginHorizontal: 12,
-    padding: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: PALETTE.border,
-    backgroundColor: "#0c1020",
-  },
-  detailsTitle: { color: PALETTE.chipText, fontWeight: "800", marginBottom: 8 },
-
-  kvRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: 4,
-    gap: 10,
-  },
-  kvKey: { width: 120, color: "#93a5ff", fontSize: 12 },
-  kvVal: { flex: 1, color: PALETTE.text, fontSize: 12 },
-
-  actionsRow: {
-    flexDirection: "row",
-    gap: 10,
-    marginHorizontal: 12,
-    marginTop: 10,
-  },
-  actionBtn: {
-    flex: 1,
+  btn: {
+    backgroundColor: "#2b48ff",
+    paddingHorizontal: 10,
     paddingVertical: 10,
     borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
   },
-  actionTxt: { fontWeight: "800" },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
 
-  /* Modal zoom */
-  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", alignItems: "center", justifyContent: "center" },
-  fullImg: { width: "100%", height: "100%" },
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1730",
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  statChip: { color: "#dbeafe", fontSize: 14, fontWeight: "600" },
+  statNumber: { color: "#fff" },
+  modelChip: { marginLeft: "auto", color: "#9fb0ff", fontSize: 12 },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.14)",
+  },
+  joyKnob: {
+    position: "absolute",
+    backgroundColor: "rgba(43,72,255,0.9)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.85)",
+  },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
 });
 
 
 
-Como usar: toque no card para expandir/ocultar. No painel aberto você pode tocar na imagem para ver em tela cheia, abrir o arquivo no sistema, compartilhar, ou excluir o registro.
 
-Se quiser que vários itens abram ao mesmo tempo, já está suportado (o estado guarda um Set de abertos).
 
 
 
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import { useEffect, useState } from "react";
-import {
-  View, Text, StyleSheet, FlatList, Image, Pressable, Alert, TextInput, Modal, TouchableOpacity, SafeAreaView,
-} from "react-native";
-import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+import { View, Text, StyleSheet, Pressable } from "react-native";
 import { useLanguage } from "../context/LanguageContext";
 
-const PALETTE = { bg: "#0a0a0a", card: "#121212", border: "#232323", text: "#e5e7eb", sub: "#9ca3af", accent: "#2b48ff", danger: "#ef4444" };
+const PALETTE = { bg: "#0a0a0a", card: "#121212", border: "#232323", text: "#e5e7eb", accent: "#2b48ff" };
 
-const texts = {
-  pt: {
-    title: "Dashboard",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar agora",
-    saving: "Salvando...",
-    empty1: "Sem eventos ainda.",
-    empty2: "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
-    fire: "Detecção de fogo",
-    clear: "Limpar",
-    confirmClearTitle: "Limpar tudo",
-    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
-    cancel: "Cancelar",
-    delete: "Excluir",
-    confirmDeleteTitle: "Excluir registro",
-    confirmDeleteBody: "Deseja excluir este evento?",
-    fail: "Falha ao salvar",
-    failBody: "Verifique o servidor /snapshot e a rede.",
-  },
-  en: {
-    title: "Dashboard",
-    server: "Server:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Save now",
-    saving: "Saving...",
-    empty1: "No events yet.",
-    empty2: "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
-    fire: "Fire detection",
-    clear: "Clear",
-    confirmClearTitle: "Clear all",
-    confirmClearBody: "This will delete all events and images. Continue?",
-    cancel: "Cancel",
-    delete: "Delete",
-    confirmDeleteTitle: "Delete entry",
-    confirmDeleteBody: "Do you want to delete this event?",
-    fail: "Failed to save",
-    failBody: "Check the /snapshot endpoint and network.",
-  },
-  es: {
-    title: "Panel",
-    server: "Servidor:",
-    placeholder: "http://192.168.4.2:8000",
-    btnSave: "Registrar ahora",
-    saving: "Guardando...",
-    empty1: "Sin eventos aún.",
-    empty2: "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
-    fire: "Detección de fuego",
-    clear: "Limpiar",
-    confirmClearTitle: "Limpiar todo",
-    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
-    cancel: "Cancelar",
-    delete: "Eliminar",
-    confirmDeleteTitle: "Eliminar registro",
-    confirmDeleteBody: "¿Deseas eliminar este evento?",
-    fail: "Error al guardar",
-    failBody: "Revisa /snapshot y la red.",
-  },
-};
-
-const DEFAULT_SERVER = "http://192.168.4.2:8000";
-
-export default function DashboardScreen() {
-  const { lang } = useLanguage();
-  const T = texts[lang];
-
-  const [server, setServer] = useState<string>(DEFAULT_SERVER);
-  const [items, setItems] = useState<FireEvent[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
-  const [preview, setPreview] = useState<FireEvent | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function load() {
-    setRefreshing(true);
-    try { setItems(await getEvents()); } finally { setRefreshing(false); }
-  }
-  useEffect(() => { load(); }, []);
-
-  async function handleRegisterNow() {
-    try {
-      setBusy(true);
-      const ev = await saveEventFromServer(server);
-      setItems((prev) => [ev, ...prev]);
-    } catch (e) {
-      Alert.alert(T.fail, T.failBody);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function confirmDelete(ev: FireEvent) {
-    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
-      { text: T.cancel, style: "cancel" },
-      { text: T.delete, style: "destructive", onPress: async () => {
-          await deleteEvent(ev.id);
-          setItems((prev) => prev.filter((x) => x.id !== ev.id));
-        }
-      },
-    ]);
-  }
-
-  function confirmClearAll() {
-    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
-      { text: T.cancel, style: "cancel" },
-      { text: T.clear, style: "destructive", onPress: async () => { await clearAllEvents(); setItems([]); } },
-    ]);
-  }
-
-  const renderItem = ({ item }: { item: FireEvent }) => {
-    const dateStr = new Date(item.ts).toLocaleString();
-    return (
-      <Pressable onPress={() => setPreview(item)} style={styles.card}>
-        <Image source={{ uri: item.imageUri }} style={styles.thumb} />
-        <View style={{ flex: 1 }}>
-          <Text style={styles.title}>{T.fire}</Text>
-          <Text style={styles.time}>{dateStr}</Text>
-          <Text style={styles.path} numberOfLines={1}>{item.imageUri}</Text>
-        </View>
-        <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
-          <Text style={styles.trashTxt}>{T.delete}</Text>
-        </Pressable>
-      </Pressable>
-    );
-  };
+export default function SettingsScreen() {
+  const { lang, setLang } = useLanguage();
 
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>{T.title}</Text>
-        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
-          <Text style={styles.clearAllTxt}>{T.clear}</Text>
-        </Pressable>
-      </View>
+    <View style={styles.container}>
+      <Text style={styles.title}>
+        {lang === "pt" ? "Configurações" : lang === "es" ? "Configuraciones" : "Settings"}
+      </Text>
+
+      <Text style={styles.label}>
+        {lang === "pt" ? "Idioma do aplicativo:" : lang === "es" ? "Idioma de la aplicación:" : "App language:"}
+      </Text>
 
       <View style={styles.row}>
-        <Text style={styles.label}>{T.server}</Text>
-        <TextInput
-          value={server}
-          onChangeText={setServer}
-          placeholder={T.placeholder}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={[styles.input, { flex: 1 }]}
-        />
-        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
-          <Text style={styles.btnTxt}>{busy ? T.saving : T.btnSave}</Text>
+        <Pressable
+          onPress={() => setLang("pt")}
+          style={[styles.btn, lang === "pt" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>Português</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => setLang("en")}
+          style={[styles.btn, lang === "en" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>English</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => setLang("es")}
+          style={[styles.btn, lang === "es" && styles.btnActive]}
+        >
+          <Text style={styles.btnText}>Español</Text>
         </Pressable>
       </View>
-
-      <FlatList
-        data={items}
-        keyExtractor={(it) => it.id}
-        renderItem={renderItem}
-        refreshing={refreshing}
-        onRefresh={load}
-        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
-        ListEmptyComponent={
-          <View style={{ alignItems: "center" }}>
-            <Text style={{ color: PALETTE.sub }}>{T.empty1}</Text>
-            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>{T.empty2}</Text>
-          </View>
-        }
-      />
-
-      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
-        <View style={styles.modalBg}>
-          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
-            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
-          </TouchableOpacity>
-        </View>
-      </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: PALETTE.bg },
-  header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
-  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
-  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
-  clearAllTxt: { color: "white", fontWeight: "700" },
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 20 },
+  title: { color: PALETTE.text, fontSize: 22, fontWeight: "700", marginBottom: 20 },
+  label: { color: PALETTE.text, marginBottom: 12 },
+  row: { flexDirection: "row", gap: 12 },
+  btn: {
+    backgroundColor: PALETTE.card,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+  },
+  btnActive: { backgroundColor: PALETTE.accent, borderColor: PALETTE.accent },
+  btnText: { color: "white", fontWeight: "600" },
+});
 
-  row: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
-  label: { color: PALETTE.sub, fontSize: 12 },
-  input: { backgroundColor: PALETTE.card, color: PALETTE.text, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, borderWidth: 1, borderColor: PALETTE.border, minWidth: 140 },
-  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
-  btnTxt: { color: "white", fontWeight: "700" },
-
-  card: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: PALETTE.border },
-  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
-  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
-  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
-  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
-
-  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8 },
-  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
-
-  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.9)", alignItems: "center", justifyContent: "center" },
-  fullImg: { width: "100%", height: "100%" },
-}); 
