@@ -1,4 +1,807 @@
 
+perfeito — deixei a Câmera no modo que você pediu:
+
+
+
+
+Detecção sempre ativa (sem botão).
+
+
+Snapshot (fallback) como visão padrão (sem opção de trocar para stream).
+
+
+Removi o botão “Boxes” (o mini-preview do servidor). O overlay de caixas na própria imagem continua funcionando.
+
+
+Barra do servidor simplificada (mostra “Detectando…” quando ativo).
+
+
+
+
+Cole isso em HydroBotApp2/src/screens/CameraScreen.tsx:
+
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
+  Image,
+  Animated,
+  LayoutChangeEvent,
+} from "react-native";
+import { WebView } from "react-native-webview";
+import { saveEventFromServer } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+/* ---------- PALETA ---------- */
+const PALETTE = {
+  bg: "#0b0b0f",
+  card: "#121218",
+  border: "#25273a",
+  accent: "#e6403a",
+  text: "#e5e7eb",
+};
+
+/* ---------- TEXTOS ---------- */
+const textsByLang = {
+  pt: {
+    heroSubtitle: "Monitoramento e Controle",
+    espIp: "ESP IP:",
+    test: "Testar",
+    ledOn: "LED ON",
+    ledOff: "LED OFF",
+    pumpOn: "BOMBA ON",
+    pumpOff: "BOMBA OFF",
+    server: "Servidor:",
+    detecting: "Detectando…",
+    saving: "Salvando...",
+    statusFail: "Falha ao conectar. Confira o Wi-Fi/IP.",
+    noVideo: "Sem vídeo (snapshot). Verifique o servidor.",
+    fireOn: (s: number) => `🔥 FOGO • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `Sem fogo • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Evento salvo em ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    persons: "Pessoas",
+    animals: "Animais",
+    backend: "Modelo",
+  },
+  en: {
+    heroSubtitle: "Monitoring & Control",
+    espIp: "ESP IP:",
+    test: "Test",
+    ledOn: "LED ON",
+    ledOff: "LED OFF",
+    pumpOn: "PUMP ON",
+    pumpOff: "PUMP OFF",
+    server: "Server:",
+    detecting: "Detecting…",
+    saving: "Saving...",
+    statusFail: "Failed to connect. Check Wi-Fi/IP.",
+    noVideo: "No video (snapshot). Check the server.",
+    fireOn: (s: number) => `🔥 FIRE • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `No fire • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Event saved at ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    persons: "People",
+    animals: "Animals",
+    backend: "Model",
+  },
+  es: {
+    heroSubtitle: "Monitoreo y Control",
+    espIp: "ESP IP:",
+    test: "Probar",
+    ledOn: "LED ENC.",
+    ledOff: "LED APAG.",
+    pumpOn: "BOMBA ENC.",
+    pumpOff: "BOMBA APAG.",
+    server: "Servidor:",
+    detecting: "Detectando…",
+    saving: "Guardando...",
+    statusFail: "Error de conexión. Revisa Wi-Fi/IP.",
+    noVideo: "Sin vídeo (snapshot). Revisa el servidor.",
+    fireOn: (s: number) => `🔥 FUEGO • score ${s.toFixed(2)}`,
+    fireOff: (s: number) => `Sin fuego • score ${s.toFixed(2)}`,
+    eventSavedAt: (ts: string) => `Evento guardado a las ${ts}`,
+    placeholderIp: "192.168.4.1",
+    placeholderServer: "http://192.168.4.2:8000",
+    persons: "Personas",
+    animals: "Animales",
+    backend: "Modelo",
+  },
+};
+
+const DEFAULT_IP = "192.168.4.1";
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+// caminho correto da logo a partir de src/screens
+const appLogo = require("../../assets/logo.png");
+
+/* ---------- HERO ---------- */
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+/* ---------- STREAM (mantido para possível uso futuro) ---------- */
+function LiveMJPEG({ ip }: { ip: string }) {
+  const html = `
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;}
+        .wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+        img{max-width:100%;max-height:100%;object-fit:contain;background:#000;}
+      </style>
+    </head>
+    <body><div class="wrap"><img src="http://${ip}:81/stream"/></div></body></html>
+  `.trim();
+
+  return (
+    <WebView
+      originWhitelist={["*"]}
+      source={{ html }}
+      javaScriptEnabled
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      automaticallyAdjustContentInsets={false}
+      style={{ flex: 1, backgroundColor: "black" }}
+    />
+  );
+}
+
+/* ---------- SNAPSHOT com crossfade ---------- */
+function CrossfadeImage({
+  currentUri,
+  nextUri,
+  onNextLoadStart,
+  onNextShown,
+}: {
+  currentUri: string;
+  nextUri: string;
+  onNextLoadStart: () => void;
+  onNextShown: () => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={onNextShown}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown();
+                fade.setValue(0);
+                setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+/* ---------- OVERLAY DE CAIXAS ---------- */
+type BoxType = "fire" | "person" | "animal";
+type SrcBox = { x: number; y: number; w: number; h: number; type: BoxType; conf?: number };
+
+function BoxesOverlay({
+  frameWH,
+  containerWH,
+  boxes,
+}: {
+  frameWH: { w: number; h: number } | null;
+  containerWH: { w: number; h: number } | null;
+  boxes: SrcBox[];
+}) {
+  if (!frameWH || !containerWH || frameWH.w <= 0 || frameWH.h <= 0 || containerWH.w <= 0 || containerWH.h <= 0) {
+    return null;
+  }
+  const scale = Math.min(containerWH.w / frameWH.w, containerWH.h / frameWH.h);
+  const dispW = frameWH.w * scale;
+  const dispH = frameWH.h * scale;
+  const offsetX = (containerWH.w - dispW) / 2;
+  const offsetY = (containerWH.h - dispH) / 2;
+
+  return (
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+      <View style={{ position: "absolute", left: offsetX, top: offsetY, width: dispW, height: dispH }}>
+        {boxes.map((b, i) => {
+          const left = b.x * scale;
+          const top = b.y * scale;
+          const width = b.w * scale;
+          const height = b.h * scale;
+
+          let borderColor = "#ff3b30"; // fire
+          if (b.type === "person") borderColor = "#00e5ff";
+          else if (b.type === "animal") borderColor = "#7CFC00";
+
+          return (
+            <View
+              key={`${i}-${b.type}`}
+              style={{ position: "absolute", left, top, width, height, borderWidth: 3, borderColor, borderRadius: 6 }}
+            >
+              <View
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: -18,
+                  paddingHorizontal: 6,
+                  paddingVertical: 2,
+                  borderRadius: 4,
+                  backgroundColor: borderColor,
+                }}
+              >
+                <Text style={{ color: "#000", fontWeight: "800", fontSize: 10 }}>
+                  {b.type.toUpperCase()}
+                  {typeof b.conf === "number" ? ` ${b.conf.toFixed(2)}` : ""}
+                </Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+/* ---------- TELA PRINCIPAL ---------- */
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  // conexões
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  // estados do ESP
+  const [isChecking, setIsChecking] = useState(false);
+  const [statusText, setStatusText] = useState("—");
+  const [ledOn, setLedOn] = useState(false);
+  const [pumpOn, setPumpOn] = useState(false);
+
+  // detecção (sempre ativa)
+  const [detectOn] = useState(true);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+
+  // pessoas/animais
+  const [people, setPeople] = useState(0);
+  const [animals, setAnimals] = useState(0);
+  const [backend, setBackend] = useState<string>("—");
+  const [confMax, setConfMax] = useState<number>(0);
+
+  // caixas + dimensões para overlay
+  const [overlayBoxes, setOverlayBoxes] = useState<SrcBox[]>([]);
+  const [frameWH, setFrameWH] = useState<{ w: number; h: number } | null>(null);
+  const [videoContainerWH, setVideoContainerWH] = useState<{ w: number; h: number } | null>(null);
+
+  // registro automático
+  const [saving, setSaving] = useState(false);
+  const lastSaveRef = useRef(0);
+  const wasFireRef = useRef(false);
+  const SAVE_COOLDOWN_MS = 5000;
+
+  // visão: sempre SNAPSHOT fallback (sem botão para trocar)
+  const [useStream] = useState(false);
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  // joystick (UI)
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  // helpers URL
+  const cleanServer = (s: string) => s.replace(/\/+$/, "");
+  const statusUrl = useMemo(() => `http://${ip}/status`, [ip]);
+  const ledUrl = useMemo(() => (on: boolean) => `http://${ip}/led?on=${on ? "1" : "0"}`, [ip]);
+  const pumpUrl = useMemo(() => (on: boolean) => `http://${ip}/pump?on=${on ? "1" : "0"}`, [ip]);
+
+  /* ===== ESP STATUS ===== */
+  async function pingStatus() {
+    try {
+      setIsChecking(true);
+      const r = await fetch(statusUrl);
+      const j = await r.json();
+      setLedOn(!!j.led);
+      setPumpOn(!!j.pump);
+      setStatusText(`OK • ip:${j.ip} • mode:${j.mode} • led:${j.led ? "on" : "off"} • pump:${j.pump ? "on" : "off"}`);
+    } catch {
+      setStatusText(T.statusFail);
+    } finally {
+      setIsChecking(false);
+    }
+  }
+  async function toggleLed() {
+    try {
+      const t = !ledOn;
+      await fetch(ledUrl(t));
+      setLedOn(t);
+    } catch {
+      setStatusText(T.statusFail);
+    }
+  }
+  async function togglePump() {
+    try {
+      const t = !pumpOn;
+      await fetch(pumpUrl(t));
+      setPumpOn(t);
+    } catch {
+      setStatusText(T.statusFail);
+    }
+  }
+  useEffect(() => {
+    pingStatus();
+    const id = setInterval(pingStatus, 5000);
+    return () => clearInterval(id);
+  }, [statusUrl]);
+
+  /* ===== SNAPSHOT fallback (25 fps alvo) ===== */
+  useEffect(() => {
+    let stop = false;
+    const FPS_INTERVAL = 40; // ~25 fps
+
+    setCurrentFrameUri(`${cleanServer(server)}/snapshot?ts=${Date.now()}`);
+
+    const tick = () => {
+      if (stop) return;
+      if (!loadingNextRef.current) {
+        const url = `${cleanServer(server)}/snapshot?ts=${Date.now()}`;
+        setNextFrameUri(url);
+      }
+      setTimeout(tick, FPS_INTERVAL);
+    };
+    tick();
+
+    return () => {
+      stop = true;
+    };
+  }, [server]);
+
+  function onNextLoadStart() {
+    loadingNextRef.current = true;
+  }
+  function onNextShown() {
+    if (nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    loadingNextRef.current = false;
+  }
+
+  /* ===== LOOP DE DETECÇÃO + CAIXAS ===== */
+  useEffect(() => {
+    let stop = false;
+
+    const loop = async () => {
+      try {
+        const r = await fetch(`${cleanServer(server)}/detect`);
+        const j = await r.json();
+
+        if (!stop && j && j.ok !== false) {
+          // fogo
+          setIsFire(!!j.isFire);
+          setFireScore(Number(j.score || 0));
+
+          // frame size (se servidor expor; opcional)
+          const wh =
+            Array.isArray(j.frame_wh) && j.frame_wh.length === 2
+              ? { w: Number(j.frame_wh[0]) || 0, h: Number(j.frame_wh[1]) || 0 }
+              : null;
+          if (wh && wh.w > 0 && wh.h > 0) setFrameWH(wh);
+
+          // objetos e estáveis
+          const o = j.objects || {};
+          const objs = o.objects || [];
+          const peopleStable =
+            typeof o.n_person_stable === "number"
+              ? o.n_person_stable
+              : typeof o.n_person === "number"
+              ? o.n_person
+              : objs.some((x: any) => String(x.label).toLowerCase() === "person")
+              ? 1
+              : 0;
+          const animalsStable =
+            typeof o.n_animals_stable === "number"
+              ? o.n_animals_stable
+              : typeof o.n_animals === "number"
+              ? o.n_animals
+              : objs.some((x: any) => String(x.label).toLowerCase() !== "person")
+              ? 1
+              : 0;
+
+          setPeople(peopleStable);
+          setAnimals(animalsStable);
+          setBackend(o.backend || "—");
+          setConfMax(Number(o.conf_max || 0));
+
+          // montar caixas
+          const boxes: SrcBox[] = [];
+
+          if (j.isFire && Array.isArray(j.boxes)) {
+            for (const b of j.boxes) {
+              if (!Array.isArray(b) || b.length < 4) continue;
+              const [x, y, w, h] = b.map((n: any) => Number(n) || 0);
+              boxes.push({ x, y, w, h, type: "fire" });
+            }
+          }
+          for (const it of objs) {
+            if (!it || !Array.isArray(it.box) || it.box.length < 4) continue;
+            const [x, y, w, h] = it.box.map((n: any) => Number(n) || 0);
+            const label = String(it.label || "").toLowerCase();
+            const conf = typeof it.conf === "number" ? it.conf : undefined;
+            if (label === "person") boxes.push({ x, y, w, h, type: "person", conf });
+            else boxes.push({ x, y, w, h, type: "animal", conf });
+          }
+          setOverlayBoxes(boxes);
+        }
+      } catch {
+        if (!stop) {
+          setIsFire(false);
+          setFireScore(0);
+          setPeople(0);
+          setAnimals(0);
+          setOverlayBoxes([]);
+        }
+      } finally {
+        if (!stop) setTimeout(loop, 180); // ~5-6Hz
+      }
+    };
+    loop();
+
+    return () => {
+      stop = true;
+    };
+  }, [server]);
+
+  /* ===== Registro automático ===== */
+  useEffect(() => {
+    const rising = !wasFireRef.current && isFire;
+    const now = Date.now();
+    const cooldownOk = now - lastSaveRef.current >= SAVE_COOLDOWN_MS;
+
+    if (rising && cooldownOk && !saving) {
+      (async () => {
+        try {
+          setSaving(true);
+          await saveEventFromServer(server);
+          lastSaveRef.current = Date.now();
+          setStatusText(T.eventSavedAt(new Date(lastSaveRef.current).toLocaleString()));
+        } catch {
+          setStatusText(T.noVideo);
+        } finally {
+          setSaving(false);
+        }
+      })();
+    }
+    wasFireRef.current = isFire;
+  }, [isFire, server, saving, T]);
+
+  /* ===== Joystick ===== */
+  const RADIUS = 64,
+    KNOB_R = 22;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => setDragging(true),
+      onPanResponderMove: (_e: GestureResponderEvent, g: PanResponderGestureState) => {
+        let nx = g.dx / RADIUS,
+          ny = g.dy / RADIUS;
+        const len = Math.hypot(nx, ny);
+        if (len > 1) {
+          nx /= len;
+          ny /= len;
+        }
+        setJoy({ x: nx, y: -ny });
+      },
+      onPanResponderRelease: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+      onPanResponderTerminate: () => {
+        setDragging(false);
+        setJoy({ x: 0, y: 0 });
+      },
+    })
+  ).current;
+
+  /* ===== Medidas do container do vídeo ===== */
+  function onVideoLayout(e: LayoutChangeEvent) {
+    const { width, height } = e.nativeEvent.layout;
+    setVideoContainerWH({ w: width, h: height });
+  }
+
+  return (
+    <View style={styles.container}>
+      <AppHero subtitle={T.heroSubtitle} />
+
+      {/* Linha: ESP + LED + BOMBA */}
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder={T.placeholderIp}
+          placeholderTextColor="#8a93a5"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        <Pressable onPress={pingStatus} style={styles.btn}>
+          <Text style={styles.btnText}>{isChecking ? "..." : T.test}</Text>
+        </Pressable>
+
+        <Pressable onPress={toggleLed} style={[styles.btn, ledOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{ledOn ? T.ledOn : T.ledOff}</Text>
+        </Pressable>
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn ? T.pumpOn : T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha: Servidor + indicador (sem botões de detectar/stream/boxes) */}
+      <View style={styles.statusRow}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholderServer}
+          placeholderTextColor="#8a93a5"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <View style={[styles.badge]}>
+          <Text style={{ color: "#fff", fontWeight: "800" }}>{T.detecting}</Text>
+        </View>
+      </View>
+
+      {/* Status curto */}
+      <View style={[styles.statusRow, { paddingTop: 4, paddingBottom: 8 }]}>
+        <Text numberOfLines={2} style={styles.status}>
+          {statusText}
+        </Text>
+      </View>
+
+      {/* Banner de fogo */}
+      <View style={[styles.fireBanner, isFire ? styles.fireOn : styles.fireOff]}>
+        <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+      </View>
+
+      {/* Banner de pessoas/animais + backend */}
+      <View style={[styles.statusRow, { justifyContent: "space-between" }]}>
+        <Text style={styles.statChip}>
+          {T.persons}: <Text style={styles.statNumber}>{people}</Text>
+        </Text>
+        <Text style={styles.statChip}>
+          {T.animals}: <Text style={styles.statNumber}>{animals}</Text>
+        </Text>
+        <Text style={styles.modelChip}>
+          {T.backend}: {backend} • conf_max {confMax.toFixed(2)}
+        </Text>
+      </View>
+
+      {/* Vídeo (sempre snapshot) + Overlay */}
+      <View style={{ flex: 1 }} onLayout={onVideoLayout}>
+        <CrossfadeImage
+          currentUri={currentFrameUri}
+          nextUri={nextFrameUri}
+          onNextLoadStart={onNextLoadStart}
+          onNextShown={onNextShown}
+        />
+
+        {overlayBoxes.length > 0 && (
+          <BoxesOverlay frameWH={frameWH} containerWH={videoContainerWH} boxes={overlayBoxes} />
+        )}
+      </View>
+
+      {/* Joystick overlay (UI) */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap, { width: 64 * 2 + 24, height: 64 * 2 + 24 }]} {...pan.panHandlers}>
+          <View style={[styles.joyBase, { width: 64 * 2, height: 64 * 2, borderRadius: 64 }]} />
+          <View
+            style={[
+              styles.joyKnob,
+              {
+                width: 22 * 2,
+                height: 22 * 2,
+                borderRadius: 22,
+                transform: [{ translateX: joy.x * 64 }, { translateY: -joy.y * 64 }],
+                opacity: dragging ? 1 : 0.9,
+              },
+            ]}
+          />
+          <Text style={styles.joyText}>
+            x: {joy.x.toFixed(2)} y: {joy.y.toFixed(2)}
+          </Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/* ---------- ESTILOS ---------- */
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  // HERO
+  hero: { alignItems: "center", paddingTop: 12, paddingBottom: 6 },
+  heroLogo: { width: 80, height: 80, marginBottom: 6, resizeMode: "contain" },
+  heroTitle: { color: "#fff", fontSize: 22, fontWeight: "800" },
+  heroSubtitle: { color: "#d1d5db", marginTop: 2 },
+
+  topbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+    backgroundColor: PALETTE.card,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+  },
+  label: { color: "#cfd3d8", fontSize: 12 },
+  input: {
+    backgroundColor: "#0b0d14",
+    color: "white",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    minWidth: 110,
+  },
+  btn: {
+    backgroundColor: PALETTE.accent,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  btnOn: { backgroundColor: "#17a34a" },
+  btnOff: { backgroundColor: "#374151" },
+  btnText: { color: "white", fontWeight: "600" },
+
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+    backgroundColor: "#0f1322",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+  },
+  badge: {
+    backgroundColor: "#1f2937",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+  },
+  status: { color: "#cbd5ff", flex: 1, fontSize: 12 },
+
+  fireBanner: { alignItems: "center", justifyContent: "center", paddingVertical: 6 },
+  fireOn: { backgroundColor: "#8b0000" },
+  fireOff: { backgroundColor: "#223" },
+  fireText: { color: "white", fontWeight: "800" },
+
+  statChip: { color: "#dbeafe", fontSize: 14, fontWeight: "600" },
+  statNumber: { color: "#fff" },
+  modelChip: { marginLeft: "auto", color: "#9fb0ff", fontSize: 12 },
+
+  // Joystick
+  joyWrap: { position: "absolute", bottom: 24, left: 24, alignItems: "center", justifyContent: "center" },
+  joyBase: {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.14)",
+  },
+  joyKnob: {
+    position: "absolute",
+    backgroundColor: "rgba(230,64,58,0.9)",
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.85)",
+  },
+  joyText: { position: "absolute", bottom: -22, color: "#cbd5ff", fontSize: 12 },
+});
+
+
+
+se quiser também sumo com os botões de LED/BOMBA e deixo só o vídeo + overlay 😉
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: PALETTE.bg },
 
