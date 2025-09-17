@@ -1,4 +1,56 @@
 
+async function ensureLoadedInfo(item: EventWithMeta) {
+  if (loaded[item.id]) return;
+  try {
+    // peça explicitamente o size; em alguns SDKs isso é necessário
+    const info = await FileSystem.getInfoAsync(item.imageUri, { size: true } as any);
+
+    let sizeBytes: number | undefined;
+    // TypeScript-safe: só usa se a prop existir e for número
+    if (info && typeof (info as any).size === "number") {
+      sizeBytes = (info as any).size;
+    }
+
+    let width: number | undefined;
+    let height: number | undefined;
+    await new Promise<void>((resolve) => {
+      Image.getSize(
+        item.imageUri,
+        (w, h) => {
+          width = w;
+          height = h;
+          resolve();
+        },
+        () => resolve()
+      );
+    });
+
+    setLoaded((prev) => ({ ...prev, [item.id]: { sizeBytes, width, height } }));
+  } catch {
+    // silencioso
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — segue a Dashboard com “expandir/colapsar” em cada item. Ao tocar no card, ele abre um painel com imagem grande + detalhes (data, caminho, tamanho do arquivo, resolução, servidor, score etc. quando disponíveis). Mantive o botão de excluir e adicionei ações úteis (Abrir / Compartilhar).
 
 
