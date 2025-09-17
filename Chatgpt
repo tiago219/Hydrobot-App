@@ -1,3 +1,665 @@
+
+Perfeito — segue a Dashboard com “expandir/colapsar” em cada item. Ao tocar no card, ele abre um painel com imagem grande + detalhes (data, caminho, tamanho do arquivo, resolução, servidor, score etc. quando disponíveis). Mantive o botão de excluir e adicionei ações úteis (Abrir / Compartilhar).
+
+
+
+
+Cole este arquivo completo no lugar do seu DashboardScreen atual.
+
+
+
+
+// HydroBotApp2/src/screens/DashboardScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  Image,
+  Pressable,
+  Alert,
+  TextInput,
+  Modal,
+  TouchableOpacity,
+  SafeAreaView,
+  Share,
+  Linking,
+} from "react-native";
+import * as FileSystem from "expo-file-system";
+import { getEvents, saveEventFromServer, deleteEvent, clearAllEvents, FireEvent } from "../storage/fireLog";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = {
+  bg: "#0a0a0a",
+  card: "#121212",
+  card2: "#0e0e10",
+  border: "#232323",
+  text: "#e5e7eb",
+  sub: "#9ca3af",
+  accent: "#2b48ff",
+  accent2: "#1b39ff",
+  danger: "#ef4444",
+  chip: "#182033",
+  chipText: "#b7c6ff",
+  row: "#0f1730",
+  ok: "#16a34a",
+  warn: "#eab308",
+};
+
+const texts = {
+  pt: {
+    title: "Dashboard",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar agora",
+    saving: "Salvando...",
+    empty1: "Sem eventos ainda.",
+    empty2:
+      "Quando o detector sinalizar fogo, capturaremos o snapshot automaticamente.\nVocê também pode tocar “Registrar agora”.",
+    fire: "Detecção de fogo",
+    clear: "Limpar",
+    confirmClearTitle: "Limpar tudo",
+    confirmClearBody: "Isso apagará todos os eventos e imagens. Continuar?",
+    cancel: "Cancelar",
+    delete: "Excluir",
+    confirmDeleteTitle: "Excluir registro",
+    confirmDeleteBody: "Deseja excluir este evento?",
+    fail: "Falha ao salvar",
+    failBody: "Verifique o servidor /snapshot e a rede.",
+    details: "Detalhes",
+    open: "Abrir",
+    share: "Compartilhar",
+    path: "Caminho",
+    date: "Data",
+    size: "Tamanho",
+    res: "Resolução",
+    serverAt: "Servidor (na captura)",
+    score: "Score",
+    model: "Modelo",
+    yes: "sim",
+    no: "não",
+    show: "Mostrar",
+    hide: "Ocultar",
+  },
+  en: {
+    title: "Dashboard",
+    server: "Server:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Save now",
+    saving: "Saving...",
+    empty1: "No events yet.",
+    empty2:
+      "When fire is detected, a snapshot is captured automatically.\nYou can also tap “Save now”.",
+    fire: "Fire detection",
+    clear: "Clear",
+    confirmClearTitle: "Clear all",
+    confirmClearBody: "This will delete all events and images. Continue?",
+    cancel: "Cancel",
+    delete: "Delete",
+    confirmDeleteTitle: "Delete entry",
+    confirmDeleteBody: "Do you want to delete this event?",
+    fail: "Failed to save",
+    failBody: "Check the /snapshot endpoint and network.",
+    details: "Details",
+    open: "Open",
+    share: "Share",
+    path: "Path",
+    date: "Date",
+    size: "Size",
+    res: "Resolution",
+    serverAt: "Server (at capture)",
+    score: "Score",
+    model: "Model",
+    yes: "yes",
+    no: "no",
+    show: "Show",
+    hide: "Hide",
+  },
+  es: {
+    title: "Panel",
+    server: "Servidor:",
+    placeholder: "http://192.168.4.2:8000",
+    btnSave: "Registrar ahora",
+    saving: "Guardando...",
+    empty1: "Sin eventos aún.",
+    empty2:
+      "Cuando se detecte fuego, se capturará una imagen automáticamente.\nTambién puedes tocar “Registrar ahora”.",
+    fire: "Detección de fuego",
+    clear: "Limpiar",
+    confirmClearTitle: "Limpiar todo",
+    confirmClearBody: "Esto borrará todos los eventos e imágenes. ¿Continuar?",
+    cancel: "Cancelar",
+    delete: "Eliminar",
+    confirmDeleteTitle: "Eliminar registro",
+    confirmDeleteBody: "¿Deseas eliminar este evento?",
+    fail: "Error al guardar",
+    failBody: "Revisa /snapshot y la red.",
+    details: "Detalles",
+    open: "Abrir",
+    share: "Compartir",
+    path: "Ruta",
+    date: "Fecha",
+    size: "Tamaño",
+    res: "Resolución",
+    serverAt: "Servidor (en la captura)",
+    score: "Score",
+    model: "Modelo",
+    yes: "sí",
+    no: "no",
+    show: "Mostrar",
+    hide: "Ocultar",
+  },
+};
+
+const DEFAULT_SERVER = "http://192.168.4.2:8000";
+
+// Tipagem opcional defensiva (caso o storage salve metadados)
+type EventMeta = {
+  server?: string;
+  score?: number;
+  isFire?: boolean;
+  backend?: string;
+  conf_max?: number;
+  frame_wh?: [number, number];
+};
+type EventWithMeta = FireEvent & { meta?: EventMeta };
+
+// Estado auxiliar carregado ao expandir
+type LoadedInfo = {
+  sizeBytes?: number;
+  width?: number;
+  height?: number;
+};
+
+function fmtBytes(n?: number) {
+  if (!n || n <= 0) return "—";
+  const kb = n / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(2)} MB`;
+}
+
+export default function DashboardScreen() {
+  const { lang } = useLanguage();
+  const T = texts[lang];
+
+  const [server, setServer] = useState<string>(DEFAULT_SERVER);
+  const [items, setItems] = useState<EventWithMeta[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [preview, setPreview] = useState<EventWithMeta | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // controle de expansão
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loaded, setLoaded] = useState<Record<string, LoadedInfo>>({});
+
+  async function load() {
+    setRefreshing(true);
+    try {
+      const list = (await getEvents()) as EventWithMeta[];
+      setItems(list);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function handleRegisterNow() {
+    try {
+      setBusy(true);
+      const ev = (await saveEventFromServer(server)) as EventWithMeta;
+      setItems((prev) => [ev, ...prev]);
+    } catch {
+      Alert.alert(T.fail, T.failBody);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function confirmDelete(ev: EventWithMeta) {
+    Alert.alert(T.confirmDeleteTitle, T.confirmDeleteBody, [
+      { text: T.cancel, style: "cancel" },
+      {
+        text: T.delete,
+        style: "destructive",
+        onPress: async () => {
+          await deleteEvent(ev.id);
+          setItems((prev) => prev.filter((x) => x.id !== ev.id));
+          setExpanded((s) => {
+            const n = new Set(s);
+            n.delete(ev.id);
+            return n;
+          });
+        },
+      },
+    ]);
+  }
+
+  function confirmClearAll() {
+    Alert.alert(T.confirmClearTitle, T.confirmClearBody, [
+      { text: T.cancel, style: "cancel" },
+      {
+        text: T.clear,
+        style: "destructive",
+        onPress: async () => {
+          await clearAllEvents();
+          setItems([]);
+          setExpanded(new Set());
+          setLoaded({});
+        },
+      },
+    ]);
+  }
+
+  async function ensureLoadedInfo(item: EventWithMeta) {
+    if (loaded[item.id]) return;
+    try {
+      const info = await FileSystem.getInfoAsync(item.imageUri);
+      let width: number | undefined;
+      let height: number | undefined;
+      await new Promise<void>((resolve) => {
+        Image.getSize(
+          item.imageUri,
+          (w, h) => {
+            width = w;
+            height = h;
+            resolve();
+          },
+          () => resolve()
+        );
+      });
+      setLoaded((prev) => ({ ...prev, [item.id]: { sizeBytes: info.size, width, height } }));
+    } catch {
+      // silencioso
+    }
+  }
+
+  function toggleExpand(item: EventWithMeta) {
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(item.id)) {
+        n.delete(item.id);
+      } else {
+        n.add(item.id);
+        ensureLoadedInfo(item);
+      }
+      return n;
+    });
+  }
+
+  function Row({ k, v }: { k: string; v: string }) {
+    return (
+      <View style={styles.kvRow}>
+        <Text style={styles.kvKey}>{k}</Text>
+        <Text style={styles.kvVal}>{v}</Text>
+      </View>
+    );
+  }
+
+  const renderItem = ({ item }: { item: EventWithMeta }) => {
+    const dateStr = new Date(item.ts).toLocaleString();
+    const isOpen = expanded.has(item.id);
+    const ld = loaded[item.id];
+
+    const meta = item.meta || {};
+    const resStr =
+      ld?.width && ld?.height
+        ? `${ld.width}×${ld.height}px`
+        : Array.isArray(meta.frame_wh)
+        ? `${meta.frame_wh[0]}×${meta.frame_wh[1]}px`
+        : "—";
+    const scoreStr =
+      typeof meta.score === "number"
+        ? meta.score.toFixed(3)
+        : "—";
+
+    return (
+      <View style={styles.cardWrap}>
+        {/* Cabeçalho do card */}
+        <Pressable onPress={() => toggleExpand(item)} style={styles.cardHeader}>
+          <Image source={{ uri: item.imageUri }} style={styles.thumb} />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title}>{T.fire}</Text>
+            <Text style={styles.time}>{dateStr}</Text>
+            <Text style={styles.path} numberOfLines={1}>
+              {item.imageUri}
+            </Text>
+          </View>
+
+          <View style={{ alignItems: "flex-end", gap: 8 }}>
+            <Pressable onPress={() => toggleExpand(item)} style={[styles.expandBtn, isOpen && styles.expandBtnOn]}>
+              <Text style={styles.expandTxt}>{isOpen ? "▾ " + T.hide : "▸ " + T.show}</Text>
+            </Pressable>
+            <Pressable onPress={() => confirmDelete(item)} style={styles.trashBtn}>
+              <Text style={styles.trashTxt}>{T.delete}</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+
+        {/* Painel expandido */}
+        {isOpen && (
+          <View style={styles.expandPanel}>
+            <Pressable onPress={() => setPreview(item)} style={styles.bigImageWrap}>
+              <Image source={{ uri: item.imageUri }} style={styles.bigImage} resizeMode="contain" />
+            </Pressable>
+
+            <View style={styles.detailsBox}>
+              <Text style={styles.detailsTitle}>{T.details}</Text>
+              <Row k={T.date} v={dateStr} />
+              <Row k={T.path} v={item.imageUri} />
+              <Row k={T.size} v={fmtBytes(ld?.sizeBytes)} />
+              <Row k={T.res} v={resStr} />
+              <Row k={T.serverAt} v={meta.server || "—"} />
+              <Row k={T.score} v={scoreStr} />
+              <Row k={T.model} v={meta.backend || "—"} />
+              {/* você pode adicionar mais campos do seu storage aqui */}
+            </View>
+
+            <View style={styles.actionsRow}>
+              <Pressable style={[styles.actionBtn, { backgroundColor: PALETTE.chip }]} onPress={() => Linking.openURL(item.imageUri)}>
+                <Text style={[styles.actionTxt, { color: PALETTE.chipText }]}>{T.open}</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, { backgroundColor: PALETTE.accent }]}
+                onPress={() => Share.share({ url: item.imageUri, message: `${T.fire} • ${dateStr}` })}
+              >
+                <Text style={[styles.actionTxt, { color: "white" }]}>{T.share}</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.headerTitle}>{T.title}</Text>
+        <Pressable onPress={confirmClearAll} style={styles.clearAllBtn}>
+          <Text style={styles.clearAllTxt}>{T.clear}</Text>
+        </Pressable>
+      </View>
+
+      {/* Linha do servidor + Registrar */}
+      <View style={styles.row}>
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput
+          value={server}
+          onChangeText={setServer}
+          placeholder={T.placeholder}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.input, { flex: 1 }]}
+        />
+        <Pressable onPress={handleRegisterNow} style={[styles.btn, busy && { opacity: 0.6 }]} disabled={busy}>
+          <Text style={styles.btnTxt}>{busy ? T.saving : T.btnSave}</Text>
+        </Pressable>
+      </View>
+
+      {/* Lista */}
+      <FlatList
+        data={items}
+        keyExtractor={(it) => it.id}
+        renderItem={renderItem}
+        refreshing={refreshing}
+        onRefresh={load}
+        contentContainerStyle={items.length === 0 && { flex: 1, justifyContent: "center" }}
+        ListEmptyComponent={
+          <View style={{ alignItems: "center", paddingHorizontal: 16 }}>
+            <Text style={{ color: PALETTE.sub, textAlign: "center" }}>{T.empty1}</Text>
+            <Text style={{ color: PALETTE.sub, marginTop: 4, textAlign: "center" }}>{T.empty2}</Text>
+          </View>
+        }
+      />
+
+      {/* Modal de zoom (toque na imagem grande) */}
+      <Modal visible={!!preview} transparent animationType="fade" onRequestClose={() => setPreview(null)}>
+        <View style={styles.modalBg}>
+          <TouchableOpacity style={styles.modalBg} activeOpacity={1} onPress={() => setPreview(null)}>
+            {preview && <Image source={{ uri: preview.imageUri }} style={styles.fullImg} resizeMode="contain" />}
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+/* =========================
+   ESTILOS
+========================= */
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg },
+
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+    backgroundColor: PALETTE.card2,
+  },
+  headerTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700", flex: 1 },
+  clearAllBtn: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: PALETTE.danger, borderRadius: 8 },
+  clearAllTxt: { color: "white", fontWeight: "700" },
+
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.border,
+    backgroundColor: PALETTE.row,
+  },
+  label: { color: PALETTE.sub, fontSize: 12 },
+  input: {
+    backgroundColor: PALETTE.card,
+    color: PALETTE.text,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    minWidth: 140,
+  },
+  btn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
+  btnTxt: { color: "white", fontWeight: "700" },
+
+  /* CARD */
+  cardWrap: {
+    backgroundColor: PALETTE.card,
+    marginHorizontal: 10,
+    marginTop: 10,
+    borderRadius: 12,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+  },
+  cardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  thumb: { width: 84, height: 56, backgroundColor: "#000", borderRadius: 8 },
+  title: { color: PALETTE.text, fontSize: 14, fontWeight: "700" },
+  time: { color: PALETTE.sub, fontSize: 12, marginTop: 2 },
+  path: { color: "#8b93a3", fontSize: 11, marginTop: 2 },
+
+  expandBtn: {
+    backgroundColor: "#2a2f3d",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  expandBtnOn: { backgroundColor: "#1d2435" },
+  expandTxt: { color: "#cbd5ff", fontWeight: "700", fontSize: 12 },
+
+  trashBtn: { backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
+  trashTxt: { color: "#fca5a5", fontWeight: "700", fontSize: 12 },
+
+  expandPanel: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: PALETTE.border,
+    backgroundColor: PALETTE.card2,
+    paddingBottom: 12,
+  },
+
+  bigImageWrap: {
+    marginHorizontal: 12,
+    marginTop: 10,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    backgroundColor: "#000",
+  },
+  bigImage: { width: "100%", height: 220 },
+
+  detailsBox: {
+    marginTop: 10,
+    marginHorizontal: 12,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    backgroundColor: "#0c1020",
+  },
+  detailsTitle: { color: PALETTE.chipText, fontWeight: "800", marginBottom: 8 },
+
+  kvRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 4,
+    gap: 10,
+  },
+  kvKey: { width: 120, color: "#93a5ff", fontSize: 12 },
+  kvVal: { flex: 1, color: PALETTE.text, fontSize: 12 },
+
+  actionsRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginHorizontal: 12,
+    marginTop: 10,
+  },
+  actionBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  actionTxt: { fontWeight: "800" },
+
+  /* Modal zoom */
+  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", alignItems: "center", justifyContent: "center" },
+  fullImg: { width: "100%", height: "100%" },
+});
+
+
+
+Como usar: toque no card para expandir/ocultar. No painel aberto você pode tocar na imagem para ver em tela cheia, abrir o arquivo no sistema, compartilhar, ou excluir o registro.
+
+Se quiser que vários itens abram ao mesmo tempo, já está suportado (o estado guarda um Set de abertos).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import { useEffect, useState } from "react";
 import {
   View, Text, StyleSheet, FlatList, Image, Pressable, Alert, TextInput, Modal, TouchableOpacity, SafeAreaView,
