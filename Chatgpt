@@ -1,4 +1,85 @@
 
+async function downloadImage(uri: string, id: string) {
+  try {
+    // Nome destino dentro da pasta do app
+    const filename = `${id}.jpg`;
+    const dest = FileSystem.documentDirectory + filename;
+
+    let localPath = dest;
+
+    if (uri.startsWith("file://")) {
+      // -> imagem já está local; copie para uma pasta controlada do app
+      await FileSystem.copyAsync({ from: uri, to: dest });
+    } else {
+      // -> origem remota http/https
+      const res = await FileSystem.downloadAsync(uri, dest);
+      localPath = res.uri;
+    }
+
+    // Tentar salvar na galeria (Android/iOS)
+    try {
+      const perm = await MediaLibrary.requestPermissionsAsync();
+      if (perm.granted) {
+        const asset = await MediaLibrary.createAssetAsync(localPath);
+        // Cria/usa um álbum "HydroBot"
+        const albumName = "HydroBot";
+        let album = await MediaLibrary.getAlbumAsync(albumName);
+        if (!album) {
+          album = await MediaLibrary.createAlbumAsync(albumName, asset, false);
+        } else {
+          await MediaLibrary.addAssetsToAlbumAsync([asset], album, false);
+        }
+        Alert.alert("OK", T.savedToGallery);
+        return;
+      }
+    } catch {
+      // Se der erro com a galeria, mostramos o fallback abaixo
+    }
+
+    // Fallback: manter no app e mostrar caminho
+    Alert.alert("OK", T.downloadedTo(localPath));
+  } catch (e) {
+    Alert.alert("Erro", "Falha ao baixar imagem");
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 show! Aqui está o arquivo completo do DashboardScreen.tsx já com:
 
