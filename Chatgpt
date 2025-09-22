@@ -1,4 +1,211 @@
 
+Tranquilo — dá para rodar com Python 3.13. Esses avisos do Pylance aparecem porque o VS Code está apontando para um interpretador sem as libs. Siga os passos abaixo (Windows/PowerShell):
+
+
+1) Crie e ative uma venv com o 3.13
+
+
+No diretório do server_heuristic.py:
+
+
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+# se bloquear por política:
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+python -m pip install --upgrade pip wheel setuptools
+
+
+
+2) Instale os pacotes (3.13)
+
+
+Tente primeiro a versão “headless” do OpenCV (mais leve e sem dependência de GUI):
+
+
+pip install "fastapi>=0.110" "uvicorn[standard]" watchfiles requests "pydantic>=2,<3" numpy
+pip install "opencv-python-headless>=4.10"
+
+
+
+
+
+Se o último comando falhar, tente a variante padrão:
+
+
+
+
+pip install "opencv-python>=4.10"
+
+
+
+
+
+Se ainda der erro de wheel ausente para 3.13, você pode:
+
+
+
+
+(A) usar o headless nightly: pip install --pre opencv-python-headless
+
+
+(B) instalar um wheel do Gohlke (Windows): baixe o .whl compatível com cp313 e rode pip install <arquivo.whl>.
+
+
+(C) temporariamente desligar a parte de objetos (roda só detecção de fogo) — posso te mandar um server_heuristic_no_cv2.py se quiser.
+
+
+
+
+
+
+3) Aponte o VS Code para a venv
+
+
+
+
+Ctrl+Shift+P → Python: Select Interpreter → escolha o que termina em .venv\Scripts\python.exe.
+
+
+Se os “Import could not be resolved” não sumirem após alguns segundos, use Developer: Reload Window.
+
+
+
+
+4) Rode o servidor
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+Testes rápidos
+
+
+
+
+http://127.0.0.1:8000/healthz → deve retornar {"ok":true,...}
+
+
+http://127.0.0.1:8000/status → deve mostrar fps_in, hasFrame, etc.
+
+
+
+
+
+requirements.txt (opção prática)
+
+
+Se preferir, crie um requirements.txt com:
+
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+watchfiles>=0.21
+requests>=2.32
+pydantic>=2,<3
+numpy>=2
+opencv-python-headless>=4.10
+
+
+
+E instale com:
+
+
+pip install -r requirements.txt
+
+
+
+
+Se algo falhar
+
+
+Me mande:
+
+
+
+
+a saída de python --version dentro da venv,
+
+
+a saída de pip list,
+
+
+e o primeiro erro que aparece ao rodar pip install opencv-python-headless (ou ao iniciar o uvicorn).
+
+
+
+
+Com isso eu ajusto exatamente o que está faltando no seu ambiente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Beleza — arrumei o app para não quebrar quando o servidor não responde e para exibir o vídeo + caixas assim que o /snapshot e o /detect ficarem OK. Também acrescentei um health-check no servidor para o app só iniciar os loops quando houver câmera/frames recentes. Abaixo estão os dois arquivos completos já com os ajustes.
 
 
