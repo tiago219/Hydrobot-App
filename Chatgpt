@@ -1,4 +1,375 @@
 
+Perfeito — vamos enxugar ao máximo para economizar energia e reduzir quedas: sem stream, só /snapshot (JPEG sob demanda) e /status. Também removi NTP, LED, e qualquer coisa que cause pico de consumo ou tráfego extra. A câmera roda “leve” (QVG A + 1 framebuffer + XCLK baixo). O AP fica simples e estável.
+
+
+Cole este sketch completo:
+
+
+/**
+ * HydroBot ESP32-CAM (AI Thinker) — MÍNIMO: AP + /snapshot + /status
+ * - AP: SSID "HYDROBOT-CAM" / PASS "12345678" / IP 192.168.4.1
+ * - Endpoints (porta 80):
+ *     /           -> página simples para teste (mostra snapshot)
+ *     /status     -> JSON com ip, cam_ok, uptime, heap
+ *     /snapshot   -> image/jpeg (foto única sob demanda)
+ *
+ * Foco em estabilidade e baixo consumo:
+ *  - CPU 160 MHz
+ *  - WiFi AP em canal fixo, HT20, TX power moderado
+ *  - Sem NTP, sem stream, sem flash, 1 framebuffer
+ *  - Câmera leve: QVGA, XCLK 10 MHz, jpeg_quality 22
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_wifi.h"         // controle do rádio (opcional, mas útil)
+
+// Desativa brownout (evita reset com fonte/cabo fracos)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===================== AP =====================
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GW(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+// ===================== Pines AI Thinker =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_FLASH_PIN      4   // manter desligado
+
+// ===================== Estado =====================
+WebServer server(80);
+bool g_camOk = false;
+
+// ===================== Utils =====================
+static inline void setCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleCORS() { setCORS(); server.send(200); }
+
+String uptimeJsonField() {
+  // Retorna algo como  {"uptime_ms":123456}
+  char buf[48];
+  snprintf(buf, sizeof(buf), "{\"uptime_ms\":%lu}", millis());
+  return String(buf);
+}
+
+// ===================== Wi-Fi AP (simples e estável) =====================
+void startAP() {
+  Serial.println("[WiFi] Iniciando AP…");
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPdisconnect(true);
+  delay(50);
+
+  // Configura IP fixo
+  if (!WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK)) {
+    Serial.println("[WiFi] softAPConfig falhou");
+  }
+
+  // Canal 1, visível, até 4 clientes
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  if (!ok) {
+    Serial.println("[WiFi] softAP falhou; tentando canal 6…");
+    ok = WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 4);
+  }
+
+  // WiFi “tranquilo”: banda HT20, tx power moderado (economia)
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  WiFi.setTxPower(WIFI_POWER_11dBm);  // aumente para 13~19dBm se sinal fraco
+  WiFi.setSleep(true);                // pode economizar; se notar instabilidade, mude para false
+
+  if (ok) {
+    Serial.println("[WiFi] AP OK!");
+    Serial.print("  SSID: "); Serial.println(AP_SSID);
+    Serial.print("  PASS: "); Serial.println(AP_PASS);
+    Serial.print("  IP  : "); Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("[WiFi] ERRO: Não foi possível subir o AP.");
+  }
+}
+
+// ===================== Câmera (leve) =====================
+bool initCamera() {
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0;     // XCLK em TIMER_0/CH0
+  c.ledc_timer   = LEDC_TIMER_0;
+
+  c.pin_d0       = Y2_GPIO_NUM;
+  c.pin_d1       = Y3_GPIO_NUM;
+  c.pin_d2       = Y4_GPIO_NUM;
+  c.pin_d3       = Y5_GPIO_NUM;
+  c.pin_d4       = Y6_GPIO_NUM;
+  c.pin_d5       = Y7_GPIO_NUM;
+  c.pin_d6       = Y8_GPIO_NUM;
+  c.pin_d7       = Y9_GPIO_NUM;
+  c.pin_xclk     = XCLK_GPIO_NUM;
+  c.pin_pclk     = PCLK_GPIO_NUM;
+  c.pin_vsync    = VSYNC_GPIO_NUM;
+  c.pin_href     = HREF_GPIO_NUM;
+  c.pin_sscb_sda = SIOD_GPIO_NUM;
+  c.pin_sscb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn     = PWDN_GPIO_NUM;
+  c.pin_reset    = RESET_GPIO_NUM;
+
+  c.xclk_freq_hz = 10000000;           // 10 MHz -> mais estável e econômico
+  c.pixel_format = PIXFORMAT_JPEG;
+
+  // QVGA é um bom equilíbrio de qualidade/consumo; se quiser ainda menor, use QQVGA.
+  c.frame_size   = FRAMESIZE_QVGA;     // 320x240
+  c.jpeg_quality = 22;                 // mais compressão (número maior = mais compressão)
+  c.fb_count     = 1;                  // 1 framebuffer = menos RAM/consumo
+  c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  c.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] init failed: 0x%x\n", err);
+    return false;
+  }
+
+  // Garante LED apagado
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  return true;
+}
+
+// ===================== Endpoints =====================
+const char* HOME_HTML =
+  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<style>body{background:#111;color:#eee;font-family:sans-serif;margin:18px}"
+  "a,button{background:#e53b2f;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;margin-right:8px}"
+  "img{display:block;margin-top:12px;max-width:100%;height:auto;background:#000}</style>"
+  "<h3>HydroBot CAM (snapshot only)</h3>"
+  "<div><a href='/snapshot'>Snapshot</a>"
+  "<button onclick='reload()'>Reload</button></div>"
+  "<img id=i src='/snapshot'><script>function reload(){i.src='/snapshot?ts='+Date.now()}</script>";
+
+void api_status() {
+  setCORS();
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"cam_ok\":" + String(g_camOk ? "true":"false") + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"ts\":" + uptimeJsonField();
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void api_snapshot() {
+  setCORS();
+  if (!g_camOk) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"camera_unavailable\"}"); return; }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}"); return; }
+  if (fb->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
+    return;
+  }
+
+  // Resposta sem cache
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// ===================== Setup/Loop =====================
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // sem brownout
+  setCpuFrequencyMhz(160);                    // 160 MHz: bom equilíbrio consumo/estabilidade
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== HYDROBOT CAM — SNAPSHOT-ONLY ===");
+
+  // Sobe o AP primeiro (se câmera falhar, você ainda acessa /status)
+  startAP();
+
+  // Inicializa câmera em perfil leve
+  g_camOk = initCamera();
+  if (!g_camOk) Serial.println("[CAM] Falhou — seguindo sem câmera");
+
+  // HTTP
+  server.on("/",          HTTP_GET, [](){ setCORS(); server.send(200, "text/html", HOME_HTML); });
+  server.on("/status",    HTTP_GET, api_status);
+  server.on("/snapshot",  HTTP_GET, api_snapshot);
+  server.on("/status",    HTTP_OPTIONS, handleCORS);
+  server.on("/snapshot",  HTTP_OPTIONS, handleCORS);
+  server.begin();
+  Serial.println("[HTTP] Porta 80 pronta");
+  Serial.println("=== PRONTO ===");
+}
+
+void loop() {
+  server.handleClient();
+  delay(10);
+}
+
+
+
+Notas rápidas
+
+
+
+
+Se ainda houver quedas com sua fonte/cabo, tente reduzir ainda mais:
+
+
+
+c.frame_size = FRAMESIZE_QQVGA; (160×120)
+
+
+c.jpeg_quality = 24;
+
+
+WiFi.setTxPower(WIFI_POWER_8_5dBm); (menos alcance, menos corrente)
+
+
+setCpuFrequencyMhz(80); (só se a UI continuar responsiva)
+
+
+
+
+
+
+No app, use http://192.168.4.1/snapshot?ts=${Date.now()} para evitar cache.
+
+
+Evite ligar o flash. Ele puxa bastante corrente.
+
+
+
+
+Isso é o mínimo funcional, sob demanda, com o menor estresse de energia possível.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — vou deixar o ESP32-CAM o mais enxuto possível: só cria o AP e serve /status, /snapshot (JPEG único) e /stream (MJPEG). Removi tudo que lembra as funções do seu “Arduino base” (velocidade, LED PWM, etc.) e também o que já tínhamos tirado (pump, joystick, mode, LED API). Isso reduz carga de CPU/RAM e picos de corrente.
 
 
