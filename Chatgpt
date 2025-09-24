@@ -1,3 +1,401 @@
+
+Segue o sketch completo para o ESP32-CAM (AI Thinker) em modo AP, somente /status e /snapshot (sem stream, joystick, pump etc.), com o init da câmera robusto para contornar o erro ESP_ERR_NOT_SUPPORTED:
+
+
+
+
+Liga um AP HYDROBOT-CAM (IP fixo 192.168.4.1)
+
+
+Endpoints:
+
+
+
+http://192.168.4.1/status → JSON (ip, uptime, heap, cam_ok)
+
+
+http://192.168.4.1/snapshot → uma imagem JPEG (com headers no-cache)
+
+
+
+
+
+
+Consumo reduzido: QVGA, 1 frame buffer, XCLK 10 MHz (sobe 20 MHz só no probe)
+
+
+Rotina de retry: acorda PWDN (GPIO32), tenta init com XCLK 20→10 MHz, e se falhar tenta de novo com pin_pwdn = -1 (para clones que não ligam o 32 ao sensor).
+
+
+
+
+
+
+Placa: ESP32 Wrover Module (ou “AI Thinker ESP32-CAM”)
+
+Partição: “Huge APP (3MB No OTA)”
+
+PSRAM: Enabled
+
+Alimente pela porta 5V do baseboard com 5 V / 2 A.
+
+
+
+
+
+HydroBot_cam_snapshot_only.ino
+
+
+/**
+ * HydroBot - ESP32-CAM (AI Thinker)  |  AP ONLY + SNAPSHOT
+ * - AP: SSID "HYDROBOT-CAM"  (IP 192.168.4.1)
+ * - Endpoints: /status (JSON), /snapshot (image/jpeg)
+ * - Baixo consumo: FRAMESIZE_QVGA, 1 frame buffer, XCLK 10 MHz
+ * - Init robusto da câmera:
+ *      * acorda PWDN (GPIO32 LOW)
+ *      * tenta init com XCLK 20 MHz (probe), reinit 10 MHz
+ *      * se falhar 0x106, tenta novamente com pin_pwdn = -1
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+
+// --- desativa brownout para evitar resets com fonte fraca
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===================== WIFI AP =====================
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP  (192,168,4,1);
+const IPAddress AP_GW  (192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+// ===================== PINOS (AI THINKER) =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_FLASH_PIN      4   // flash onboard (alta = ligado)
+
+// ===================== ESTADO =====================
+WebServer server(80);
+bool g_camOk = false;
+const framesize_t g_curFramesize = FRAMESIZE_QVGA; // 320x240 (estável e leve)
+
+// ===================== UTILS =====================
+static inline void corsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin",  "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &ti);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return ts;
+}
+
+// ===================== CÂMERA (init robusto) =====================
+bool initCamera() {
+  // base config
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;   // XCLK
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;    // pode ser -1 em alguns clones
+  cfg.pin_reset    = RESET_GPIO_NUM;
+
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = g_curFramesize;
+  cfg.jpeg_quality = 24;               // mais compressão, menos carga
+  cfg.fb_count     = 1;
+  cfg.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+
+  // garante PWDN = LOW (acorda sensor)
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(15);
+
+  // 1ª tentativa: XCLK 20 MHz (alguns módulos só “acordam” assim)
+  cfg.xclk_freq_hz = 20000000;
+  esp_err_t err = esp_camera_init(&cfg);
+
+  if (err == ESP_OK) {
+    // reinit com 10 MHz para estabilidade e menor consumo
+    esp_camera_deinit();
+    cfg.xclk_freq_hz = 10000000;
+    err = esp_camera_init(&cfg);
+  }
+
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed (PWDN=32, 20/10 MHz). Err=0x%x\n", err);
+    // 2ª tentativa: alguns clones não têm PWDN ligado ao sensor → use -1
+    esp_camera_deinit();
+    cfg.pin_pwdn     = -1;
+    cfg.xclk_freq_hz = 20000000;
+    err = esp_camera_init(&cfg);
+    if (err == ESP_OK) {
+      esp_camera_deinit();
+      cfg.xclk_freq_hz = 10000000;
+      err = esp_camera_init(&cfg);
+    }
+    if (err != ESP_OK) {
+      Serial.printf("Retry with pin_pwdn=-1 failed. Err=0x%x\n", err);
+      return false;
+    }
+  }
+
+  // pequenos ajustes do sensor
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize (s, g_curFramesize);
+    s->set_quality   (s, 24);
+    s->set_brightness(s, -1);
+    s->set_saturation(s, -1);
+    s->set_contrast  (s,  0);
+    s->set_aec2      (s,  1);
+    s->set_ae_level  (s, -2);
+    s->set_gain_ctrl (s,  1);
+    s->set_awb_gain  (s,  1);
+  }
+
+  return true;
+}
+
+// ===================== ENDPOINTS =====================
+void handleOPTIONS() {
+  corsHeaders();
+  server.send(200);
+}
+
+void handleStatus() {
+  corsHeaders();
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"cam_ok\":" + String(g_camOk ? "true":"false") + ",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"ts\":\"" + isoTimestamp() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSnapshot() {
+  corsHeaders();
+
+  if (!g_camOk) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"camera_unavailable\"}");
+    return;
+  }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}");
+    return;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
+    return;
+  }
+
+  // headers no-cache e conexão curta (mais estável)
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// ===================== SETUP/AP/LOOP =====================
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+  WiFi.softAP(AP_SSID, AP_PASS, 6 /*canal*/);
+  WiFi.setSleep(false);           // AP estável
+  delay(200);
+
+  Serial.println("AP iniciado:");
+  Serial.print("  SSID: "); Serial.println(AP_SSID);
+  Serial.print("  PASS: "); Serial.println(AP_PASS);
+  Serial.print("  IP:   "); Serial.println(WiFi.softAPIP());
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desliga brownout
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\n=== HydroBot CAM — snapshot-only (stability mode) ===");
+
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  // Câmera primeiro (melhor timing)
+  g_camOk = initCamera();
+  if (!g_camOk) Serial.println("Camera FAIL (seguindo sem camera)");
+
+  // AP e servidor HTTP
+  startAP();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  server.on("/status",   HTTP_GET,     handleStatus);
+  server.on("/status",   HTTP_OPTIONS, handleOPTIONS);
+  server.on("/snapshot", HTTP_GET,     handleSnapshot);
+  server.on("/snapshot", HTTP_OPTIONS, handleOPTIONS);
+  server.begin();
+  Serial.println("HTTP :80 pronto");
+  Serial.println("=== PRONTO ===");
+}
+
+void loop() {
+  server.handleClient();
+  delay(5); // reduz carga da CPU/wi-fi
+}
+
+
+
+Dicas finais
+
+
+
+
+
+
+Se ainda aparecer Detected camera not supported / 0x106, quase sempre é:
+
+
+
+
+Flat da câmera mal encaixado → reconecte dos dois lados (trava fechada).
+
+
+Módulo não é OV2640 (alguns vêm com GC2145/OV5640) → não funciona com esse driver.
+
+
+Sensor danificado → teste outra câmera OV2640.
+
+
+
+
+
+
+
+
+Se reiniciar ao mirar cenas muito detalhadas, continue usando QVGA, jpeg_quality 24 e 1 framebuffer; são os parâmetros mais leves (menos PSRAM/pico de corrente).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ====== HydroBot Arduino - Driver & Sensors (sem servo) ======
 // Motores, bomba, LED e sensores ficam aqui. ESP32-CAM comanda via UART.
 // Protocolo linha-a-linha (terminado em '\n'):
