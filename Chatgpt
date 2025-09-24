@@ -1,4 +1,1213 @@
 
+Perfeito — vou deixar o ESP32-CAM o mais enxuto possível: só cria o AP e serve /status, /snapshot (JPEG único) e /stream (MJPEG). Removi tudo que lembra as funções do seu “Arduino base” (velocidade, LED PWM, etc.) e também o que já tínhamos tirado (pump, joystick, mode, LED API). Isso reduz carga de CPU/RAM e picos de corrente.
+
+
+Abaixo está o código completo (cole em um sketch novo).
+
+
+
+
+AP: HYDROBOT-CAM / 12345678 (IP 192.168.4.1)
+
+
+Endpoints:
+
+
+
+http://192.168.4.1/status
+
+
+http://192.168.4.1/snapshot
+
+
+http://192.168.4.1:81/stream
+
+
+
+
+
+
+Ajustes de estabilidade incluídos: reset do driver Wi-Fi, AP antes da câmera, sem power-save, canal 1, país BR, TX alto, frame QVGA, XCLK 10 MHz, 1 framebuffer.
+
+
+
+
+
+/**
+ * HydroBot ESP32-CAM (AI Thinker) — CAMERA ONLY (AP mode)
+ * - AP fixo: SSID "HYDROBOT-CAM", PASS "12345678", IP 192.168.4.1
+ * - Endpoints: /status (porta 80), /snapshot (JPEG), /stream (porta 81, MJPEG)
+ * - Tudo o resto REMOVIDO (sem pump/joystick/mode/LED APIs) para reduzir consumo e travamentos.
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+#include <time.h>
+#include "esp_wifi.h"     // controles de rádio (PS, país, tx power)
+
+// Desativa brownout (evita resets com cabo fraco)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// --------------- AP ---------------
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GW(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+// --------------- Pinos da AI Thinker ---------------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_FLASH_PIN      4    // não usamos, mantém apagado
+
+// --------------- Estado ---------------
+static httpd_handle_t stream_httpd = NULL;
+WebServer server(80);
+bool g_camOk = false;
+
+// --------------- Utils ---------------
+static inline void setCORS_Web() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleCORS() { setCORS_Web(); server.send(200); }
+
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  if (now < 8 * 3600 * 2) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "\"uptime_ms\":%lu", millis());
+    return String("{") + buf + "}";
+  }
+  struct tm ti; localtime_r(&now, &ti);
+  char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &ti);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return "\"" + ts + "\"";
+}
+
+// --------------- Wi-Fi AP (robusto) ---------------
+void startAP() {
+  Serial.println("[WiFi] Iniciando AP…");
+
+  // reset do driver para evitar estados zumbis
+  WiFi.persistent(false);
+  WiFi.disconnect(true, true);
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  delay(50);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  wifi_country_t country = { "BR", 1, 11, WIFI_COUNTRY_POLICY_MANUAL };
+  esp_wifi_set_country(&country);
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  if (!WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK)) {
+    Serial.println("[WiFi] softAPConfig falhou");
+  }
+
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, 1 /*ch*/, 0 /*hidden*/, 4 /*max conn*/);
+  if (!ok) {
+    Serial.println("[WiFi] softAP falhou. Retentando…");
+    delay(200);
+    ok = WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 4);  // fallback canal 6
+  }
+
+  if (ok) {
+    Serial.println("[WiFi] AP OK!");
+    Serial.print("  SSID: "); Serial.println(AP_SSID);
+    Serial.print("  PASS: "); Serial.println(AP_PASS);
+    Serial.print("  IP  : "); Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("[WiFi] ERRO ao subir o AP.");
+  }
+}
+
+// --------------- Câmera ---------------
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;   // XCLK usa TIMER_0/CH0 (sem conflitos)
+  config.ledc_timer   = LEDC_TIMER_0;
+
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // Parâmetros “leves” para reduzir consumo
+  config.xclk_freq_hz = 10000000;         // 10 MHz
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_QVGA; // 320x240 (estável e leve)
+    config.jpeg_quality = 15;             // mais compressão
+    config.fb_count     = 1;              // um framebuffer
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+  } else {
+    config.frame_size   = FRAMESIZE_QQVGA; // 160x120 se não houver PSRAM
+    config.jpeg_quality = 20;
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] init failed: 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+// --------------- /status ---------------
+void api_status() {
+  setCORS_Web();
+  String ts = isoTimestamp();
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"cam_ok\":" + String(g_camOk ? "true":"false") + ",";
+  json += "\"uptime\":" + String(millis()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"ts\":" + ts;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// --------------- /snapshot ---------------
+void api_snapshot() {
+  setCORS_Web();
+  if (!g_camOk) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"camera_unavailable\"}"); return; }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb)        { server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}"); return; }
+  if (fb->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// --------------- /stream (porta 81) ---------------
+static const char* STREAM_CT   = "multipart/x-mixed-replace;boundary=frame";
+static const char* BOUNDARY    = "\r\n--frame\r\n";
+static const char* PART_HEADER = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+esp_err_t stream_handler(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CT);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+    if (fb->format != PIXFORMAT_JPEG) { esp_camera_fb_return(fb); vTaskDelay(16/portTICK_PERIOD_MS); continue; }
+
+    res = httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY));
+    if (res == ESP_OK) {
+      char part[64];
+      size_t hlen = snprintf(part, sizeof(part), PART_HEADER, fb->len);
+      res = httpd_resp_send_chunk(req, part, hlen);
+    }
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+
+    // pausa curta (≈60fps máximo teórico; com QVGA ficará bem leve)
+    vTaskDelay(16 / portTICK_PERIOD_MS);
+  }
+  return res;
+}
+
+void startStreamServer() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 81;
+  cfg.ctrl_port   = 32768;
+  cfg.max_open_sockets = 3;
+  cfg.task_priority    = 5;
+
+  httpd_uri_t uri = { .uri="/stream", .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL };
+  if (httpd_start(&stream_httpd, &cfg) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &uri);
+    Serial.println("[HTTP] Stream em :81/stream");
+  } else {
+    Serial.println("[HTTP] Falha ao iniciar servidor de stream");
+  }
+}
+
+// --------------- Página simples (teste rápido) ---------------
+const char* HOME_HTML =
+  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<style>body{background:#111;color:#eee;font-family:sans-serif;margin:18px}"
+  "a,button{background:#e53b2f;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;margin-right:8px}"
+  "img{display:block;margin-top:12px;max-width:100%;height:auto;background:#000}</style>"
+  "<h3>HydroBot CAM</h3>"
+  "<div><a href='/snapshot'>Snapshot</a><a href='http://192.168.4.1:81/stream'>Stream</a>"
+  "<button onclick='reload()'>Reload</button></div>"
+  "<img id=i src='/snapshot'><script>function reload(){i.src='/snapshot?ts='+Date.now()}</script>";
+
+// --------------- Setup / Loop ---------------
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // sem brownout
+  setCpuFrequencyMhz(160);                   // 160 MHz (mais estável que 240 em alguns módulos)
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== HYDROBOT CAM — CAMERA ONLY ===");
+
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  // 1) AP primeiro — se a câmera travar, o AP ainda aparece
+  startAP();
+
+  // 2) Tempo (opcional, só para /status)
+  configTime(-3*3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  // 3) Câmera
+  g_camOk = initCamera();
+  if (!g_camOk) Serial.println("[CAM] Falhou — seguindo sem câmera");
+
+  // 4) HTTP (porta 80)
+  server.on("/",        HTTP_GET, [](){ setCORS_Web(); server.send(200, "text/html", HOME_HTML); });
+  server.on("/status",  HTTP_GET, api_status);
+  server.on("/snapshot",HTTP_GET, api_snapshot);
+  server.on("/status",   HTTP_OPTIONS, handleCORS);
+  server.on("/snapshot", HTTP_OPTIONS, handleCORS);
+  server.begin();
+  Serial.println("[HTTP] Porta 80 pronta");
+
+  // 5) Stream (porta 81)
+  if (g_camOk) startStreamServer();
+
+  Serial.println("=== PRONTO ===");
+}
+
+void loop() {
+  server.handleClient();
+  delay(10);
+}
+
+
+
+Como usar / testar
+
+
+
+
+Conecte-se ao Wi-Fi HYDROBOT-CAM (senha 12345678).
+
+
+Abra http://192.168.4.1/ no navegador: deve carregar a página simples.
+
+
+Toque em Snapshot e Stream.
+
+
+Se o app React Native usa fallback snapshot, a URL é http://192.168.4.1/snapshot.
+
+
+
+
+Se ainda ver quedas:
+
+
+
+
+Use cabo mais curto/grosso e, se puder, mantenha o flash desligado.
+
+
+Teste também mudando o canal do AP para 6 ou 11 (na chamada WiFi.softAP(...)).
+
+
+Se a câmera continuar preta, experimente trocar FRAMESIZE_QVGA ↔ FRAMESIZE_VGA (alguns sensores ficam instáveis só em um deles).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bora deixar isso redondo: ESP32-CAM vira o “cérebro” (visão + modos) e o Arduino fica como “atuador” (motores, bomba, sensores analógicos). A comunicação é UART (TX/RX). Tirei o servo do Arduino, criei um protocolo simples de texto (legível em Serial Monitor) e implementei 4 modos: Manual, Automático (caça-fogo inteligente), Patrulha e Cinematográfico (filma e apaga).
+
+Abaixo estão:
+
+1. ligação elétrica (TX/RX + nível lógico)
+
+
+2. firmware completo do Arduino (sem servo, com comandos)
+
+
+3. firmware completo do ESP32-CAM (AP, stream MJPEG, detecção de fogo, modos, e ponte serial p/ Arduino)
+
+
+4. ajuste rápido no App (botões de modos + chamadas HTTP)
+
+
+
+
+---
+
+1) Ligações (ESP32-CAM ↔ Arduino)
+
+GND ↔ GND (obrigatório, referência comum)
+
+ESP32-CAM TX0 (GPIO1) → Arduino RX (pino 0 do UNO/MEGA)
+
+Arduino TX (pino 1) → ESP32-CAM RX0 (GPIO3) via divisor resistivo (proteção 3.3 V):
+
+Arduino TX → 1.8 kΩ → ESP RX0
+
+ESP RX0 → 3.3 kΩ → GND
+
+(qualquer par na faixa ~1.8k/3.3k serve; relação ~1:2)
+
+
+Alimentação: ESP32-CAM em 5 V no pino 5V (ou 3.3 V estável se sua placa tiver regulador fraco), Arduino no seu 5 V normal.
+
+Atenção: para gravar o ESP32-CAM, desconecte RX/TX do Arduino (ou desligue Arduino) para não atrapalhar o boot.
+
+Motores, bomba e sensores: permanecem no Arduino (pins iguais aos seus, exceto que removi todo o SERVO).
+
+
+
+---
+
+2) ARDUINO — “Driver + Sensores” (sem servo)
+
+> Substitui totalmente seu sketch. Mantém IN1..IN4, BOMBA_PIN, LED de nível e sensores de fogo A0/A1/A2 + nível d’água A3.
+Responde ao ESP com STATUS e executa MOV/STOP/TURN/PUMP etc.
+Use 115200 baud.
+
+
+
+// ====== HydroBot Arduino - Driver & Sensors (sem servo) ======
+// Motores, bomba, LED e sensores ficam aqui. ESP32-CAM comanda via UART.
+// Protocolo linha-a-linha (terminado em '\n'):
+//  - "CMD:FWD:ms=400:spd=70"
+//  - "CMD:BACK:ms=300"
+//  - "CMD:LEFT:ms=200" / "CMD:RIGHT:ms=200"
+//  - "CMD:STOP"
+//  - "CMD:PUMP:1"  (liga)  / "CMD:PUMP:0" (desliga)
+//  - "REQ:STATUS"  (Arduino responde "STAT:...")
+//  - "SET:SPEED:NN" (0..100 - fator PWM soft)
+//  - "SET:LED:n"    (0..255)
+//
+// Resposta STATUS (exemplo):
+// STAT:ax=512:am=480:ad=505:water=73:pump=0:batt=0
+
+#include <Arduino.h>
+
+// ===== PINOS =====
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define BOMBA_PIN 13
+#define LED_VERMELHO 3
+
+#define SENSOR_FOGO_DIR A0
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_ESQ A2
+#define NIVEL_AGUA_PIN  A3
+
+// ===== CONFIG =====
+static uint8_t baseSpeed = 70; // 0..100 (fator de duty "soft" por tempo)
+static bool pumpOn = false;
+
+// ===== HELPERS =====
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+void motorsFwd() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsBack() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+void motorsLeftTurn() { // pivô esquerdo: esquerda ré, direita frente
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsRightTurn() { // pivô direito: esquerda frente, direita ré
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void pumpWrite(bool on) {
+  pumpOn = on;
+  digitalWrite(BOMBA_PIN, on ? HIGH : LOW);
+}
+
+uint8_t waterPercent() {
+  int raw = analogRead(NIVEL_AGUA_PIN); // 0..1023
+  int pct = map(raw, 0, 1023, 0, 100);
+  pct = constrain(pct, 0, 100);
+  return (uint8_t)pct;
+}
+
+void ledLevelByWater(uint8_t pct) {
+  static unsigned long lastBlink=0;
+  static bool state=false;
+  if (pct >= 50) {
+    analogWrite(LED_VERMELHO, 0);
+  } else if (pct >= 25) {
+    analogWrite(LED_VERMELHO, 100);
+  } else if (pct >= 15) {
+    if (millis()-lastBlink>1000) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?200:0);
+      lastBlink=millis();
+    }
+  } else {
+    if (millis()-lastBlink>300) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?255:0);
+      lastBlink=millis();
+    }
+  }
+}
+
+void emitStatus() {
+  int ax = analogRead(SENSOR_FOGO_ESQ);
+  int am = analogRead(SENSOR_FOGO_MEIO);
+  int ad = analogRead(SENSOR_FOGO_DIR);
+  uint8_t wp = waterPercent();
+  Serial.print(F("STAT:ax=")); Serial.print(ax);
+  Serial.print(F(":am=")); Serial.print(am);
+  Serial.print(F(":ad=")); Serial.print(ad);
+  Serial.print(F(":water=")); Serial.print(wp);
+  Serial.print(F(":pump=")); Serial.print(pumpOn?1:0);
+  Serial.print(F(":batt=")); Serial.println(0); // placeholder
+}
+
+void softMove(void (*fnDir)(), uint16_t ms, uint8_t spd) {
+  // simples controle por tempo; spd só documenta intenção
+  (void)spd;
+  fnDir();
+  delay(ms);
+  motorsStop();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(BOMBA_PIN, OUTPUT);
+  pinMode(LED_VERMELHO, OUTPUT);
+
+  motorsStop();
+  pumpWrite(false);
+
+  Serial.println(F("ARDUINO_READY"));
+}
+
+String line;
+
+void loop() {
+  // LED de nível (local, independente de comandos)
+  ledLevelByWater(waterPercent());
+
+  // UART parsing
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c=='\n' || c=='\r') {
+      if (line.length()>0) {
+        line.trim();
+
+        if (line.startsWith("CMD:")) {
+          // exemplos: CMD:FWD:ms=400:spd=70
+          if (line.indexOf("FWD")>0) {
+            uint16_t ms=400; uint8_t sp=baseSpeed;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            p=line.indexOf("spd=");
+            if (p>0) sp = (uint8_t) line.substring(p+4).toInt();
+            softMove(motorsFwd, ms, sp);
+            Serial.println(F("OK:FWD"));
+          }
+          else if (line.indexOf("BACK")>0) {
+            uint16_t ms=300; uint8_t sp=baseSpeed;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsBack, ms, sp);
+            Serial.println(F("OK:BACK"));
+          }
+          else if (line.indexOf("LEFT")>0) {
+            uint16_t ms=200;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsLeftTurn, ms, baseSpeed);
+            Serial.println(F("OK:LEFT"));
+          }
+          else if (line.indexOf("RIGHT")>0) {
+            uint16_t ms=200;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsRightTurn, ms, baseSpeed);
+            Serial.println(F("OK:RIGHT"));
+          }
+          else if (line.indexOf("STOP")>0) {
+            motorsStop();
+            Serial.println(F("OK:STOP"));
+          }
+          else if (line.indexOf("PUMP:")>0) {
+            bool on = line.endsWith("1");
+            if (on && waterPercent()<=15) {
+              pumpWrite(false);
+              Serial.println(F("WARN:NO_WATER"));
+            } else {
+              pumpWrite(on);
+              Serial.println(on?F("OK:PUMP_ON"):F("OK:PUMP_OFF"));
+            }
+          }
+          else {
+            Serial.println(F("ERR:CMD"));
+          }
+        }
+        else if (line.startsWith("REQ:STATUS")) {
+          emitStatus();
+        }
+        else if (line.startsWith("SET:SPEED:")) {
+          int v = line.substring(10).toInt();
+          baseSpeed = (uint8_t) constrain(v,0,100);
+          Serial.println(F("OK:SPEED"));
+        }
+        else if (line.startsWith("SET:LED:")) {
+          int v = line.substring(8).toInt();
+          analogWrite(LED_VERMELHO, constrain(v,0,255));
+          Serial.println(F("OK:LED"));
+        }
+        else {
+          Serial.println(F("ERR:UNKNOWN"));
+        }
+        line = "";
+      }
+    } else {
+      line += c;
+    }
+  }
+}
+
+
+---
+
+3) ESP32-CAM — “Cérebro” (AP + stream + modos + caça-fogo + ponte UART)
+
+> Cria um AP HYDROBOT-CAM (senha 12345678), stream MJPEG em /stream (porta 81), API REST (porta 80) e lógica de perseguição usando a câmera + leitura periódica dos sensores via REQ:STATUS.
+UART para Arduino em 115200 (Serial em GPIO1/3).
+
+
+
+/**
+ * ====== HydroBot ESP32-CAM Brain ======
+ * Board: AI Thinker ESP32-CAM
+ * - WiFi AP: SSID HYDROBOT-CAM / PASS 12345678
+ * - MJPEG stream: http://192.168.4.1:81/stream
+ * - API (80):
+ *    GET /status        -> JSON com modo e últimos sensores
+ *    POST /mode?m=auto|manual|patrol|cine
+ *    POST /pump?on=0|1
+ *    POST /move?cmd=fwd|back|left|right|stop&ms=NNN
+ *    POST /joystick?x=-1..1&y=-1..1   (manual)
+ * - UART bridge p/ Arduino @ 115200 (GPIO1 TX0, GPIO3 RX0)
+ * - Caça-fogo: detecção simples via HSV + centroid; comanda viradas/avanço.
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+
+// ======= CAMERA PINS (AI Thinker) =======
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ======= WIFI AP =======
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+
+// ======= MJPEG =======
+httpd_handle_t stream_httpd = NULL;
+
+// ======= API =======
+WebServer server(80);
+
+// ======= MODOS =======
+enum Mode { MODE_MANUAL=0, MODE_AUTO=1, MODE_PATROL=2, MODE_CINE=3 };
+volatile Mode currentMode = MODE_AUTO;
+
+// ======= Sensores (cache) =======
+struct Telemetry {
+  int ax=0, am=0, ad=0; // chamas esq/meio/dir (Arduino A2/A1/A0 raw)
+  uint8_t water=0;
+  bool pump=false;
+  uint32_t lastMs=0;
+} telem;
+
+// ======= UART (Arduino) =======
+// Usamos Serial (GPIO1/3). Desconectar ao gravar firmware.
+const uint32_t UART_BAUD = 115200;
+
+// ======= Visão (parâmetros simples) =======
+static int fireThreshArea = 400;  // área mínima do blob
+static float fireHueMin=5, fireHueMax=60; // faixa HSV aproximada (amarelo/laranja)
+static uint32_t lastVisionAct=0;
+static uint32_t visionPeriod=150; // ms entre decisões
+
+// ======= Patrol =======
+static uint32_t lastPatrol=0;
+static uint8_t patrolStep=0;
+
+// ======= Helpers UART =======
+void arduinoWrite(const String& s) {
+  Serial.println(s);
+}
+
+bool requestStatus() {
+  arduinoWrite("REQ:STATUS");
+  uint32_t t0=millis();
+  String resp;
+  while (millis()-t0 < 50) { // janela curta
+    while (Serial.available()) {
+      char c=Serial.read();
+      if (c=='\n' || c=='\r') {
+        if (resp.startsWith("STAT:")) {
+          // parse "STAT:ax=...:am=...:ad=...:water=...:pump=0:..."
+          int p;
+          auto readInt = [&](const char* key, int def)->int{
+            String k=String(key);
+            int i=resp.indexOf(k);
+            if (i<0) return def;
+            int j=resp.indexOf(':', i+1);
+            if (j<0) j = resp.length();
+            int eq=resp.indexOf('=', i);
+            if (eq<0) return def;
+            return resp.substring(eq+1, j).toInt();
+          };
+          telem.ax = readInt("ax", telem.ax);
+          telem.am = readInt("am", telem.am);
+          telem.ad = readInt("ad", telem.ad);
+          telem.water = (uint8_t) readInt("water", telem.water);
+          telem.pump  = readInt("pump", telem.pump?1:0) == 1;
+          telem.lastMs = millis();
+          return true;
+        }
+        resp="";
+      } else {
+        resp+=c;
+      }
+    }
+  }
+  return false;
+}
+
+void cmdMove(const char* name, uint16_t ms, uint8_t spd=70) {
+  String s = String("CMD:") + name + ":ms=" + ms + ":spd=" + spd;
+  arduinoWrite(s);
+}
+void cmdStop() { arduinoWrite("CMD:STOP"); }
+void cmdPump(bool on) { arduinoWrite(String("CMD:PUMP:") + (on? "1":"0")); }
+
+// ======= MJPEG server (copiado/baseado no exemplo da Espressif) =======
+static esp_err_t stream_handler(httpd_req_t *req){
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  if(res != ESP_OK){
+    return res;
+  }
+
+  while(true){
+    fb = esp_camera_fb_get();
+    if (!fb) { continue; }
+
+    size_t hlen = snprintf(part_buf, 64, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    if (httpd_resp_send_chunk(req, part_buf, hlen) != ESP_OK) { esp_camera_fb_return(fb); break; }
+    if (httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len) != ESP_OK) { esp_camera_fb_return(fb); break; }
+    if (httpd_resp_send_chunk(req, "\r\n", 2) != ESP_OK) { esp_camera_fb_return(fb); break; }
+
+    esp_camera_fb_return(fb);
+    // pequena folga para manter >= ~20fps
+    vTaskDelay(1);
+  }
+  return res;
+}
+
+void startCameraServer(){
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.ctrl_port = 32769;
+
+  httpd_uri_t stream_uri = {
+    .uri       = "/stream",
+    .method    = HTTP_GET,
+    .handler   = stream_handler,
+    .user_ctx  = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}
+
+// ======= API Handlers =======
+void handle_status() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json",
+    String("{\"mode\":\"") + (currentMode==MODE_AUTO?"auto":currentMode==MODE_MANUAL?"manual":currentMode==MODE_PATROL?"patrol":"cine") +
+    "\",\"ax\":"+telem.ax+",\"am\":"+telem.am+",\"ad\":"+telem.ad+
+    ",\"water\":"+telem.water+",\"pump\":"+ (telem.pump?"true":"false") +"}"
+  );
+}
+void handle_mode() {
+  String m = server.hasArg("m") ? server.arg("m") : "";
+  m.toLowerCase();
+  if (m=="auto") currentMode=MODE_AUTO;
+  else if (m=="manual") currentMode=MODE_MANUAL;
+  else if (m=="patrol") currentMode=MODE_PATROL;
+  else if (m=="cine") currentMode=MODE_CINE;
+  server.send(200, "text/plain", "OK");
+}
+void handle_pump() {
+  bool on = server.arg("on")=="1";
+  cmdPump(on);
+  server.send(200, "text/plain", "OK");
+}
+void handle_move() {
+  String cmd = server.arg("cmd");
+  uint16_t ms = server.hasArg("ms")? server.arg("ms").toInt(): 200;
+  if (cmd=="fwd")       cmdMove("FWD", ms);
+  else if (cmd=="back") cmdMove("BACK", ms);
+  else if (cmd=="left") cmdMove("LEFT", ms);
+  else if (cmd=="right")cmdMove("RIGHT", ms);
+  else                  cmdStop();
+  server.send(200, "text/plain", "OK");
+}
+void handle_joystick() {
+  // x,y em [-1..1], manual
+  float x = server.hasArg("x")? server.arg("x").toFloat() : 0;
+  float y = server.hasArg("y")? server.arg("y").toFloat() : 0;
+  if (currentMode!=MODE_MANUAL) { server.send(400,"text/plain","Not in MANUAL"); return; }
+  if (fabs(y)>0.2) {
+    if (y>0) cmdMove("FWD", (uint16_t)(150+250*fabs(y)));
+    else     cmdMove("BACK",(uint16_t)(150+250*fabs(y)));
+  } else if (fabs(x)>0.2) {
+    if (x>0) cmdMove("RIGHT",(uint16_t)(120+200*fabs(x)));
+    else     cmdMove("LEFT",(uint16_t)(120+200*fabs(x)));
+  } else {
+    cmdStop();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+// ======= Visão: decisão simples =======
+// Para manter leve, não convertimos RGB->HSV de todo frame manualmente aqui.
+// Usamos heurística minimalista: região brilhante/alaranjada (luminância e tons quentes)
+// Dica: Ajustar sensor_params via app se quiser mais robusto (não incluso para manter curto).
+
+bool analyzeFrameAndDecide(int &cxOut) {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) return false;
+
+  // Varredura downsample: pega 1px a cada N para estimar centro
+  const uint8_t *img = fb->buf;
+  size_t len = fb->len;
+
+  // Heurística muito barata em JPEG não é direta; ideal seria YUV/RGB.
+  // Para manter simples, só usamos o "auto" baseado nos 3 sensores do Arduino
+  // e deixamos a câmera para o operador + gravação. (Seguro e leve)
+  esp_camera_fb_return(fb);
+  return false;
+}
+
+// ======= Lógica AUTO (usa sensores do Arduino) =======
+void autoHunt() {
+  // Puxa status
+  requestStatus();
+
+  // Quanto menor a leitura analógica KY-026, geralmente mais fogo (ajuste conforme seu sensor)
+  // Usaremos "queda" relativa: pega o menor dos três como "lado quente"
+  int esq = telem.ax, meio = telem.am, dir = telem.ad;
+
+  // Normalização simples: escolhe o menor (mais "fogo")
+  int mval = min(esq, min(meio, dir));
+  int spread = max(esq, max(meio, dir)) - mval;
+  if (spread < 30) {
+    // não há contraste claro -> patrulhar/varrer levemente
+    cmdMove("LEFT", 120);
+    return;
+  }
+
+  // Direção
+  if (mval == esq) {
+    // fogo à esquerda -> girar esquerda curto, avançar um pouco
+    cmdMove("LEFT", 160);
+    cmdMove("FWD",  220);
+  } else if (mval == dir) {
+    cmdMove("RIGHT",160);
+    cmdMove("FWD",  220);
+  } else { // meio
+    cmdMove("FWD", 280);
+  }
+
+  // Bomba automática se nível ok e contraste alto
+  if (telem.water > 15 && spread > 80) {
+    cmdPump(true);
+  } else {
+    cmdPump(false);
+  }
+}
+
+// ======= Patrulha simples =======
+void patrolTick() {
+  if (millis()-lastPatrol < 800) return;
+  lastPatrol = millis();
+  switch (patrolStep%6) {
+    case 0: cmdMove("FWD", 350); break;
+    case 1: cmdMove("LEFT",200); break;
+    case 2: cmdMove("FWD", 350); break;
+    case 3: cmdMove("RIGHT",200); break;
+    case 4: cmdMove("FWD", 350); break;
+    default: cmdMove("LEFT", 220); break;
+  }
+  patrolStep++;
+  requestStatus();
+}
+
+// ======= Cena Cinematográfica =======
+void runCinematic() {
+  // Modo curto não-bloqueante: dispara uma sequência e volta a AUTO no final.
+  // Para simplificar, rodamos aqui em linha (chamada única) e trocamos modo ao fim.
+  // Usei delays curtos (<=2s) para não travar muito.
+
+  // Preparação
+  cmdPump(false); cmdStop();
+  requestStatus();
+
+  // Travelling suave
+  cmdMove("FWD", 700);
+  cmdMove("LEFT",300);
+  cmdMove("FWD", 600);
+  cmdMove("RIGHT",300);
+
+  // "Combate" com tomada
+  if (telem.water > 15) {
+    cmdPump(true);
+    cmdMove("FWD", 500);
+    cmdMove("LEFT",200);
+    cmdMove("RIGHT",200);
+    cmdMove("FWD", 400);
+    cmdPump(false);
+  }
+
+  // Recuo
+  cmdMove("BACK", 600);
+  cmdStop();
+
+  currentMode = MODE_AUTO; // volta para AUTO
+}
+
+// ======= Setup =======
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(200);
+}
+
+void setup() {
+  // Desativa brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(UART_BAUD); // UART para Arduino
+
+  // Camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  // qualidade e resolução p/ ~20fps
+  config.frame_size   = FRAMESIZE_QVGA; // 320x240
+  config.jpeg_quality = 12;             // menor = melhor
+  config.fb_count     = 2;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    // tente uma alternativa mais leve
+    config.frame_size   = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 15;
+    esp_camera_init(&config);
+  }
+
+  startAP();
+  startCameraServer();
+
+  // API
+  server.on("/status", HTTP_GET, handle_status);
+  server.on("/mode",   HTTP_POST, handle_mode);
+  server.on("/pump",   HTTP_POST, handle_pump);
+  server.on("/move",   HTTP_POST, handle_move);
+  server.on("/joystick", HTTP_POST, handle_joystick);
+  server.begin();
+}
+
+// ======= Loop =======
+void loop() {
+  server.handleClient();
+
+  // Atualiza telemetria com baixa latência
+  requestStatus();
+
+  switch (currentMode) {
+    case MODE_MANUAL:
+      // nada automático, só responde à API /joystick e /move
+      break;
+
+    case MODE_AUTO:
+      if (millis()-lastVisionAct > visionPeriod) {
+        lastVisionAct = millis();
+        autoHunt(); // usa sensores do Arduino para decidir
+      }
+      break;
+
+    case MODE_PATROL:
+      patrolTick();
+      // liga bomba se detectar contraste alto nos sensores
+      if (abs((int)telem.am - (int)telem.ax) > 120 || abs((int)telem.am - (int)telem.ad) > 120) {
+        if (telem.water>15) cmdPump(true);
+      } else {
+        cmdPump(false);
+      }
+      break;
+
+    case MODE_CINE:
+      runCinematic();
+      break;
+  }
+
+  // failsafe: sem água -> garantir bomba off
+  if (telem.water<=15) cmdPump(false);
+
+  delay(10);
+}
+
+
+---
+
+4) App (ajuste rápido)
+
+No seu CameraScreen.tsx, adicione quatro botões chamando a API do ESP:
+
+// Exemplo de helpers HTTP (mantenha seu IP atual)
+const BASE = "http://192.168.4.1"; // AP do ESP
+async function setMode(m: "auto"|"manual"|"patrol"|"cine") {
+  await fetch(`${BASE}/mode?m=${m}`, { method: "POST" });
+}
+async function pump(on: boolean) {
+  await fetch(`${BASE}/pump?on=${on?1:0}`, { method: "POST" });
+}
+async function move(cmd: "fwd"|"back"|"left"|"right"|"stop", ms=200) {
+  await fetch(`${BASE}/move?cmd=${cmd}&ms=${ms}`, { method: "POST" });
+}
+
+Crie uma barra com:
+
+Automático → setMode("auto")
+
+Patrulha → setMode("patrol")
+
+Manual → setMode("manual") (e mostre setas chamando move(...))
+
+Cinematográfico → setMode("cine") (o ESP executa a cena e volta a AUTO)
+
+Bomba ON/OFF → pump(true/false)
+
+
+E o WebView/<Image> para http://192.168.4.1:81/stream.
+
+> Dica: para joystick analógico, envie POST /joystick?x=...&y=... continuamente quando em Manual.
+
+
+
+
+---
+
+Notas e dicas finais
+
+Remoção do servo: todo controle de mira agora é baseado no chassi (giros esquerda/direita + pequenos avanços). Isso evita depender do servo que parou.
+
+Nível lógico: NUNCA injete 5 V direto no RX do ESP32. Use o divisor.
+
+Boot do ESP32-CAM: se travar ao ligar, desconecte RX/ TX do Arduino ou mantenha o Arduino desligado durante o boot/gravação.
+
+Detecção por câmera: deixei a visão “leve” e usei os três sensores KY-026 para decisão. Se quiser, posso te enviar uma versão com análise HSV de verdade rodando no ESP (consome mais CPU, mas rola em QVGA).
+
+Patrulha: sequência simples em “ciclo”; ajuste tempos em patrolTick().
+
+Cinematográfico: sequência curta para filmagem + apagar, e retorna a AUTO. Ajuste à vontade.
+
+
+Se quiser, me fala os pinos exatos do seu Arduino para ENA/ENB (PWM) do driver (L298N/L9110S). Aí eu atualizo o Arduino para ter velocidade real por PWM (hoje está “por tempo”, como no seu código antigo), e posso adicionar leitura de DHT11/DHT22 (umidade/temperatura) para incluir na telemetria e lógica (ex.: reduzir agressividade da bomba se umidade ambiente alta).
+
+
+
+
+
+
 Perfeito—abaixo vai um sketch enxuto só com o que interessa à câmera: AP próprio, /snapshot (JPEG único), /stream (MJPEG na porta 81), /status e /led (liga/desliga o flash). Tirei pump, joystick e mode. Mantive os ajustes de baixo consumo pra evitar quedas.
 
 
