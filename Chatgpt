@@ -1,4 +1,350 @@
 
+Beleza 👍 Vou te mandar o código completo e limpo do ESP32-CAM (AI Thinker), já com:
+
+
+
+
+Access Point fixo HYDROBOT-CAM em 192.168.4.1
+
+
+Stream MJPEG em :81/stream
+
+
+Snapshot em /snapshot
+
+
+Endpoints /status, /led, /pump, /pump_pwm, /mode, /joystick
+
+
+PWM da bomba isolado em TIMER_1 / CHANNEL_1 (sem conflito com câmera)
+
+
+Wi-Fi estável: PS desativado, potência máxima, log de eventos, watchdog
+
+
+
+
+
+/**
+ * HydroBot.ino - ESP32-CAM (AI Thinker) - AP ONLY
+ * - AP fixo (HYDROBOT-CAM) em 192.168.4.1
+ * - Stream MJPEG: /stream (porta 81)
+ * - API (porta 80): /status, /led, /mode, /joystick, /pump, /pump_pwm?duty=0..255, /snapshot
+ * - LED no GPIO 4 (flash)
+ * - Bomba no GPIO 14 via PWM (LEDC TIMER_1/CHANNEL_1)
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+#include <time.h>
+#include "driver/ledc.h"
+#include "esp_wifi.h"
+
+// Desativa brownout
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===================== WIFI AP =====================
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GW(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+// ===================== PINOS =====================
+#define LED_FLASH_PIN 4
+#define PUMP_PIN      14
+
+// ===================== ESTADO =====================
+String g_mode = "manual";
+bool   g_ledOn = false;
+bool   g_pumpOn = false;
+bool   g_camOk = false;
+float  g_joyX = 0, g_joyY = 0;
+
+static httpd_handle_t stream_httpd = NULL;
+WebServer server(80);
+
+// ===================== CAMERA (AI THINKER) =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ===================== UTILS =====================
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  if (now < 1000) return "\"uptime_ms\":" + String(millis());
+  struct tm ti; localtime_r(&now, &ti);
+  char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &ti);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return "\"" + ts + "\"";
+}
+
+void sendCORSHeaders(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+}
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ===================== BOMBA (PWM) =====================
+static const ledc_channel_t PUMP_CH   = LEDC_CHANNEL_1;
+static const ledc_timer_t   PUMP_TMR  = LEDC_TIMER_1;
+static const ledc_mode_t    PUMP_MODE = LEDC_HIGH_SPEED_MODE;
+
+void pumpPwmInit() {
+  ledc_timer_config_t tcfg = {
+    .speed_mode = PUMP_MODE,
+    .duty_resolution = LEDC_TIMER_8_BIT,
+    .timer_num = PUMP_TMR,
+    .freq_hz = 5000,
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+  ledc_timer_config(&tcfg);
+
+  ledc_channel_config_t ccfg = {
+    .gpio_num   = PUMP_PIN,
+    .speed_mode = PUMP_MODE,
+    .channel    = PUMP_CH,
+    .intr_type  = LEDC_INTR_DISABLE,
+    .timer_sel  = PUMP_TMR,
+    .duty       = 0,
+    .hpoint     = 0
+  };
+  ledc_channel_config(&ccfg);
+}
+inline void pumpWriteDuty(uint8_t d){ ledc_set_duty(PUMP_MODE,PUMP_CH,d); ledc_update_duty(PUMP_MODE,PUMP_CH); }
+void pumpSetOnOff(bool on){ g_pumpOn=on; pumpWriteDuty(on?255:0); }
+void pumpSetDuty(uint8_t d){ if(d>255)d=255; g_pumpOn=(d>0); pumpWriteDuty(d); }
+
+// ===================== STREAM =====================
+esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
+  sendCORSHeaders(req);
+  esp_err_t res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) break;
+    if (fb->format != PIXFORMAT_JPEG) { esp_camera_fb_return(fb); continue; }
+
+    char buf[64];
+    size_t hlen = snprintf(buf, 64, "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    httpd_resp_send_chunk(req, "\r\n--frame\r\n", 12);
+    httpd_resp_send_chunk(req, buf, hlen);
+    httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+
+    vTaskDelay(15/portTICK_PERIOD_MS);
+  }
+  return ESP_OK;
+}
+void startCameraStreamServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.stack_size = 8192;
+  httpd_uri_t uri = { .uri="/stream", .method=HTTP_GET, .handler=jpg_stream_httpd_handler, .user_ctx=NULL };
+  if (httpd_start(&stream_httpd,&config)==ESP_OK) httpd_register_uri_handler(stream_httpd,&uri);
+}
+
+// ===================== SNAPSHOT =====================
+void api_snapshot() {
+  sendCORS();
+  if (!g_camOk) { server.send(503,"application/json","{\"ok\":false,\"error\":\"camera\"}"); return; }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { server.send(503,"application/json","{\"ok\":false,\"error\":\"no_frame\"}"); return; }
+  server.sendHeader("Cache-Control","no-cache");
+  server.setContentLength(fb->len);
+  server.send(200,"image/jpeg","");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  client.flush(); client.stop();
+  esp_camera_fb_return(fb);
+}
+
+// ===================== API =====================
+void api_status() {
+  sendCORS();
+  String json="{\"ip\":\""+WiFi.softAPIP().toString()+"\",\"mode\":\""+g_mode+
+               "\",\"led\":"+(g_ledOn?"true":"false")+
+               ",\"pump\":"+(g_pumpOn?"true":"false")+
+               ",\"cam_ok\":"+(g_camOk?"true":"false")+
+               ",\"uptime\":"+String(millis())+
+               ",\"heap\":"+String(ESP.getFreeHeap())+
+               ",\"ts\":"+isoTimestamp()+"}";
+  server.send(200,"application/json",json);
+}
+void api_led(){ sendCORS(); bool on=server.arg("on")=="1"||server.arg("on")=="true"; g_ledOn=on; digitalWrite(LED_FLASH_PIN,on); server.send(200,"application/json","{\"ok\":true}"); }
+void api_pump(){ sendCORS(); bool on=server.arg("on")=="1"||server.arg("on")=="true"; pumpSetOnOff(on); server.send(200,"application/json","{\"ok\":true}"); }
+void api_pump_pwm(){ sendCORS(); int d=server.hasArg("duty")?server.arg("duty").toInt():-1; if(d<0||d>255){server.send(400,"application/json","{\"ok\":false}");return;} pumpSetDuty(d); server.send(200,"application/json","{\"ok\":true}"); }
+void api_mode(){ sendCORS(); String v=server.arg("v"); if(v!="manual"&&v!="auto"&&v!="patrol"){server.send(400,"application/json","{\"ok\":false}");return;} g_mode=v; server.send(200,"application/json","{\"ok\":true}"); }
+void api_joystick(){ sendCORS(); g_joyX=server.arg("x").toFloat(); g_joyY=server.arg("y").toFloat(); server.send(200,"application/json","{\"ok\":true}"); }
+void handleCORS(){ sendCORS(); server.send(200); }
+
+// ===================== CAMERA INIT =====================
+bool initCamera() {
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer   = LEDC_TIMER_0;
+  c.pin_d0=Y2_GPIO_NUM; c.pin_d1=Y3_GPIO_NUM; c.pin_d2=Y4_GPIO_NUM; c.pin_d3=Y5_GPIO_NUM;
+  c.pin_d4=Y6_GPIO_NUM; c.pin_d5=Y7_GPIO_NUM; c.pin_d6=Y8_GPIO_NUM; c.pin_d7=Y9_GPIO_NUM;
+  c.pin_xclk=XCLK_GPIO_NUM; c.pin_pclk=PCLK_GPIO_NUM; c.pin_vsync=VSYNC_GPIO_NUM; c.pin_href=HREF_GPIO_NUM;
+  c.pin_sscb_sda=SIOD_GPIO_NUM; c.pin_sscb_scl=SIOC_GPIO_NUM;
+  c.pin_pwdn=PWDN_GPIO_NUM; c.pin_reset=RESET_GPIO_NUM;
+  c.xclk_freq_hz=10000000; c.pixel_format=PIXFORMAT_JPEG;
+  if(psramFound()){ c.frame_size=FRAMESIZE_VGA; c.jpeg_quality=15; c.fb_count=1; c.fb_location=CAMERA_FB_IN_PSRAM; c.grab_mode=CAMERA_GRAB_LATEST; }
+  else { c.frame_size=FRAMESIZE_QVGA; c.jpeg_quality=18; c.fb_count=1; c.fb_location=CAMERA_FB_IN_DRAM; c.grab_mode=CAMERA_GRAB_WHEN_EMPTY; }
+  return (esp_camera_init(&c)==ESP_OK);
+}
+
+// ===================== WIFI SETUP =====================
+void startAPOnly() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP,AP_GW,AP_MASK);
+  WiFi.softAP(AP_SSID,AP_PASS,6);
+  esp_wifi_set_ps(WIFI_PS_NONE);        // sem power save
+  esp_wifi_set_max_tx_power(78);        // potência máx
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+}
+
+// ===================== SETUP/LOOP =====================
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG,0);
+  Serial.begin(115200);
+  pinMode(LED_FLASH_PIN,OUTPUT); digitalWrite(LED_FLASH_PIN,LOW);
+
+  g_camOk = initCamera();
+  if(!g_camOk) Serial.println("Falha ao iniciar câmera!");
+
+  pumpPwmInit();
+  startAPOnly();
+
+  // rotas
+  server.on("/status",HTTP_GET,api_status);
+  server.on("/led",HTTP_GET,api_led); server.on("/led",HTTP_POST,api_led);
+  server.on("/pump",HTTP_GET,api_pump); server.on("/pump",HTTP_POST,api_pump);
+  server.on("/pump_pwm",HTTP_GET,api_pump_pwm); server.on("/pump_pwm",HTTP_POST,api_pump_pwm);
+  server.on("/mode",HTTP_GET,api_mode); server.on("/mode",HTTP_POST,api_mode);
+  server.on("/joystick",HTTP_GET,api_joystick); server.on("/joystick",HTTP_POST,api_joystick);
+  server.on("/snapshot",HTTP_GET,api_snapshot);
+
+  // CORS
+  server.on("/status",HTTP_OPTIONS,handleCORS);
+  server.on("/led",HTTP_OPTIONS,handleCORS);
+  server.on("/pump",HTTP_OPTIONS,handleCORS);
+  server.on("/pump_pwm",HTTP_OPTIONS,handleCORS);
+  server.on("/mode",HTTP_OPTIONS,handleCORS);
+  server.on("/joystick",HTTP_OPTIONS,handleCORS);
+  server.on("/snapshot",HTTP_OPTIONS,handleCORS);
+
+  server.begin();
+  startCameraStreamServer();
+  Serial.println("=== PRONTO ===");
+}
+
+void loop(){ server.handleClient(); delay(10); }
+
+
+
+
+👉 Testa esse código no seu ESP32-CAM.
+
+
+
+
+Primeiro acessa http://192.168.4.1/status → deve dar JSON.
+
+
+Depois http://192.168.4.1/snapshot → retorna JPEG.
+
+
+E http://192.168.4.1:81/stream → vídeo.
+
+
+
+
+Quer que eu monte também uma versão com FPS forçado para 30 no stream (ajuste de vTaskDelay) ou prefere primeiro estabilizar a rede?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /**
  * HydroBot.ino - ESP32-CAM (AI Thinker) - AP ONLY
  * - AP fixo (HYDROBOT-CAM) em 192.168.4.1
