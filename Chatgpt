@@ -1,4 +1,469 @@
 
+Isso é clássico de ESP32-CAM “surtando” quando a cena gera JPEGs grandes: mais detalhes/luz = frames maiores = pico de PSRAM/CPU → brownout ou watchdog → reboot. Tapar a lente simplifica a cena, os JPEGs ficam pequenos e o crash some — confirma a causa.
+
+
+A correção mais eficaz é reduzir agressivamente a carga de captura e adaptar em tempo real quando os JPEGs começarem a crescer. Abaixo vai um sketch completo (AP-only, apenas /snapshot e /status), baseado no seu último, com:
+
+
+O que mudei (focado em estabilidade):
+
+
+
+
+Frame menor por padrão: FRAMESIZE_QVGA (320×240).
+
+
+JPEG mais comprimido: jpeg_quality = 24 (número maior = mais compressão).
+
+
+Apenas 1 frame buffer: fb_count = 1, grab_mode = CAMERA_GRAB_WHEN_EMPTY.
+
+
+XCLK já baixo: 10 MHz (mantive).
+
+
+Tuning do sensor para cenas claras: aec2=1, ae_level=-2, brightness=-1, saturation=-1 (reduz exposição e “estouro”).
+
+
+Throttle no /snapshot: rejeita sobrecarga concorrente e aplica “sleep” curto.
+
+
+Auto-downshift: se 3 JPEGs seguidos > 85 KB → cai para QQVGA (160×120). Se estabilizar (10 JPEGs < 45 KB), volta para QVGA.
+
+
+Sem LED, sem bomba, sem joystick (como você pediu antes).
+
+
+
+
+Copie e grave esse código:
+
+
+/**
+ * HydroBot_cam_stable.ino – ESP32-CAM (AI Thinker) – AP ONLY, snapshot-only
+ * Foco: máxima estabilidade quando a cena é “pesada”.
+ * - AP: SSID HYDROBOT-CAM (192.168.4.1)
+ * - Endpoints: /status (JSON), /snapshot (image/jpeg)
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+
+// Desativa brownout (importante em fontes “fracas”)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+/* ===================== WIFI AP ===================== */
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GW(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+/* ===================== PINOS (AI Thinker) ===================== */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* ===================== ESTADO ===================== */
+WebServer server(80);
+bool g_camOk = false;
+
+// Proteções de /snapshot
+volatile bool g_snapshotBusy = false;
+unsigned long g_lastShotMs = 0;
+
+// Adaptativo de tamanho
+int g_curFramesize = FRAMESIZE_QVGA; // começa em 320x240
+int g_consecBig = 0;
+int g_consecSmall = 0;
+
+/* ===================== UTILS ===================== */
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  if (now < 3600) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "\"uptime_ms\":%lu", millis());
+    return String("{") + buf + "}";
+  }
+  struct tm t; localtime_r(&now, &t);
+  char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &t);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return "\"" + ts + "\"";
+}
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+/* ===================== CAMERA ===================== */
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;   // XCLK em TIMER_0/CH_0
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 10000000;         // 10 MHz (mais estável/menos consumo)
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Modo “econômico” e com menos pressão de PSRAM
+  config.frame_size   = (framesize_t)g_curFramesize; // começa em QVGA
+  config.jpeg_quality = 24;                // mais compressão => menor JPEG
+  config.fb_count     = 1;                 // 1 buffer
+  config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+
+  // Tuning do sensor para evitar estouro em cenas claras (reduz reboot)
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, (framesize_t)g_curFramesize); // reforça QVGA
+    s->set_quality(s, 24);
+    s->set_brightness(s, -1); // -2..2
+    s->set_saturation(s, -1); // -2..2
+    s->set_contrast(s, 0);
+    s->set_aec2(s, 1);        // AEC mais estável
+    s->set_ae_level(s, -2);   // puxa exposição para baixo
+    s->set_gain_ctrl(s, 1);   // AGC on
+    s->set_awb_gain(s, 1);    // AWB gain on
+    // Evita resoluções grandes por acidente
+    // s->set_framesize(s, FRAMESIZE_QQVGA); // descomente para testar 160x120 direto
+  }
+  return true;
+}
+
+void maybeAdjustFramesize(size_t jpegLen) {
+  // Se JPEGs seguidos forem grandes -> reduz framesize para QQVGA
+  // Se ficarem pequenos por bastante tempo -> volta a QVGA
+  const size_t BIG_TH   = 85 * 1024; // ~85 KB
+  const size_t SMALL_TH = 45 * 1024; // ~45 KB
+
+  if (jpegLen >= BIG_TH) {
+    g_consecBig++;
+    g_consecSmall = 0;
+  } else if (jpegLen <= SMALL_TH) {
+    g_consecSmall++;
+    if (g_consecBig > 0) g_consecBig--;
+  } else {
+    // zona neutra
+    if (g_consecBig > 0) g_consecBig--;
+    if (g_consecSmall > 0) g_consecSmall--;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+
+  // Downshift agressivo
+  if (g_curFramesize == FRAMESIZE_QVGA && g_consecBig >= 3) {
+    Serial.println("[auto] JPEGs grandes: caindo para QQVGA");
+    g_curFramesize = FRAMESIZE_QQVGA; // 160x120
+    s->set_framesize(s, (framesize_t)g_curFramesize);
+    s->set_quality(s, 26);            // ainda mais compressão
+    g_consecBig = 0; g_consecSmall = 0;
+  }
+
+  // Upshift cuidadoso
+  if (g_curFramesize == FRAMESIZE_QQVGA && g_consecSmall >= 10) {
+    Serial.println("[auto] JPEGs pequenos: voltando para QVGA");
+    g_curFramesize = FRAMESIZE_QVGA;  // 320x240
+    s->set_framesize(s, (framesize_t)g_curFramesize);
+    s->set_quality(s, 24);
+    g_consecBig = 0; g_consecSmall = 0;
+  }
+}
+
+/* ===================== HTTP ===================== */
+void handle_status() {
+  sendCORS();
+  String ts = isoTimestamp();
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"cam_ok\":" + String(g_camOk ? "true":"false") + ",";
+  json += "\"framesize\":" + String(g_curFramesize) + ",";
+  json += "\"ts\":" + ts;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handle_snapshot() {
+  if (!g_camOk) {
+    sendCORS();
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"camera_unavailable\"}");
+    return;
+  }
+  // Throttle simples: evita concorrência e explosões de taxa
+  if (g_snapshotBusy) {
+    delay(12);
+    // se ainda estiver ocupado, retorna 429 para o cliente recuar
+    if (g_snapshotBusy) {
+      sendCORS();
+      server.send(429, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+      return;
+    }
+  }
+  g_snapshotBusy = true;
+
+  // Espaçamento mínimo entre capturas (reduz pico)
+  unsigned long now = millis();
+  if (now - g_lastShotMs < 30) delay(30 - (now - g_lastShotMs));
+  g_lastShotMs = millis();
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    g_snapshotBusy = false;
+    sendCORS();
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}");
+    return;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    esp_camera_fb_return(fb);
+    g_snapshotBusy = false;
+    sendCORS();
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
+    return;
+  }
+
+  // Ajuste adaptativo baseado no tamanho real do JPEG
+  maybeAdjustFramesize(fb->len);
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  g_snapshotBusy = false;
+}
+
+void handle_options() {
+  sendCORS();
+  server.send(200);
+}
+
+/* ===================== SETUP / LOOP ===================== */
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+  WiFi.softAP(AP_SSID, AP_PASS, 6);
+  WiFi.setSleep(false); // estabilidade do AP
+  delay(150);
+  Serial.println("AP up:");
+  Serial.print(" SSID: "); Serial.println(AP_SSID);
+  Serial.print(" PASS: "); Serial.println(AP_PASS);
+  Serial.print(" IP:   "); Serial.println(WiFi.softAPIP());
+}
+
+void setupNTP() { configTime(-3*3600, 0, "pool.ntp.org", "time.nist.gov"); }
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  Serial.println("\n=== HydroBot CAM – snapshot-only (stability mode) ===");
+
+  g_camOk = initCamera();
+  if (!g_camOk) Serial.println("Camera FAIL (seguindo sem camera)");
+
+  startAP();
+  setupNTP();
+
+  server.on("/status",   HTTP_GET, handle_status);
+  server.on("/snapshot", HTTP_GET, handle_snapshot);
+
+  server.on("/status",   HTTP_OPTIONS, handle_options);
+  server.on("/snapshot", HTTP_OPTIONS, handle_options);
+
+  server.begin();
+  Serial.println("HTTP :80 pronto");
+}
+
+void loop() {
+  server.handleClient();
+  delay(5); // cooperar com WiFi/task
+}
+
+
+
+Como isso resolve seu caso
+
+
+
+
+Cena complexa → JPEG grande: o código percebe 3 capturas seguidas > 85 KB e automaticamente derruba para 160×120 com mais compressão; quando “acalmar”, volta para 320×240.
+
+
+Menos buffers + taxa limitada: 1 FB, WHEN_EMPTY e pequenos espera/lock no /snapshot evitam corridas e picos.
+
+
+Exposição mais baixa evita estouro de brilho que também inflaria o JPEG.
+
+
+XCLK a 10 MHz reduz consumo e timing crítico.
+
+
+
+
+Se ainda resetar em ambientes muito claros/ricos, teste por alguns minutos com:
+
+
+
+
+FRAMESIZE_QQVGA fixo (descomente onde indiquei)
+
+
+aumentar jpeg_quality para 26–28
+
+
+iluminação: evitar apontar para sol/janelas (o sensor OV2640 sofre com isso)
+
+
+
+
+Diga se quer que eu ajuste o app para mostrar “qualidade atual” (QVGAvsQQVGA) vinda de /status — dá para pintar um badge na tela.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Segue o server_heuristic.py completo já adaptado para snapshot-only (puxa http://192.168.4.1/snapshot em loop), mantendo todo o resto (detector de fogo, objetos, endpoints) igual ao seu fluxo atual. É “drop-in”: substitua seu arquivo por este.
 
 
