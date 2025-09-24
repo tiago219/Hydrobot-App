@@ -1,4 +1,361 @@
 
+Perfeito—abaixo vai um sketch enxuto só com o que interessa à câmera: AP próprio, /snapshot (JPEG único), /stream (MJPEG na porta 81), /status e /led (liga/desliga o flash). Tirei pump, joystick e mode. Mantive os ajustes de baixo consumo pra evitar quedas.
+
+
+/**
+ * HydroBot-CAM (AI Thinker) — AP ONLY (somente câmera)
+ * Rotas (porta 80): /          (home simples)
+ *                    /status   (json)
+ *                    /led?on=0|1
+ *                    /snapshot (image/jpeg)
+ * Stream (porta 81): /stream   (multipart MJPEG)
+ *
+ * Ajustes de estabilidade/consumo:
+ *  - CPU 160 MHz
+ *  - WiFi AP com tx power reduzido e sleep ligado
+ *  - Câmera leve: QVGA, xclk 10 MHz, jpeg_quality 20, fb_count = 1
+ *  - Stream com leve pausa (≈15fps) pra reduzir pico
+ */
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+#include <time.h>
+
+// Desativa brownout (queda de tensão costuma disparar isso)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===================== WIFI AP =====================
+const char* AP_SSID = "HYDROBOT-CAM";
+const char* AP_PASS = "12345678";
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GW(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
+// ===================== PINOS =====================
+#define LED_FLASH_PIN 4
+
+// ===================== ESTADO =====================
+bool   g_ledOn = false;
+bool   g_camOk = false;
+
+static httpd_handle_t stream_httpd = NULL;
+WebServer server(80);
+
+// ===================== CAMERA (AI THINKER) =====================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ===================== UTILS =====================
+static inline void setCORS(httpd_req_t *req){
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+}
+static inline void setCORS_Web(){
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+String isoTimestamp() {
+  time_t now = time(nullptr);
+  if (now < 8 * 3600 * 2) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "\"uptime_ms\":%lu", millis());
+    return String("{") + buf + "}";
+  }
+  struct tm ti; localtime_r(&now, &ti);
+  char buf[64]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &ti);
+  String ts(buf);
+  if (ts.length() >= 5) ts = ts.substring(0, ts.length()-2) + ":" + ts.substring(ts.length()-2);
+  return "\"" + ts + "\"";
+}
+
+// ===================== STREAM (:81/stream) =====================
+static const char* STREAM_CT   = "multipart/x-mixed-replace;boundary=frame";
+static const char* STREAM_BND  = "\r\n--frame\r\n";
+static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
+  setCORS(req);
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CT);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+    if (fb->format != PIXFORMAT_JPEG) { esp_camera_fb_return(fb); vTaskDelay(20/portTICK_PERIOD_MS); continue; }
+
+    res = httpd_resp_send_chunk(req, STREAM_BND, strlen(STREAM_BND));
+    if (res == ESP_OK) {
+      char part[64];
+      size_t hlen = snprintf(part, sizeof(part), STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, part, hlen);
+    }
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+
+    // ~15 fps para reduzir pico de consumo
+    vTaskDelay(65 / portTICK_PERIOD_MS);
+  }
+  return res;
+}
+
+void startStreamServer() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 81;
+  cfg.ctrl_port   = 32768;
+  cfg.max_open_sockets = 2;
+  cfg.task_priority    = 4;
+
+  httpd_uri_t uri = { .uri="/stream", .method=HTTP_GET, .handler=jpg_stream_httpd_handler, .user_ctx=NULL };
+  if (httpd_start(&stream_httpd, &cfg) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &uri);
+    Serial.println("Stream em :81/stream");
+  }
+}
+
+// ===================== HOME HTML (teste) =====================
+const char* HOME_HTML =
+  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<style>body{background:#111;color:#eee;font-family:sans-serif;margin:20px}"
+  "a,button{background:#e53b2f;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;margin-right:8px}"
+  "#img{display:block;margin-top:12px;max-width:100%;height:auto;background:#000}</style>"
+  "<h2>HydroBot CAM</h2>"
+  "<div>"
+    "<a href='/snapshot'>Snapshot</a>"
+    "<a href='http://192.168.4.1:81/stream'>Stream</a>"
+    "<button onclick='reload()'>Recarregar</button>"
+  "</div>"
+  "<img id=img src='/snapshot'>"
+  "<script>function reload(){document.getElementById('img').src='/snapshot?ts='+Date.now()}</script>";
+
+// ===================== API (porta 80) =====================
+void api_status() {
+  setCORS_Web();
+  String ts = isoTimestamp();
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"led\":" + String(g_ledOn ? "true":"false") + ",";
+  json += "\"cam_ok\":" + String(g_camOk ? "true":"false") + ",";
+  json += "\"uptime\":" + String(millis()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"ts\":" + ts;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void api_led() {
+  setCORS_Web();
+  g_ledOn = server.arg("on") == "1" || server.arg("on") == "true";
+  digitalWrite(LED_FLASH_PIN, g_ledOn ? HIGH : LOW);
+  server.send(200, "application/json", String("{\"ok\":true,\"led\":") + (g_ledOn?"true":"false") + "}");
+}
+
+void handleCORS() { setCORS_Web(); server.send(200); }
+
+// ===== /snapshot (JPEG único) =====
+void api_snapshot() {
+  setCORS_Web();
+  if (!g_camOk) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"camera_unavailable\"}"); return; }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"no_frame\"}"); return; }
+  if (fb->format != PIXFORMAT_JPEG) { esp_camera_fb_return(fb); server.send(500, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}"); return; }
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// ===================== SETUP =====================
+void setupNTP() { configTime(-3*3600, 0, "pool.ntp.org", "time.nist.gov"); }
+
+bool initCamera() {
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0;   // XCLK em TIMER_0/CH0
+  c.ledc_timer   = LEDC_TIMER_0;
+  c.pin_d0 = Y2_GPIO_NUM;  c.pin_d1 = Y3_GPIO_NUM;  c.pin_d2 = Y4_GPIO_NUM;  c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM;  c.pin_d5 = Y7_GPIO_NUM;  c.pin_d6 = Y8_GPIO_NUM;  c.pin_d7 = Y9_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM; c.pin_pclk = PCLK_GPIO_NUM; c.pin_vsync = VSYNC_GPIO_NUM; c.pin_href = HREF_GPIO_NUM;
+  c.pin_sscb_sda = SIOD_GPIO_NUM; c.pin_sscb_scl = SIOC_GPIO_NUM; c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
+
+  c.xclk_freq_hz = 10000000;         // 10 MHz -> mais estável e econômico
+  c.pixel_format = PIXFORMAT_JPEG;
+  c.frame_size   = FRAMESIZE_QVGA;   // 320x240
+  c.jpeg_quality = 20;               // mais compressão
+  c.fb_count     = 1;                // 1 buffer
+  c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  c.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&c);
+  if (err != ESP_OK) { Serial.printf("Camera init failed: 0x%x\n", err); return false; }
+  return true;
+}
+
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+  WiFi.softAP(AP_SSID, AP_PASS, 6);
+  WiFi.setSleep(true);                    // economia
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);     // pode subir para 11 dBm se sinal fraco
+  delay(200);
+  Serial.println("AP iniciado:");
+  Serial.print(" SSID: "); Serial.println(AP_SSID);
+  Serial.print(" PASS: "); Serial.println(AP_PASS);
+  Serial.print(" IP: ");   Serial.println(WiFi.softAPIP());
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  setCpuFrequencyMhz(160);    // ↓ consumo
+  Serial.begin(115200);
+  Serial.println("\n=== HYDROBOT CAM (AP ONLY / CAMERA ONLY) ===");
+
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  digitalWrite(LED_FLASH_PIN, LOW);
+
+  g_camOk = initCamera();
+  if (!g_camOk) Serial.println("Camera FAIL (seguindo sem camera)");
+
+  startAP();
+  setupNTP();
+
+  // Rotas HTTP (porta 80)
+  server.on("/",        HTTP_GET, [](){ setCORS_Web(); server.send(200, "text/html", HOME_HTML); });
+  server.on("/status",  HTTP_GET, api_status);
+  server.on("/led",     HTTP_GET, api_led);
+  server.on("/led",     HTTP_POST, api_led);
+  server.on("/snapshot",HTTP_GET, api_snapshot);
+
+  // CORS preflight
+  server.on("/status",   HTTP_OPTIONS, handleCORS);
+  server.on("/led",      HTTP_OPTIONS, handleCORS);
+  server.on("/snapshot", HTTP_OPTIONS, handleCORS);
+
+  server.begin();
+  Serial.println("HTTP :80 pronto");
+  startStreamServer();
+  Serial.println("=== PRONTO ===");
+}
+
+void loop() {
+  server.handleClient();
+  delay(10);
+}
+
+
+
+Se quiser ainda mais estabilidade com sua fonte/cabo, você pode:
+
+
+
+
+trocar WIFI_POWER_8_5dBm por WIFI_POWER_11dBm somente se o sinal estiver fraco;
+
+
+manter o flash (/led?on=1) desligado quase o tempo todo (ele consome bem);
+
+
+se ainda cair, teste jpeg_quality = 22 e vTaskDelay(80) no stream (≈12 fps).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito 👌. Vou te mandar o código correto e completo pronto para abrir diretamente no Arduino IDE como um único arquivo .ino.
 
 
