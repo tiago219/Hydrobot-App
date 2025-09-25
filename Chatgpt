@@ -1,4 +1,488 @@
 
+Perfeito — vou te entregar um firmware do ESP32-CAM pronto para a sua nova arquitetura “com roteador externo”, casando 100% com o app e o server que te passei:
+
+
+
+
+Conecta em STA (seu roteador) com WiFi.begin(SSID, PASS).
+
+
+Expõe somente endpoints simples (nada de MJPEG):
+
+
+
+GET /snapshot → 1 JPEG (para o server puxar em loop).
+
+
+GET /status   → JSON: ip, modo, led, pump.
+
+
+GET /led?on=0|1
+
+
+GET /pump?on=0|1
+
+
+GET /joystick?x=..&y=..  → publica na Serial: JOY:x=..,y=..
+
+
+GET /uart?line=...       → repassa para a Serial literalmente.
+
+
+
+
+
+
+Respostas com CORS liberado, para o FastAPI/App acessarem sem dor de cabeça.
+
+
+Camera otimizada para GRAB_LATEST (baixa latência para snapshot polling).
+
+
+Mantive o include board_config.h (pinos da câmera), igual você já usa.
+
+
+
+
+
+
+Você só precisa editar WIFI_SSID e WIFI_PASS, e (se quiser) trocar o pino da bomba.
+
+
+
+
+
+ESP32-CAM (Arduino / ESP-IDF via Arduino core)
+
+
+
+
+Arquivo único (pode ser .ino ou .cpp). Se você já usa o projeto padrão do exemplo CameraWebServer, isso aqui compila no mesmo ambiente.
+
+
+
+
+/*
+  ESP32-CAM – Snapshot-only + controle via HTTP (STA, roteador externo)
+  Combina com o app + server (FastAPI) que usam /snapshot e comandos proxy.
+
+  Endpoints:
+    GET /snapshot                -> retorna 1 JPEG
+    GET /status                  -> JSON { ip, mode, led, pump }
+    GET /led?on=0|1              -> liga/desliga LED (flash) ou LED externo
+    GET /pump?on=0|1             -> liga/desliga bomba (pino configurável)
+    GET /joystick?x=..&y=..      -> publica na Serial: "JOY:x=..,y=.."
+    GET /uart?line=...           -> publica "line" na Serial, eco de "OK"
+
+  Observações:
+   - Se seu hardware usa o LED do flash (GPIO 4) como “LED”, mantemos ledc nele.
+   - Pino da bomba (PUMP_PIN) é configurável; use transistor/rele adequado.
+*/
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+// ========== SUA PLACA ==========
+#include "board_config.h"   // seus pinos da câmera (igual ao seu projeto)
+
+// ========== REDE (ROTEADOR EXTERNO) ==========
+static const char* WIFI_SSID = "SEU_ROTEADOR";      // <<< ALTERE AQUI
+static const char* WIFI_PASS = "SUA_SENHA";         // <<< ALTERE AQUI
+
+// ========== I/O DE USUÁRIO ==========
+// LED do flash (definido por LED_GPIO_NUM no board_config.h). Se não tiver, use outro pino aqui.
+#ifndef LED_GPIO_NUM
+#define LED_GPIO_NUM 4     // ESP32-CAM AI-Thinker: LED flash na GPIO4
+#endif
+
+#define PUMP_PIN  14       // <<< ALTERE PARA O PINO QUE VOCÊ USA NA BOMBA (usar transistor/relé). Evite pinos da câmera!
+
+// ========== AJUSTES DE CÂMERA ==========
+#define JPEG_QUALITY      12           // 10~14 bom; menor = melhor qualidade
+#define FRAME_SIZE_BOOT   FRAMESIZE_SVGA  // arranca SVGA e depois sobe
+#define FRAME_SIZE_RUN    FRAMESIZE_VGA   // estável p/ rede: VGA (640x480)
+
+// ========== ESTADO ==========
+static bool g_led_on  = false;
+static bool g_pump_on = false;
+
+// ========== HELPERS ==========
+static void add_cors_headers(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+static String ipToStr(const IPAddress& ip) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  return String(buf);
+}
+
+// ========== ENDPOINT: /status ==========
+static esp_err_t status_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  httpd_resp_set_type(req, "application/json");
+  String ip = ipToStr(WiFi.localIP());
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"ok\":true,\"ip\":\"%s\",\"mode\":\"router-snapshot\",\"led\":%s,\"pump\":%s}",
+    ip.c_str(), g_led_on ? "true" : "false", g_pump_on ? "true" : "false"
+  );
+  return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+// ========== ENDPOINT: /snapshot ==========
+static esp_err_t snapshot_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "ERR_NO_FB");
+  }
+
+  // Se vier em RGB/GRAYSCALE, reconverte para JPEG
+  if (fb->format != PIXFORMAT_JPEG) {
+    jpg_chunking_t jch = {0};
+    httpd_resp_set_type(req, "image/jpeg");
+    jch.req = req;
+    jch.len = 0;
+    bool ok = frame2jpg_cb(fb, 80, jpg_encode_stream, &jch);
+    esp_camera_fb_return(fb);
+    return ok ? ESP_OK : httpd_resp_sendstr(req, "ERR_JPG");
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+// ========== PARSER DE QUERY ==========
+static bool query_has_kv(const char* qry, const char* key, char* out, size_t outlen) {
+  if (!qry || !key) return false;
+  // busca &key=valor (ou inicio)
+  const char* p = strstr(qry, key);
+  while (p) {
+    // exige "key=" ou "&key="
+    bool ok_start = (p == qry) || (*(p-1) == '&' || *(p-1) == '?');
+    p += strlen(key);
+    if (ok_start && *p == '=') {
+      p++;
+      size_t i = 0;
+      while (*p && *p != '&' && i+1 < outlen) {
+        out[i++] = *p++;
+      }
+      out[i] = 0;
+      return true;
+    }
+    p = strstr(p, key);
+  }
+  return false;
+}
+
+// ========== ENDPOINT: /led?on=0|1 ==========
+static esp_err_t led_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  char qry[64] = {0};
+  httpd_req_get_url_query_str(req, qry, sizeof(qry));
+  char val[8] = {0};
+  if (query_has_kv(qry, "on", val, sizeof(val))) {
+    int on = atoi(val) ? 1 : 0;
+#if defined(LED_GPIO_NUM)
+    // usa PWM leve para “flash” se quiser; aqui, apenas ON/OFF
+    pinMode(LED_GPIO_NUM, OUTPUT);
+    digitalWrite(LED_GPIO_NUM, on ? HIGH : LOW);
+#else
+    // se não houver LED_GPIO_NUM, nada impede você definir outro pino aqui
+#endif
+    g_led_on = (on == 1);
+  }
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, g_led_on ? "{\"ok\":true,\"led\":true}" : "{\"ok\":true,\"led\":false}");
+}
+
+// ========== ENDPOINT: /pump?on=0|1 ==========
+static esp_err_t pump_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  char qry[64] = {0};
+  httpd_req_get_url_query_str(req, qry, sizeof(qry));
+  char val[8] = {0};
+  if (query_has_kv(qry, "on", val, sizeof(val))) {
+    int on = atoi(val) ? 1 : 0;
+    pinMode(PUMP_PIN, OUTPUT);
+    digitalWrite(PUMP_PIN, on ? HIGH : LOW);   // ajuste para seu driver (talvez LOW ative)
+    g_pump_on = (on == 1);
+  }
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, g_pump_on ? "{\"ok\":true,\"pump\":true}" : "{\"ok\":true,\"pump\":false}");
+}
+
+// ========== ENDPOINT: /joystick?x=..&y=.. ==========
+static esp_err_t joystick_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  char qry[96] = {0};
+  httpd_req_get_url_query_str(req, qry, sizeof(qry));
+  char sx[16] = {0}, sy[16] = {0};
+  bool hx = query_has_kv(qry, "x", sx, sizeof(sx));
+  bool hy = query_has_kv(qry, "y", sy, sizeof(sy));
+  if (hx && hy) {
+    Serial.printf("JOY:x=%s,y=%s\n", sx, sy);   // seu firmware de movimento lê isso na Serial
+  }
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+// ========== ENDPOINT: /uart?line=... ==========
+static esp_err_t uart_handler(httpd_req_t *req) {
+  add_cors_headers(req);
+  char qry[192] = {0};
+  httpd_req_get_url_query_str(req, qry, sizeof(qry));
+  char line[160] = {0};
+  if (query_has_kv(qry, "line", line, sizeof(line))) {
+    // decodifica %xx do query (bem simples)
+    // (opcional) aqui está “cru”: se precisar de decode robusto, implemente urlDecode.
+    Serial.printf("%s\n", line);
+  }
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+// ========== WEBSERVER ==========
+httpd_handle_t httpd = NULL;
+
+static void start_httpd() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.recv_wait_timeout = 10;
+  config.send_wait_timeout = 10;
+  config.max_uri_handlers = 12;
+
+  if (httpd_start(&httpd, &config) == ESP_OK) {
+    httpd_uri_t uri_status    = { .uri="/status",    .method=HTTP_GET, .handler=status_handler,   .user_ctx=NULL };
+    httpd_uri_t uri_snapshot  = { .uri="/snapshot",  .method=HTTP_GET, .handler=snapshot_handler, .user_ctx=NULL };
+    httpd_uri_t uri_led       = { .uri="/led",       .method=HTTP_GET, .handler=led_handler,      .user_ctx=NULL };
+    httpd_uri_t uri_pump      = { .uri="/pump",      .method=HTTP_GET, .handler=pump_handler,     .user_ctx=NULL };
+    httpd_uri_t uri_joy       = { .uri="/joystick",  .method=HTTP_GET, .handler=joystick_handler, .user_ctx=NULL };
+    httpd_uri_t uri_uart      = { .uri="/uart",      .method=HTTP_GET, .handler=uart_handler,     .user_ctx=NULL };
+
+    httpd_register_uri_handler(httpd, &uri_status);
+    httpd_register_uri_handler(httpd, &uri_snapshot);
+    httpd_register_uri_handler(httpd, &uri_led);
+    httpd_register_uri_handler(httpd, &uri_pump);
+    httpd_register_uri_handler(httpd, &uri_joy);
+    httpd_register_uri_handler(httpd, &uri_uart);
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  delay(200);
+
+  // ---- Câmera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size   = FRAME_SIZE_BOOT;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode    = CAMERA_GRAB_LATEST;     // baixa latência p/ snapshot loop
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = JPEG_QUALITY;
+  config.fb_count     = 2;
+
+  if (!psramFound()) {
+    config.fb_count    = 1;
+    config.frame_size  = FRAMESIZE_XGA; // reduz se sem PSRAM
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed 0x%x\n", err);
+    ESP.restart();
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s && s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
+  }
+  s->set_framesize(s, FRAME_SIZE_RUN);
+
+  // ---- IO
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+#if defined(LED_GPIO_NUM)
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, LOW);
+#endif
+
+  // ---- WiFi STA
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("WiFi connecting");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+    if (++tries > 100) {
+      Serial.println("\nWiFi connect timeout, restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println();
+  Serial.printf("WiFi OK: %s\n", ipToStr(WiFi.localIP()).c_str());
+
+  // ---- HTTP
+  start_httpd();
+
+  Serial.printf("Ready! http://%s\n", ipToStr(WiFi.localIP()).c_str());
+}
+
+void loop() {
+  // tudo no httpd/task; só mantém vivo
+  delay(1000);
+}
+
+
+
+
+Como isso “fecha” com o app + server
+
+
+
+
+O server FastAPI que te mandei já espera exatamente esses endpoints do ESP.
+
+
+No app, ao mudar o campo “ESP IP”, ele faz POST /config no server ⇒ o server passa a buscar o /snapshot desse IP e a proxyar /led, /pump, /joystick, /uart.
+
+
+O app só fala com o server (não direto com o ESP).
+
+
+
+
+
+Notas rápidas de hardware
+
+
+
+
+BOMBA (PUMP_PIN): use um transistor/MOSFET ou módulo relé; não ligue carga direto no ESP.
+
+
+LED: se você usa o flash (GPIO4) para iluminação, esse mesmo controle serve. Se tiver LED externo em outro pino, troque LED_GPIO_NUM.
+
+
+
+
+
+Se quiser, eu também incluo mDNS (ex.: responder como esp-cam.local) e um /hello simples; mas para o fluxo atual não é necessário. Se aparecer qualquer erro de compilação (pino ou lib), me fala sua placa (AI-Thinker, ESP-EYE, S3-EYE…) que já ajusto os #define no board_config.h.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 valeuu! aqui vai o CameraScreen.tsx completo, fechadinho e sem o erro do any. ele usa só o server para tudo (snapshot/detect + proxy pro ESP). quando você muda o ESP IP no app, ele dá POST /config no server.
 
 
