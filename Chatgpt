@@ -1,4 +1,135 @@
 
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void handleStatus()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:142:13: error: unable to find string literal operator 'operator""ok' with 'const char [7]', 'unsigned int' arguments
+  142 | json += ""ok":true,";
+      |             ^~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:143:33: error: unable to find string literal operator 'operator""ip' with 'const char [18]', 'unsigned int' arguments
+  143 | json += ""ip":"" + localIP() + "",";
+      |                                 ^~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:144:15: error: inconsistent user-defined literal suffixes 'mode' and 'mjpeg' in string literal
+  144 | json += ""mode":"mjpeg-stream",";
+      |               ^~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:144:15: error: unable to find string literal operator 'operator""mode' with 'const char [2]', 'unsigned int' arguments
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:144:24: error: 'stream' was not declared in this scope; did you mean 'std::io_errc::stream'?
+  144 | json += ""mode":"mjpeg-stream",";
+      |                        ^~~~~~
+      |                        std::io_errc::stream
+In file included from C:/Users/yagohmz/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/xtensa-esp-elf/include/c++/14.2.0/ios:44,
+                 from C:/Users/yagohmz/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/xtensa-esp-elf/include/c++/14.2.0/ostream:40,
+                 from C:/Users/yagohmz/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/xtensa-esp-elf/include/c++/14.2.0/bits/unique_ptr.h:43,
+                 from C:/Users/yagohmz/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/xtensa-esp-elf/include/c++/14.2.0/memory:78,
+                 from C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\Network\src/NetworkClient.h:24,
+                 from C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\Network\src/Network.h:12,
+                 from C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\WiFi\src/WiFiGeneric.h:44,
+                 from C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\WiFi\src/WiFiSTA.h:30,
+                 from C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\WiFi\src/WiFi.h:34,
+                 from C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:18:
+C:/Users/yagohmz/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2411/xtensa-esp-elf/include/c++/14.2.0/bits/ios_base.h:225:24: note: 'std::io_errc::stream' declared here
+  225 |   enum class io_errc { stream = 1 };
+      |                        ^~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:145:14: error: unable to find string literal operator 'operator""led' with 'const char [2]', 'unsigned int' arguments
+  145 | json += ""led":" + String(ledOn ? "true":"false") + ",";
+      |              ^~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:146:15: error: unable to find string literal operator 'operator""pump' with 'const char [2]', 'unsigned int' arguments
+  146 | json += ""pump":" + String(pumpOn ? "true":"false");
+      |               ^~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void handleLed()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:158:50: error: inconsistent user-defined literal suffixes 'ok' and 'led' in string literal
+  158 | server.send(200, "application/json", String("{"ok":true,"led":") + (on?"true":"false") + "}");
+      |                                                  ^~~~~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:158:61: error: unable to find string literal operator 'operator""ok' with 'const char [9]', 'unsigned int' arguments
+  158 | server.send(200, "application/json", String("{"ok":true,"led":") + (on?"true":"false") + "}");
+      |                                                             ^~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void handlePump()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:167:50: error: inconsistent user-defined literal suffixes 'ok' and 'pump' in string literal
+  167 | server.send(200, "application/json", String("{"ok":true,"pump":") + (on?"true":"false") + "}");
+      |                                                  ^~~~~~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:167:62: error: unable to find string literal operator 'operator""ok' with 'const char [9]', 'unsigned int' arguments
+  167 | server.send(200, "application/json", String("{"ok":true,"pump":") + (on?"true":"false") + "}");
+      |                                                              ^~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void handleUART()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:173:43: error: inconsistent user-defined literal suffixes 'ok' and 'err' in string literal
+  173 | server.send(400, "application/json", "{"ok":false,"err":"missing line"}");
+      |                                           ^~~~~~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:173:55: error: unable to find string literal operator 'operator""ok' with 'const char [10]', 'unsigned int' arguments
+  173 | server.send(400, "application/json", "{"ok":false,"err":"missing line"}");
+      |                                                       ^~~~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:180:43: error: unable to find string literal operator 'operator""ok' with 'const char [8]', 'unsigned int' arguments
+  180 | server.send(200, "application/json", "{"ok":true}");
+      |                                           ^~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void handleJoystick()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:193:25: error: 'xx' was not declared in this scope; did you mean 'x'?
+  193 | const float mag = sqrtf(xx + yy);
+      |                         ^~
+      |                         x
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:193:30: error: 'yy' was not declared in this scope; did you mean 'y'?
+  193 | const float mag = sqrtf(xx + yy);
+      |                              ^~
+      |                              y
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:203:67: error: unable to find numeric literal operator 'operator""min'
+  203 | Serial.printf("CMD:%s:ms=%d:spd=%d\n", dir, (mag<0.2f?0:200 + int(200min(1.0f,mag))), (mag<0.2f?0:50 + int(50min(1.0f,mag))));
+      |                                                                   ^~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:203:108: error: unable to find numeric literal operator 'operator""min'
+  203 | Serial.printf("CMD:%s:ms=%d:spd=%d\n", dir, (mag<0.2f?0:200 + int(200min(1.0f,mag))), (mag<0.2f?0:50 + int(50min(1.0f,mag))));
+      |                                                                                                            ^~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:207:43: error: unable to find string literal operator 'operator""ok' with 'const char [8]', 'unsigned int' arguments
+  207 | server.send(200, "application/json", "{"ok":true}");
+      |                                           ^~~~~~~~
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: In function 'void setup()':
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:364:105: error: expected '}' before ';' token
+  364 | server.send(200, "text/plain", "HydroBot ESP32-CAM OK\n/stream, /status, /led, /pump, /joystick, /uart");
+      |                                                                                                         ^
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:363:27: note: to match this '{'
+  363 | server.on("/", HTTP_GET,  {
+      |                           ^
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:364:105: error: expected ')' before ';' token
+  364 | server.send(200, "text/plain", "HydroBot ESP32-CAM OK\n/stream, /status, /led, /pump, /joystick, /uart");
+      |                                                                                                         ^
+      |                                                                                                         )
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:363:10: note: to match this '('
+  363 | server.on("/", HTTP_GET,  {
+      |          ^
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino: At global scope:
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:365:2: error: expected unqualified-id before ')' token
+  365 | });
+      |  ^
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:368:1: error: 'server' does not name a type; did you mean 'Server'?
+  368 | server.begin();
+      | ^~~~~~
+      | Server
+C:\Users\yagohmz\Documents\Arduino\Esp32-HydroBot\Esp32-HydroBot.ino:369:1: error: expected declaration before '}' token
+  369 | }
+      | ^
+Multiple libraries were found for "WiFi.h"
+  Used: C:\Users\yagohmz\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.0\libraries\WiFi
+  Not used: C:\Users\yagohmz\Documents\Arduino\libraries\WiFiNINA
+  Not used: C:\Users\yagohmz\Documents\Arduino\libraries\WiFiEspAT
+exit status 1
+
+Compilation error: unable to find string literal operator 'operator""ok' with 'const char [7]', 'unsigned int' arguments
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — vou te entregar um firmware completo para o ESP32-CAM (AI-Thinker) que:
 
 
