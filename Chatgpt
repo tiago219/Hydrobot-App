@@ -1,4 +1,421 @@
 
+// ====== HydroBot Arduino - Driver & Sensors (robusto p/ ESP HTTP bridge) ======
+// Aceita comandos por UART em vários formatos:
+//  1) "CMD:FWD:ms=400:spd=70", "CMD:BACK:ms=300", "CMD:LEFT:ms=200", "CMD:RIGHT:ms=200", "CMD:STOP"
+//  2) "REQ:STATUS", "SET:SPEED:NN", "SET:LED:n", "CMD:PUMP:1|0"
+//  3) Linha de HTTP do ESP (caso ele encaminhe o caminho puro):
+//     - "GET /uart?line=CMD%3AFWD%3Ams%3D200 HTTP/1.1"
+//     - "GET /pump?on=1 HTTP/1.1"
+//     - "GET /joystick?x=0.42&y=-0.15 HTTP/1.1"
+//
+// Movimento não-bloqueante: envia pulso e para sozinho quando o tempo acabar.
+// Failsafe: se não chegar comando de movimento por ~1s, para motores.
+//
+// ---------------- PINOS ----------------
+#include <Arduino.h>
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define BOMBA_PIN 13
+#define LED_VERMELHO 3
+
+#define SENSOR_FOGO_DIR A0
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_ESQ A2
+#define NIVEL_AGUA_PIN  A3
+
+// ---------------- CONFIG ----------------
+static uint8_t baseSpeed = 70; // 0..100 (documental)
+static bool pumpOn = false;
+
+// ---------------- ESTADO DE MOVIMENTO (não-bloqueante) ----------------
+enum Dir { DIR_STOP=0, DIR_FWD, DIR_BACK, DIR_LEFT, DIR_RIGHT };
+static Dir currentDir = DIR_STOP;
+static bool motionActive = false;
+static unsigned long motionEndMs = 0;
+static unsigned long lastMoveCmdAt = 0; // para failsafe
+
+// ---------------- HELPERS DE HARDWARE ----------------
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  currentDir = DIR_STOP;
+}
+void motorsFwd() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  currentDir = DIR_FWD;
+}
+void motorsBack() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  currentDir = DIR_BACK;
+}
+void motorsLeftTurn() { // pivô: esquerda ré, direita frente
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  currentDir = DIR_LEFT;
+}
+void motorsRightTurn() { // pivô: esquerda frente, direita ré
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  currentDir = DIR_RIGHT;
+}
+void applyDir(Dir d) {
+  switch (d) {
+    case DIR_FWD:   motorsFwd(); break;
+    case DIR_BACK:  motorsBack(); break;
+    case DIR_LEFT:  motorsLeftTurn(); break;
+    case DIR_RIGHT: motorsRightTurn(); break;
+    default:        motorsStop(); break;
+  }
+}
+void setMotion(Dir d, uint16_t ms /*120..600*/) {
+  if (ms == 0 || d == DIR_STOP) {
+    motorsStop();
+    motionActive = false;
+    return;
+  }
+  applyDir(d);
+  motionActive  = true;
+  motionEndMs   = millis() + (unsigned long)ms;
+  lastMoveCmdAt = millis();
+}
+
+void pumpWrite(bool on) {
+  pumpOn = on;
+  digitalWrite(BOMBA_PIN, on ? HIGH : LOW);
+}
+
+uint8_t waterPercent() {
+  int raw = analogRead(NIVEL_AGUA_PIN); // 0..1023
+  int pct = map(raw, 0, 1023, 0, 100);
+  pct = constrain(pct, 0, 100);
+  return (uint8_t)pct;
+}
+
+void ledLevelByWater(uint8_t pct) {
+  static unsigned long lastBlink=0;
+  static bool state=false;
+  if (pct >= 50) {
+    analogWrite(LED_VERMELHO, 0);
+  } else if (pct >= 25) {
+    analogWrite(LED_VERMELHO, 100);
+  } else if (pct >= 15) {
+    if (millis()-lastBlink>1000) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?200:0);
+      lastBlink=millis();
+    }
+  } else {
+    if (millis()-lastBlink>300) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?255:0);
+      lastBlink=millis();
+    }
+  }
+}
+
+void emitStatus() {
+  int ax = analogRead(SENSOR_FOGO_ESQ);
+  int am = analogRead(SENSOR_FOGO_MEIO);
+  int ad = analogRead(SENSOR_FOGO_DIR);
+  uint8_t wp = waterPercent();
+  Serial.print(F("STAT:ax=")); Serial.print(ax);
+  Serial.print(F(":am=")); Serial.print(am);
+  Serial.print(F(":ad=")); Serial.print(ad);
+  Serial.print(F(":water=")); Serial.print(wp);
+  Serial.print(F(":pump=")); Serial.print(pumpOn?1:0);
+  Serial.print(F(":batt=")); Serial.println(0); // placeholder
+}
+
+// ---------------- URL-DECODE / PARSE ----------------
+static inline int _hex(char c) {
+  if (c>='0' && c<='9') return c-'0';
+  if (c>='A' && c<='F') return 10 + (c-'A');
+  if (c>='a' && c<='f') return 10 + (c-'a');
+  return -1;
+}
+
+String urlDecode(const String &s) {
+  String out; out.reserve(s.length());
+  for (size_t i=0; i<s.length(); ++i) {
+    char c = s[i];
+    if (c == '+') out += ' ';
+    else if (c == '%' && i+2 < s.length()) {
+      int h1 = _hex(s[i+1]), h2 = _hex(s[i+2]);
+      if (h1>=0 && h2>=0) { out += char((h1<<4) | h2); i+=2; }
+      else out += c;
+    } else out += c;
+  }
+  return out;
+}
+
+bool getQueryFloat(const String &path, const String &key, float &valOut) {
+  int p = path.indexOf(key + "=");
+  if (p < 0) return false;
+  int start = p + key.length() + 1;
+  int amp = path.indexOf('&', start);
+  int sp  = path.indexOf(' ', start);
+  int end = (amp<0 ? sp : (sp<0 ? amp : min(amp, sp)));
+  if (end < 0) end = path.length();
+  String sub = path.substring(start, end);
+  sub.trim();
+  valOut = sub.toFloat();
+  return true;
+}
+
+// ---------------- PARSERS DE COMANDOS ----------------
+void handleMoveCmd(const String &cmd) {
+  // aceita: FWD/BACK/LEFT/RIGHT/STOP e opcional "ms=" "spd="
+  uint16_t ms = 200;
+  uint8_t spd = baseSpeed;
+
+  int pms = cmd.indexOf("ms=");
+  if (pms >= 0) ms = (uint16_t) cmd.substring(pms+3).toInt();
+  int pspd = cmd.indexOf("spd=");
+  if (pspd >= 0) spd = (uint8_t) cmd.substring(pspd+4).toInt();
+  ms = constrain(ms, 80, 600);
+  (void)spd;
+
+  if      (cmd.indexOf("FWD")   >= 0) setMotion(DIR_FWD,   ms);
+  else if (cmd.indexOf("BACK")  >= 0) setMotion(DIR_BACK,  ms);
+  else if (cmd.indexOf("LEFT")  >= 0) setMotion(DIR_LEFT,  ms);
+  else if (cmd.indexOf("RIGHT") >= 0) setMotion(DIR_RIGHT, ms);
+  else if (cmd.indexOf("STOP")  >= 0) setMotion(DIR_STOP,  0);
+}
+
+void handleCMDLine(const String &line) {
+  // Ex.: "CMD:FWD:ms=400:spd=70" ou "CMD:PUMP:1"
+  if (line.indexOf("CMD:PUMP:") >= 0) {
+    bool on = line.endsWith("1");
+    if (on && waterPercent() <= 15) {
+      pumpWrite(false);
+      Serial.println(F("WARN:NO_WATER"));
+    } else {
+      pumpWrite(on);
+      Serial.println(on ? F("OK:PUMP_ON") : F("OK:PUMP_OFF"));
+    }
+    return;
+  }
+  handleMoveCmd(line);
+}
+
+void handleHTTPLine(const String &lineIn) {
+  // Pega apenas o caminho: "/xxx?..." (entre primeiro espaço e o próximo)
+  int sp1 = lineIn.indexOf(' ');
+  if (sp1 < 0) return;
+  int sp2 = lineIn.indexOf(' ', sp1+1);
+  if (sp2 < 0) return;
+  String path = lineIn.substring(sp1+1, sp2); // "/uart?line=..."
+  // UART proxy
+  if (path.startsWith("/uart")) {
+    int p = path.indexOf("line=");
+    if (p >= 0) {
+      String enc = path.substring(p+5);
+      int amp = enc.indexOf('&');
+      if (amp >= 0) enc = enc.substring(0, amp);
+      String dec = urlDecode(enc);
+      dec.trim();
+      handleCMDLine(dec);
+    }
+    return;
+  }
+  // Bomba
+  if (path.startsWith("/pump")) {
+    int p = path.indexOf("on=");
+    if (p >= 0) {
+      char v = path.charAt(p+3);
+      bool on = (v=='1' || v=='t' || v=='T');
+      if (on && waterPercent() <= 15) {
+        pumpWrite(false);
+        Serial.println(F("WARN:NO_WATER"));
+      } else {
+        pumpWrite(on);
+        Serial.println(on ? F("OK:PUMP_ON") : F("OK:PUMP_OFF"));
+      }
+    }
+    return;
+  }
+  // Joystick
+  if (path.startsWith("/joystick")) {
+    float x=0, y=0;
+    if (getQueryFloat(path, "x", x) | getQueryFloat(path, "y", y)) {
+      // converte vetor em direção discreta + pulso proporcional
+      float mag = sqrtf(x*x + y*y);
+      if (mag < 0.20f) { setMotion(DIR_STOP, 0); return; }
+      float deg = atan2f(y, x) * 57.2957795f; // RAD2DEG
+      Dir d;
+      if (deg > -45 && deg <= 45) d = DIR_RIGHT;
+      else if (deg > 45 && deg <= 135) d = DIR_FWD;
+      else if (deg <= -45 && deg > -135) d = DIR_BACK;
+      else d = DIR_LEFT;
+      uint16_t ms = 120 + (uint16_t)(min(1.0f, mag) * 260.0f); // 120..380ms
+      setMotion(d, ms);
+    }
+    return;
+  }
+}
+
+// ---------------- SETUP / LOOP ----------------
+String line;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(BOMBA_PIN, OUTPUT);
+  pinMode(LED_VERMELHO, OUTPUT);
+
+  motorsStop();
+  pumpWrite(false);
+
+  Serial.println(F("ARDUINO_READY"));
+}
+
+void loop() {
+  // LED de nível
+  ledLevelByWater(waterPercent());
+
+  // encerra pulso atual (não-bloqueante)
+  if (motionActive && (long)(millis() - motionEndMs) >= 0) {
+    motorsStop();
+    motionActive = false;
+  }
+
+  // failsafe: se ficar muito tempo sem comando de movimento, garante STOP
+  if ((millis() - lastMoveCmdAt) > 1000 && currentDir != DIR_STOP) {
+    motorsStop();
+    motionActive = false;
+  }
+
+  // UART parsing linha-a-linha
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c=='\n' || c=='\r') {
+      if (line.length() > 0) {
+        String s = line; line = "";
+        s.trim();
+
+        if (s.startsWith("CMD:")) {
+          handleCMDLine(s);
+          continue;
+        }
+        if (s.startsWith("REQ:STATUS")) {
+          emitStatus();
+          continue;
+        }
+        if (s.startsWith("SET:SPEED:")) {
+          int v = s.substring(10).toInt();
+          baseSpeed = (uint8_t) constrain(v,0,100);
+          Serial.println(F("OK:SPEED"));
+          continue;
+        }
+        if (s.startsWith("SET:LED:")) {
+          int v = s.substring(8).toInt();
+          analogWrite(LED_VERMELHO, constrain(v,0,255));
+          Serial.println(F("OK:LED"));
+          continue;
+        }
+
+        // Pode ter vindo uma linha HTTP do ESP
+        if (s.startsWith("GET ")) {
+          handleHTTPLine(s);
+          continue;
+        }
+
+        // Curto-circuitos extras (caso venham formas diferentes)
+        if (s.indexOf("PUMP=1")>=0 || s.indexOf("pump=1")>=0) { pumpWrite(true);  Serial.println(F("OK:PUMP_ON"));  continue; }
+        if (s.indexOf("PUMP=0")>=0 || s.indexOf("pump=0")>=0) { pumpWrite(false); Serial.println(F("OK:PUMP_OFF")); continue; }
+
+        Serial.println(F("ERR:UNKNOWN"));
+      }
+    } else {
+      line += c;
+      if (line.length() > 240) line.remove(0); // evita overflow de linha malformada
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 perfeito — se o joystick e a bomba não responderam, vamos deixar o Arduino à prova de bala.
 
 Abaixo vai um .ino completo que:
