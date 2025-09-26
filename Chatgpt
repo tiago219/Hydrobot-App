@@ -1,4 +1,237 @@
 
+/* ESP32-CAM (AI Thinker) — Bridge HTTP<->UART + Snapshot via Roteador
+   IP fixo: 192.168.3.3
+   Endpoints:
+     GET /status                -> JSON
+     GET /snapshot              -> JPEG (no-store)
+     GET /uart?line=...         -> envia "line\n" ao Arduino (UART0)
+     GET /pump?on=0|1           -> envia "CMD:PUMP:0|1\n"
+     GET /joystick?x=..&y=..    -> encaminha GET e manda CMD discreto redundante
+   Observações:
+     - UART0 (GPIO1 TX0 -> RX Arduino | GPIO3 RX0 <- TX Arduino via divisor 5V->3V3)
+     - Câmera QQVGA, quality 15, fb_count 1 (estável). Ajuste depois se quiser.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===== Wi-Fi (roteador) =====
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+IPAddress IP(192,168,3,3), GW(192,168,3,1), MASK(255,255,255,0), DNS1(8,8,8,8), DNS2(1,1,1,1);
+
+// ===== WebServer =====
+WebServer server(80);
+
+// ===== Pinos câmera (AI Thinker) =====
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// ===== Utils =====
+static String urlDecode(const String &s){
+  String o; o.reserve(s.length());
+  auto hx=[](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='A'&&c<='F')return 10+(c-'A'); if(c>='a'&&c<='f')return 10+(c-'a'); return -1; };
+  for(size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') o+=' ';
+    else if(c=='%' && i+2<s.length()){ int h1=hx(s[i+1]),h2=hx(s[i+2]); if(h1>=0&&h2>=0){ o+=(char)((h1<<4)|h2); i+=2; } else o+=c; }
+    else o+=c;
+  }
+  return o;
+}
+static void sendCORS(){
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+void handle_options(){ sendCORS(); server.send(204); }
+
+// ===== HTTP Handlers =====
+void handle_status(){
+  sendCORS();
+  String j = "{\"ok\":true,\"ip\":\""+WiFi.localIP().toString()+"\",\"mode\":\"bridge+snapshot\"}";
+  server.send(200,"application/json",j);
+}
+void handle_uart(){
+  sendCORS();
+  if(!server.hasArg("line")){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  Serial.print(line);
+  if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+void handle_pump(){
+  sendCORS();
+  if(!server.hasArg("on")){ server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on ? "PUMP_ON\n" : "PUMP_OFF\n");
+}
+void handle_joystick(){
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // Encaminha linha GET (seu Arduino entende)
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // Redundância CMD discreto
+  float m = sqrtf(x*x+y*y);
+  if(m<0.20f){
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if(deg>-45&&deg<=45) dir="RIGHT";
+    else if(deg>45&&deg<=135) dir="FWD";
+    else if(deg<=-45&&deg>-135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f,m)*260.0f);
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+void handle_snapshot(){
+  camera_fb_t* fb = esp_camera_fb_get();
+  if(!fb || fb->format!=PIXFORMAT_JPEG){
+    if(fb) esp_camera_fb_return(fb);
+    server.send(503,"text/plain","no frame\n");
+    return;
+  }
+  sendCORS();
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.setContentLength(fb->len);
+  server.send(200,"image/jpeg","");
+  WiFiClient c = server.client();
+  c.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// ===== Camera init (perfil leve/estável) =====
+bool camera_begin_low(){
+  camera_config_t cfg{};
+  cfg.ledc_channel=LEDC_CHANNEL_0; cfg.ledc_timer=LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sccb_sda=SIOD_GPIO_NUM; cfg.pin_sccb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+  cfg.xclk_freq_hz=20000000;
+  cfg.pixel_format=PIXFORMAT_JPEG;
+  cfg.frame_size=FRAMESIZE_QQVGA;   // comece bem leve; depois pode subir para QVGA
+  cfg.jpeg_quality=15;              // 10–12 é mais pesado; comece 15
+  cfg.fb_count=1;                   // 1 = mais estável
+  cfg.fb_location=CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode=CAMERA_GRAB_LATEST;
+  return esp_camera_init(&cfg) == ESP_OK;
+}
+
+// ===== setup/loop =====
+void setup(){
+  // UART0 para Arduino
+  Serial.begin(115200);
+  delay(50);
+
+  // estabilidade
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.config(IP,GW,MASK,DNS1,DNS2);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(200);
+
+  // câmera
+  camera_begin_low();
+
+  // HTTP
+  server.on("/status",    HTTP_GET, handle_status);
+  server.on("/snapshot",  HTTP_GET, handle_snapshot);
+  server.on("/uart",      HTTP_GET, handle_uart);
+  server.on("/pump",      HTTP_GET, handle_pump);
+  server.on("/joystick",  HTTP_GET, handle_joystick);
+  server.on("/",          HTTP_OPTIONS, handle_options);
+  server.on("/uart",      HTTP_OPTIONS, handle_options);
+  server.on("/pump",      HTTP_OPTIONS, handle_options);
+  server.on("/joystick",  HTTP_OPTIONS, handle_options);
+  server.on("/snapshot",  HTTP_OPTIONS, handle_options);
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+
+  server.begin();
+}
+void loop(){ server.handleClient(); delay(1); }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+.
+
+.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*  ESP32-CAM (AI Thinker) — Bridge HTTP ↔ UART (Arduino) via Roteador
     - Conecta no Wi-Fi do seu roteador (STA) com IP fixo
     - Endpoints HTTP (porta 80):
