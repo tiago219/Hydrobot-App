@@ -1,4 +1,453 @@
 
+Isso é clássico de brownout/reset no ESP32-CAM quando a cena tem muita informação (JPEG fica maior → pico de CPU/PSRAM/Wi-Fi → pico de corrente). Vou resolver em duas frentes:
+
+
+
+
+Firmware (reduz picos e travas)
+
+
+
+
+
+
+Usa PSRAM explicitamente para o framebuffer.
+
+
+Força grab_mode = CAMERA_GRAB_LATEST (evita fila travando).
+
+
+1 framebuffer (menos RAM em picos).
+
+
+Qualidade JPEG mais alta no número (pior compressão = arquivo menor): jpeg_quality = 20 (pode subir até 25 se ainda resetar).
+
+
+Mantém VGA (640×480) que seu app espera; se ainda cair, mude para FRAMESIZE_HVGA (480×320) — já deixei comentário.
+
+
+Desativa economia de energia de Wi-Fi (WiFi.setSleep(false)) para evitar burst de wake/sleep.
+
+
+Pequeno “rate-limit” no /snapshot se chegar pedido em rajada.
+
+
+
+
+
+
+Hardware (garante energia)
+
+
+
+
+
+
+Alimente o ESP32-CAM em 5V do pino 5V com fonte ≥ 1 A (melhor 2 A).
+
+
+GND comum com Arduino.
+
+
+Evite ligar o flash LED continuamente (puxa muito).
+
+
+Se estiver alimentando via FTDI/USB fraco, troque para fonte dedicada.
+
+
+
+
+Abaixo o código completo atualizado (mantém seus endpoints e UART/joystick; só ajustei a parte da câmera, Wi-Fi e /snapshot):
+
+
+// HydroBot ESP32-CAM - HTTP + UART (otimizado anti-reset)
+// - Snapshot-only em VGA com PSRAM, 1 framebuffer e grab_mode LATEST
+// - JPEG quality 20 (menor tráfego/pico de CPU)
+// - WiFi.setSleep(false) para evitar bursts
+// - Endpoints: /snapshot, /status, /led, /pump, /joystick, /uart
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+#include <esp_timer.h>
+#include <ctype.h>
+
+/* ========= Wi-Fi ========= */
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+/* ========= Pinos câmera (AI-Thinker) ========= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* ========= Flash / LED ========= */
+#define FLASH_PIN 4
+
+/* ========= UART para Arduino ========= */
+#define UART_BAUD 115200
+#define UART_TX   14
+#define UART_RX   15
+
+/* ========= HTTP ========= */
+WebServer server(80);
+
+/* ========= Estados ========= */
+volatile bool flashOn = false;
+volatile bool pumpOn  = false;
+volatile float joyX   = 0.0f, joyY = 0.0f;
+volatile uint32_t lastJoyUpdateMs = 0;
+
+/* ========= Util ========= */
+String urlDecode(const String &s) {
+  String r; r.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '+') r += ' ';
+    else if (c == '%' && i + 2 < s.length() && isxdigit(s[i+1]) && isxdigit(s[i+2])) {
+      auto hex = [](char h)->uint8_t{
+        if (h>='0' && h<='9') return h-'0';
+        if (h>='A' && h<='F') return h-'A'+10;
+        if (h>='a' && h<='f') return h-'a'+10;
+        return 0;
+      };
+      r += char((hex(s[i+1])<<4) | hex(s[i+2]));
+      i += 2;
+    } else r += c;
+  }
+  return r;
+}
+
+void sendLineToArduino(const String &line) { Serial2.print(line); Serial2.print('\n'); }
+void setFlash(bool on) { flashOn = on; digitalWrite(FLASH_PIN, on ? HIGH : LOW); }
+
+/* ========= Câmera ========= */
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;          // 20 MHz estável
+
+  // *** Ajustes anti-reset ***
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;     // 640x480 (se ainda resetar, trocar para FRAMESIZE_HVGA 480x320)
+  config.jpeg_quality = 20;                // 10..30 (20 reduz pico de CPU e tamanho)
+  config.fb_count     = 1;                 // 1 buffer = menos PSRAM
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) return false;
+
+  // Sensor tweaks adicionais (opcional)
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    // s->set_framesize(s, FRAMESIZE_VGA); // reforça resolução
+    s->set_gainceiling(s, GAINCEIL_2X);   // reduz saturação de ganho (mais estável)
+    // s->set_brightness(s, 0); s->set_contrast(s, 0); // defaults ok
+  }
+  return true;
+}
+
+/* ========= /snapshot ========= */
+static unsigned long lastSnapMs = 0;
+void handleSnapshot() {
+  // Rate-limit leve (evita espiral se o cliente abrir muitas conexões simultâneas)
+  unsigned long now = millis();
+  if (now - lastSnapMs < 60) { // ~16 fps máx. no servidor
+    delay(5);
+  }
+  lastSnapMs = now;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->format != PIXFORMAT_JPEG) {
+    if (fb) esp_camera_fb_return(fb);
+    server.send(503, "text/plain", "NO FRAME");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+/* ========= /status ========= */
+void handleStatus() {
+  StaticJsonDocument<384> doc;
+  doc["ok"]   = true;
+  doc["ip"]   = WiFi.localIP().toString();
+  doc["mode"] = "joystick+uart";
+  doc["led"]  = flashOn;
+  doc["pump"] = pumpOn;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+/* ========= /led?on=0|1 ========= */
+void handleLed() {
+  bool on = server.hasArg("on") && server.arg("on") == "1";
+  setFlash(on);
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= /pump?on=0|1 ========= */
+void handlePump() {
+  bool on = server.hasArg("on") && server.arg("on") == "1";
+  pumpOn = on;
+  sendLineToArduino(on ? "CMD:PUMP:1" : "CMD:PUMP:0");
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= /uart?line=... ========= */
+void handleUart() {
+  if (!server.hasArg("line")) { server.send(400, "text/plain", "missing line"); return; }
+  String line = urlDecode(server.arg("line")); line.trim();
+  if (!line.length()) { server.send(400, "text/plain", "empty line"); return; }
+  sendLineToArduino(line);
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= /joystick?x=&y= ========= */
+void handleJoystick() {
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.0f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.0f;
+  if (x > 1) x = 1; if (x < -1) x = -1;
+  if (y > 1) y = 1; if (y < -1) y = -1;
+  joyX = x; joyY = y; lastJoyUpdateMs = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= Joystick → comandos discretos ========= */
+String vecToDir(float x, float y) {
+  float mag = sqrtf(x*x + y*y);
+  if (mag < 0.2f) return "STOP";
+  float deg = atan2f(y, x) * 180.0f / PI;
+  if (deg > -45 && deg <= 45)  return "RIGHT";
+  if (deg > 45  && deg <= 135) return "FWD";
+  if (deg <= -45 && deg > -135) return "BACK";
+  return "LEFT";
+}
+
+void joystickTask(void* _) {
+  const uint32_t TICK_MS = 120;
+  String lastDir = "STOP";
+  for (;;) {
+    float x = joyX, y = joyY;
+    float mag = sqrtf(x*x + y*y);
+    String dir = vecToDir(x, y);
+
+    if (dir == "STOP") {
+      if (lastDir != "STOP") {
+        sendLineToArduino("CMD:STOP");
+        lastDir = "STOP";
+      }
+    } else {
+      int ms  = 140 + int(260.0f * (mag > 1 ? 1 : mag)); // 140..400
+      int spd = 50  + int(50.0f  * (mag > 1 ? 1 : mag)); // 50..100
+      char buf[64];
+      snprintf(buf, sizeof(buf), "CMD:%s:ms=%d:spd=%d", dir.c_str(), ms, spd);
+      sendLineToArduino(String(buf));
+      lastDir = dir;
+    }
+    vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+  }
+}
+
+/* ========= Setup ========= */
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+
+  pinMode(FLASH_PIN, OUTPUT);
+  setFlash(false);
+
+  // Wi-Fi antes da câmera (às vezes estabiliza a alocação)
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                 // evita picos por power-save
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(300); Serial.print("."); }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Failed — will retry in loop()");
+  }
+
+  // Câmera
+  if (!initCamera()) Serial.println("[ERR] Camera init failed");
+  else               Serial.println("[OK] Camera init");
+
+  // HTTP
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/status",   HTTP_GET, handleStatus);
+  server.on("/led",      HTTP_GET, handleLed);
+  server.on("/pump",     HTTP_GET, handlePump);
+  server.on("/uart",     HTTP_GET, handleUart);
+  server.on("/joystick", HTTP_GET, handleJoystick);
+  server.onNotFound([](){ server.send(404, "text/plain", "not found"); });
+  server.begin();
+
+  // Task joystick (core 0)
+  xTaskCreatePinnedToCore(joystickTask, "joyTask", 4096, nullptr, 1, nullptr, 0);
+
+  sendLineToArduino("REQ:STATUS");
+}
+
+/* ========= Loop ========= */
+void loop() {
+  server.handleClient();
+
+  static uint32_t lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 2000) {
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+}
+
+
+
+Se ainda resetar
+
+
+
+
+Troque apenas esta linha:
+
+// config.frame_size = FRAMESIZE_VGA;
+config.frame_size   = FRAMESIZE_HVGA; // 480x320 (app ainda exibe, só fica menor)
+
+
+
+
+
+Ou aumente:
+
+config.jpeg_quality = 25; // arquivos menores
+
+
+
+
+
+
+
+Checklist elétrico rápido
+
+
+
+
+Fonte 5 V ≥ 1 A no pino 5V do ESP32-CAM (não 3.3 V).
+
+
+Cabos curtos e grossos; GND comum com Arduino.
+
+
+Evite manter o flash ligado por longos períodos.
+
+
+
+
+Testa assim e me fala: se estabilizar, podemos tentar voltar gradualmente para jpeg_quality=18 ou fb_count=2.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // HydroBot ESP32-CAM - HTTP + UART (sem LEDC/PWM)
 // - Conecta no Wi-Fi (HydroBot)
 // - Fornece /snapshot, /status, /led, /pump, /joystick, /uart
