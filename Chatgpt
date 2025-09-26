@@ -1,4 +1,436 @@
 
+beleza — reboot em loop no ESP32-CAM quase sempre é uma combinação de alimentação fraca + câmera pesada + UART compartilhada. Vou te passar:
+
+
+
+
+um firmware “failsafe” pro ESP32-CAM (bem leve, sem nada que estresse memória/alimentação)
+
+
+o checklist elétrico (onde geralmente está o problema)
+
+
+passos de teste rápido pra isolar a causa
+
+
+
+
+
+1) ESP32-CAM “failsafe” (estável)
+
+
+
+
+Wi-Fi no roteador (troque SSID/SENHA, IP fixo 192.168.3.3)
+
+
+Endpoints:
+
+
+
+/status (JSON)
+
+
+/snapshot (JPEG com headers no-store)
+
+
+/uart?line=... → envia line\n na Serial
+
+
+/pump?on=0|1 → envia CMD:PUMP:0|1\n
+
+
+/joystick?x=&y= → reenvia a linha GET pro Arduino e manda um CMD discreto (redundante)
+
+
+
+
+
+
+Câmera em QQVGA (160×120), jpeg_quality=15, fb_count=1 (bem leve)
+
+
+Brownout detector desligado (ajuda quando a fonte é no limite)
+
+
+Zero logs pela Serial (para não atrapalhar o Arduino)
+
+
+
+
+
+
+Cole este sketch e grave no ESP32-CAM AI-Thinker (Board: AI Thinker ESP32-CAM, PSRAM: Enabled).
+
+Para gravar, desconecte Arduino dos pinos RX/TX, coloque IO0=GND (modo flash) e alimente em 5V bom.
+
+
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+
+// -------- Wi-Fi (roteador) --------
+const char* SSID = "HydroBot";
+const char* PASS = "loud2025emibr";
+
+// IP fixo 192.168.3.3
+IPAddress local_IP(192,168,3,3);
+IPAddress gateway (192,168,3,1);
+IPAddress subnet  (255,255,255,0);
+IPAddress dns1    (8,8,8,8);
+IPAddress dns2    (1,1,1,1);
+
+WebServer server(80);
+
+// ---- Pinos câmera (AI Thinker) ----
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---- Helpers (sem logs na Serial) ----
+static String urlDecode(const String &s) {
+  String out; out.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for (size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') out+=' ';
+    else if(c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if(h1>=0 && h2>=0){ out += char((h1<<4)|h2); i+=2; }
+      else out += c;
+    } else out += c;
+  }
+  return out;
+}
+
+void handle_status(){
+  String json = "{\"ok\":true,\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",\"mode\":\"snapshot\"}";
+  server.send(200,"application/json",json);
+}
+
+void handle_uart(){
+  if(!server.hasArg("line")){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  // envia para Arduino (UART0) e garante newline
+  Serial.print(line);
+  if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump(){
+  if(!server.hasArg("on")){ server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on? "PUMP_ON\n":"PUMP_OFF\n");
+}
+
+void handle_joystick(){
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // Encaminha a própria linha GET (seu Arduino entende)
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // Redundância: comando discreto
+  float mag = sqrtf(x*x+y*y);
+  if (mag < 0.20f) {
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if (deg > -45 && deg <= 45) dir="RIGHT";
+    else if (deg > 45 && deg <= 135) dir="FWD";
+    else if (deg <= -45 && deg > -135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f, mag)*260.0f);
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+void handle_snapshot(){
+  camera_fb_t *fb = esp_camera_fb_get();
+  if(!fb || fb->format!=PIXFORMAT_JPEG){
+    if(fb) esp_camera_fb_return(fb);
+    server.send(503,"text/plain","no frame\n");
+    return;
+  }
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.setContentLength(fb->len);
+  server.send(200,"image/jpeg","");
+  WiFiClient c = server.client();
+  c.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+bool camera_begin_lowmem(){
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM;  cfg.pin_d1 = Y3_GPIO_NUM;
+  cfg.pin_d2 = Y4_GPIO_NUM;  cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM;  cfg.pin_d5 = Y7_GPIO_NUM;
+  cfg.pin_d6 = Y8_GPIO_NUM;  cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk = XCLK_GPIO_NUM;
+  cfg.pin_pclk = PCLK_GPIO_NUM;
+  cfg.pin_vsync = VSYNC_GPIO_NUM;
+  cfg.pin_href = HREF_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sccb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn = PWDN_GPIO_NUM;
+  cfg.pin_reset = RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_QQVGA; // 160x120 super leve
+  cfg.jpeg_quality = 15;              // mais leve
+  cfg.fb_count     = 1;               // 1 framebuffer
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+
+  return esp_camera_init(&cfg) == ESP_OK;
+}
+
+void setup(){
+  // UART0 para Arduino
+  Serial.begin(115200);
+
+  // desliga brownout (diminui resets por queda de tensão)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // inicializa câmera no perfil mais leve possível
+  camera_begin_lowmem();
+
+  // Wi-Fi STA + IP fixo
+  WiFi.mode(WIFI_STA);
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+  WiFi.begin(SSID, PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0 < 15000) delay(200);
+
+  // HTTP
+  server.on("/status",   HTTP_GET, handle_status);
+  server.on("/snapshot", HTTP_GET, handle_snapshot);
+  server.on("/uart",     HTTP_GET, handle_uart);
+  server.on("/pump",     HTTP_GET, handle_pump);
+  server.on("/joystick", HTTP_GET, handle_joystick);
+  server.onNotFound([](){ server.send(404,"text/plain","NF\n"); });
+  server.begin();
+}
+
+void loop(){
+  // manter o servidor responsivo evita WDT
+  server.handleClient();
+  delay(1);
+}
+
+
+
+Por que esse sketch é mais estável
+
+
+
+
+QQVGA/qualidade 15/fb=1 → consumo mínimo de RAM/PSRAM e CPU.
+
+
+Brownout desativado (se sua fonte for borderline não derruba).
+
+
+Sem prints de log na Serial (não perturba o Arduino).
+
+
+Loop leve e delay(1) → evita WDT reset.
+
+
+
+
+
+
+Depois que tudo estiver OK, você pode subir para FRAMESIZE_QVGA e jpeg_quality 10–12.
+
+
+
+
+
+2) Checklist elétrico (onde normalmente está o reboot)
+
+
+
+
+Fonte do ESP32-CAM: use 5V em pelo menos 1A (ideal: 2A).
+
+FTDI em 5V geralmente não aguenta a câmera (brownout → reboot).
+
+
+GND comum entre ESP e Arduino.
+
+
+RX do ESP (GPIO3) vindo do TX do Arduino precisa de divisor 5V→3.3V
+
+(1k em série + 2k2 para GND já resolve).
+
+
+IO0 livre (só aterre para gravar; depois solte). Se mantiver no GND, o ESP entra em modo bootloader e “reinicia” ao tentar rodar.
+
+
+Cabos curtos e bons; falsos contatos dão brownout.
+
+
+Não alimente motores/bomba da mesma fonte do ESP sem um regulador decente — ruído de motor derruba o módulo.
+
+
+
+
+
+3) Teste rápido (sem app)
+
+
+
+
+Acesse http://192.168.3.3/status → tem JSON?
+
+
+Acesse http://192.168.3.3/snapshot → baixa um JPEG (pequeno por ser QQVGA).
+
+
+Com Arduino conectado na UART:
+
+
+
+http://192.168.3.3/uart?line=CMD%3AFWD%3Ams%3D300 → deve andar à frente ~300 ms.
+
+
+http://192.168.3.3/pump?on=1 / ...on=0 → liga/desliga bomba.
+
+
+http://192.168.3.3/joystick?x=0.9&y=0.2 → deve girar/andar.
+
+
+
+
+
+
+
+
+Se (1) ou (2) já reinicia, é alimentação; se só cai quando manda /snapshot, a câmera ainda está pesada → mantenha QQVGA; se mesmo assim reinicia, a fonte está no limite.
+
+
+
+Dicas finais
+
+
+
+
+Depois de estável, volte seu server e app (já com IPs .3.3 / .3.4). O app vai puxar snapshot do servidor, mas você também pode apontar direto pro ESP pra testar.
+
+
+Se quiser eliminar qualquer interferência do compartilhamento de UART, dá para mover a ponte para Serial1 (UART2) do ESP32, mas nos pinos disponíveis do AI-Thinker é arriscado por causa do SD; por isso o padrão é usar UART0 mesmo (funciona bem com boa alimentação).
+
+
+
+
+Se ainda rebootar, me diga: aparece “Brownout detector was triggered” no serial do FTDI? E me conte qual fonte você está usando para o ESP32-CAM. Isso fecha o diagnóstico.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 bora! abaixo está o CameraScreen.tsx completo com:
 
 
