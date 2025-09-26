@@ -1,4 +1,264 @@
 
+// ====== HydroBot Arduino - Driver & Sensors (sem servo) ======
+// Motores, bomba, LED e sensores ficam aqui. ESP32-CAM comanda via UART.
+// Protocolo linha-a-linha (terminado em '\n'):
+//  - "CMD:FWD:ms=400:spd=70"
+//  - "CMD:BACK:ms=300"
+//  - "CMD:LEFT:ms=200" / "CMD:RIGHT:ms=200"
+//  - "CMD:STOP"
+//  - "CMD:PUMP:1"  (liga)  / "CMD:PUMP:0" (desliga)
+//  - "REQ:STATUS"  (Arduino responde "STAT:...")
+//  - "SET:SPEED:NN" (0..100 - fator PWM soft)
+//  - "SET:LED:n"    (0..255)
+//
+// Resposta STATUS (exemplo):
+// STAT:ax=512:am=480:ad=505:water=73:pump=0:batt=0
+
+#include <Arduino.h>
+
+// ===== PINOS =====
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define BOMBA_PIN 13
+#define LED_VERMELHO 3
+
+#define SENSOR_FOGO_DIR A0
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_ESQ A2
+#define NIVEL_AGUA_PIN  A3
+
+// ===== CONFIG =====
+static uint8_t baseSpeed = 70; // 0..100 (fator de duty "soft" por tempo)
+static bool pumpOn = false;
+
+// ===== HELPERS =====
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+void motorsFwd() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsBack() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+void motorsLeftTurn() { // pivô esquerdo: esquerda ré, direita frente
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsRightTurn() { // pivô direito: esquerda frente, direita ré
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void pumpWrite(bool on) {
+  pumpOn = on;
+  digitalWrite(BOMBA_PIN, on ? HIGH : LOW);
+}
+
+uint8_t waterPercent() {
+  int raw = analogRead(NIVEL_AGUA_PIN); // 0..1023
+  int pct = map(raw, 0, 1023, 0, 100);
+  pct = constrain(pct, 0, 100);
+  return (uint8_t)pct;
+}
+
+void ledLevelByWater(uint8_t pct) {
+  static unsigned long lastBlink=0;
+  static bool state=false;
+  if (pct >= 50) {
+    analogWrite(LED_VERMELHO, 0);
+  } else if (pct >= 25) {
+    analogWrite(LED_VERMELHO, 100);
+  } else if (pct >= 15) {
+    if (millis()-lastBlink>1000) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?200:0);
+      lastBlink=millis();
+    }
+  } else {
+    if (millis()-lastBlink>300) {
+      state=!state;
+      analogWrite(LED_VERMELHO, state?255:0);
+      lastBlink=millis();
+    }
+  }
+}
+
+void emitStatus() {
+  int ax = analogRead(SENSOR_FOGO_ESQ);
+  int am = analogRead(SENSOR_FOGO_MEIO);
+  int ad = analogRead(SENSOR_FOGO_DIR);
+  uint8_t wp = waterPercent();
+  Serial.print(F("STAT:ax=")); Serial.print(ax);
+  Serial.print(F(":am=")); Serial.print(am);
+  Serial.print(F(":ad=")); Serial.print(ad);
+  Serial.print(F(":water=")); Serial.print(wp);
+  Serial.print(F(":pump=")); Serial.print(pumpOn?1:0);
+  Serial.print(F(":batt=")); Serial.println(0); // placeholder
+}
+
+void softMove(void (*fnDir)(), uint16_t ms, uint8_t spd) {
+  // simples controle por tempo; spd só documenta intenção
+  (void)spd;
+  fnDir();
+  delay(ms);
+  motorsStop();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(BOMBA_PIN, OUTPUT);
+  pinMode(LED_VERMELHO, OUTPUT);
+
+  motorsStop();
+  pumpWrite(false);
+
+  Serial.println(F("ARDUINO_READY"));
+}
+
+String line;
+
+void loop() {
+  // LED de nível (local, independente de comandos)
+  ledLevelByWater(waterPercent());
+
+  // UART parsing
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c=='\n' || c=='\r') {
+      if (line.length()>0) {
+        line.trim();
+
+        if (line.startsWith("CMD:")) {
+          // exemplos: CMD:FWD:ms=400:spd=70
+          if (line.indexOf("FWD")>0) {
+            uint16_t ms=400; uint8_t sp=baseSpeed;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            p=line.indexOf("spd=");
+            if (p>0) sp = (uint8_t) line.substring(p+4).toInt();
+            softMove(motorsFwd, ms, sp);
+            Serial.println(F("OK:FWD"));
+          }
+          else if (line.indexOf("BACK")>0) {
+            uint16_t ms=300; uint8_t sp=baseSpeed;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsBack, ms, sp);
+            Serial.println(F("OK:BACK"));
+          }
+          else if (line.indexOf("LEFT")>0) {
+            uint16_t ms=200;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsLeftTurn, ms, baseSpeed);
+            Serial.println(F("OK:LEFT"));
+          }
+          else if (line.indexOf("RIGHT")>0) {
+            uint16_t ms=200;
+            int p=line.indexOf("ms=");
+            if (p>0) ms = (uint16_t) line.substring(p+3).toInt();
+            softMove(motorsRightTurn, ms, baseSpeed);
+            Serial.println(F("OK:RIGHT"));
+          }
+          else if (line.indexOf("STOP")>0) {
+            motorsStop();
+            Serial.println(F("OK:STOP"));
+          }
+          else if (line.indexOf("PUMP:")>0) {
+            bool on = line.endsWith("1");
+            if (on && waterPercent()<=15) {
+              pumpWrite(false);
+              Serial.println(F("WARN:NO_WATER"));
+            } else {
+              pumpWrite(on);
+              Serial.println(on?F("OK:PUMP_ON"):F("OK:PUMP_OFF"));
+            }
+          }
+          else {
+            Serial.println(F("ERR:CMD"));
+          }
+        }
+        else if (line.startsWith("REQ:STATUS")) {
+          emitStatus();
+        }
+        else if (line.startsWith("SET:SPEED:")) {
+          int v = line.substring(10).toInt();
+          baseSpeed = (uint8_t) constrain(v,0,100);
+          Serial.println(F("OK:SPEED"));
+        }
+        else if (line.startsWith("SET:LED:")) {
+          int v = line.substring(8).toInt();
+          analogWrite(LED_VERMELHO, constrain(v,0,255));
+          Serial.println(F("OK:LED"));
+        }
+        else {
+          Serial.println(F("ERR:UNKNOWN"));
+        }
+        line = "";
+      }
+    } else {
+      line += c;
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Isso é clássico de brownout/reset no ESP32-CAM quando a cena tem muita informação (JPEG fica maior → pico de CPU/PSRAM/Wi-Fi → pico de corrente). Vou resolver em duas frentes:
 
 
