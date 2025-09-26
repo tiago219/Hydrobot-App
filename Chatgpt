@@ -1,4 +1,348 @@
 
+// HydroBot ESP32-CAM - HTTP + UART (sem LEDC/PWM)
+// - Conecta no Wi-Fi (HydroBot)
+// - Fornece /snapshot, /status, /led, /pump, /joystick, /uart
+// - Envia comandos via UART2 (TX=GPIO14, RX=GPIO15) para o Arduino
+// - Flash (GPIO4) controlado por digitalWrite (sem PWM)
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+#include <esp_timer.h>
+#include <ctype.h>
+
+/* ========= Wi-Fi ========= */
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+/* ========= Pinos câmera (AI-Thinker) ========= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* ========= Flash / LED ========= */
+#define FLASH_PIN 4
+
+/* ========= UART para Arduino =========
+   ESP32-CAM UART2: TX = GPIO14, RX = GPIO15
+   ATENÇÃO: Níveis lógicos 3.3V no ESP (use divisor no RX do ESP).
+*/
+#define UART_BAUD 115200
+#define UART_TX   14
+#define UART_RX   15
+
+/* ========= HTTP ========= */
+WebServer server(80);
+
+/* ========= Estados ========= */
+volatile bool flashOn = false;
+volatile bool pumpOn  = false;   // espelha último comando enviado
+volatile float joyX   = 0.0f;    // −1..+1
+volatile float joyY   = 0.0f;    // −1..+1
+volatile uint32_t lastJoyUpdateMs = 0;
+
+/* ========= Util: URL decode simples ========= */
+String urlDecode(const String &s) {
+  String r; r.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '+') r += ' ';
+    else if (c == '%' && i + 2 < s.length() && isxdigit(s[i+1]) && isxdigit(s[i+2])) {
+      auto hex = [](char h)->uint8_t{
+        if (h>='0' && h<='9') return h-'0';
+        if (h>='A' && h<='F') return h-'A'+10;
+        if (h>='a' && h<='f') return h-'a'+10;
+        return 0;
+      };
+      r += char((hex(s[i+1])<<4) | hex(s[i+2]));
+      i += 2;
+    } else r += c;
+  }
+  return r;
+}
+
+/* ========= UART helper ========= */
+void sendLineToArduino(const String &line) {
+  Serial2.print(line);
+  Serial2.print('\n');
+}
+
+/* ========= Flash ========= */
+void setFlash(bool on) {
+  flashOn = on;
+  digitalWrite(FLASH_PIN, on ? HIGH : LOW);
+}
+
+/* ========= Câmera ========= */
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+
+  // Estável para snapshot do app (640x480)
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;   // 10..20 (menor = melhor)
+  config.fb_count     = 2;
+
+  esp_err_t err = esp_camera_init(&config);
+  return (err == ESP_OK);
+}
+
+/* ========= /snapshot ========= */
+void handleSnapshot() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->format != PIXFORMAT_JPEG) {
+    if (fb) esp_camera_fb_return(fb);
+    server.send(503, "text/plain", "NO FRAME");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+/* ========= /status ========= */
+void handleStatus() {
+  StaticJsonDocument<384> doc;
+  doc["ok"]   = true;
+  doc["ip"]   = WiFi.localIP().toString();
+  doc["mode"] = "joystick+uart";
+  doc["led"]  = flashOn;
+  doc["pump"] = pumpOn;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+/* ========= /led?on=0|1 ========= */
+void handleLed() {
+  bool on = server.hasArg("on") && server.arg("on") == "1";
+  setFlash(on);
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= /pump?on=0|1  → UART ========= */
+void handlePump() {
+  bool on = server.hasArg("on") && server.arg("on") == "1";
+  pumpOn = on;
+  sendLineToArduino(on ? "CMD:PUMP:1" : "CMD:PUMP:0");
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= /uart?line=... ========= */
+void handleUart() {
+  if (!server.hasArg("line")) { server.send(400, "text/plain", "missing line"); return; }
+  String line = urlDecode(server.arg("line")); line.trim();
+  if (!line.length()) { server.send(400, "text/plain", "empty line"); return; }
+  sendLineToArduino(line);
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= /joystick?x=&y=  (−1..+1) ========= */
+void handleJoystick() {
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.0f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.0f;
+  if (x > 1) x = 1; if (x < -1) x = -1;
+  if (y > 1) y = 1; if (y < -1) y = -1;
+  joyX = x; joyY = y; lastJoyUpdateMs = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= Joystick → comandos discretos ========= */
+String vecToDir(float x, float y) {
+  float mag = sqrtf(x*x + y*y);
+  if (mag < 0.2f) return "STOP";
+  float deg = atan2f(y, x) * 180.0f / PI;
+  if (deg > -45 && deg <= 45)  return "RIGHT";
+  if (deg > 45  && deg <= 135) return "FWD";
+  if (deg <= -45 && deg > -135) return "BACK";
+  return "LEFT";
+}
+
+void joystickTask(void* _) {
+  const uint32_t TICK_MS = 120;
+  String lastDir = "STOP";
+  for (;;) {
+    float x = joyX, y = joyY;
+    float mag = sqrtf(x*x + y*y);
+    String dir = vecToDir(x, y);
+
+    if (dir == "STOP") {
+      if (lastDir != "STOP") {
+        sendLineToArduino("CMD:STOP");
+        lastDir = "STOP";
+      }
+    } else {
+      int ms  = 140 + int(260.0f * (mag > 1 ? 1 : mag)); // 140..400
+      int spd = 50  + int(50.0f  * (mag > 1 ? 1 : mag)); // 50..100
+      char buf[64];
+      snprintf(buf, sizeof(buf), "CMD:%s:ms=%d:spd=%d", dir.c_str(), ms, spd);
+      sendLineToArduino(String(buf));
+      lastDir = dir;
+    }
+    vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+  }
+}
+
+/* ========= Setup ========= */
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // UART2 → Arduino
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+
+  // Flash (GPIO)
+  pinMode(FLASH_PIN, OUTPUT);
+  setFlash(false);
+
+  // Câmera
+  if (!initCamera()) {
+    Serial.println("[ERR] Camera init failed");
+  } else {
+    Serial.println("[OK] Camera init");
+  }
+
+  // Wi-Fi STA
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(300); Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Failed — will keep retrying in loop()");
+  }
+
+  // HTTP
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/status",   HTTP_GET, handleStatus);
+  server.on("/led",      HTTP_GET, handleLed);
+  server.on("/pump",     HTTP_GET, handlePump);
+  server.on("/uart",     HTTP_GET, handleUart);
+  server.on("/joystick", HTTP_GET, handleJoystick);
+  server.onNotFound([](){ server.send(404, "text/plain", "not found"); });
+  server.begin();
+
+  // Task de joystick (core 0)
+  xTaskCreatePinnedToCore(joystickTask, "joyTask", 4096, nullptr, 1, nullptr, 0);
+
+  // Ping inicial ao Arduino
+  sendLineToArduino("REQ:STATUS");
+}
+
+/* ========= Loop ========= */
+void loop() {
+  server.handleClient();
+
+  // Reconnect Wi-Fi se cair
+  static uint32_t lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 2000) {
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — abaixo está um firmware completo para ESP32-CAM (AI-Thinker) que:
 
 
