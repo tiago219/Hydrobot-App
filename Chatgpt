@@ -1,4 +1,236 @@
 
+# === substitua a classe MJPEGGrabber inteira por esta versão ===
+class MJPEGGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._frames = 0
+        self._fps = 0.0
+        self._last_fps_tick = time.time()
+        self._session = requests.Session()
+        self._last_err: str = ""
+        self._boundary_bytes: bytes = b"--frame"   # default; pode mudar após handshake
+
+    def start(self, ip: Optional[str] = None):
+        if ip: self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _extract_jpeg_soi_eoi(self, buf: bytes) -> Tuple[Optional[bytes], bytes]:
+        """Fallback: procura SOI(FFD8) ... EOI(FFD9). Retorna (jpeg, resto)."""
+        soi = buf.find(b"\xff\xd8")
+        if soi == -1:
+            return None, buf[-2048:] if len(buf) > 2048 else buf
+        eoi = buf.find(b"\xff\xd9", soi + 2)
+        if eoi == -1:
+            # mantém buffer sob controle
+            keep_from = max(0, soi - 2)
+            return None, buf[keep_from:]
+        jpg = buf[soi:eoi + 2]
+        rest = buf[eoi + 2:]
+        return jpg, rest
+
+    def _run(self):
+        backoff = 0.5
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with self._session.get(
+                    url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), headers=REQUEST_HEADERS
+                ) as r:
+                    if r.status_code != 200:
+                        self._last_err = f"http {r.status_code}"
+                        time.sleep(backoff); backoff = min(backoff*2, 5.0); continue
+
+                    # detecta boundary a partir do header
+                    ctype = r.headers.get("Content-Type", "")
+                    # exemplos: multipart/x-mixed-replace; boundary=frame  | boundary=--frame | boundary=123abc
+                    b = None
+                    for part in ctype.split(";"):
+                        part = part.strip().lower()
+                        if part.startswith("boundary="):
+                            raw = part.split("=", 1)[1].strip()
+                            raw = raw.strip('"').strip("'")
+                            if not raw.startswith("--"):
+                                raw = "--" + raw
+                            b = raw.encode("latin-1", errors="ignore")
+                            break
+                    self._boundary_bytes = b or self._boundary_bytes
+
+                    backoff = 0.2
+                    buf = b""
+                    self._frames = 0
+                    self._last_fps_tick = time.time()
+
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set(): break
+                        if not chunk: continue
+                        buf += chunk
+                        # controla crescimento do buffer
+                        if len(buf) > MAX_BYTES:
+                            buf = buf[-MAX_BYTES//2:]
+
+                        boundary = self._boundary_bytes
+                        i = buf.find(boundary)
+                        if i == -1:
+                            # tenta fallback por SOI/EOI
+                            jpg, buf = self._extract_jpeg_soi_eoi(buf)
+                            if jpg:
+                                ts_ms = int(time.time() * 1000)
+                                with self._lock:
+                                    self._last_jpeg = jpg
+                                    self._last_ts_ms = ts_ms
+                                self._frames += 1
+                            continue
+
+                        # após achar o boundary, pula quebras de linha
+                        hdr_start = i + len(boundary)
+                        while hdr_start + 2 <= len(buf) and buf[hdr_start:hdr_start+2] in (b"\r\n", b"\n"):
+                            hdr_start += 2
+
+                        headers_end = buf.find(b"\r\n\r\n", hdr_start)
+                        # alguns firmwares não mandam headers – cai para SOI/EOI
+                        if headers_end == -1:
+                            jpg, buf = self._extract_jpeg_soi_eoi(buf[i + len(boundary):])
+                            if jpg:
+                                ts_ms = int(time.time() * 1000)
+                                with self._lock:
+                                    self._last_jpeg = jpg
+                                    self._last_ts_ms = ts_ms
+                                self._frames += 1
+                            else:
+                                # mantém só a “cauda” para não crescer indefinidamente
+                                buf = buf[-8192:]
+                            continue
+
+                        headers_bytes = buf[hdr_start:headers_end]
+                        content_length = None
+                        for line in headers_bytes.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try:
+                                    content_length = int(line.split(b":", 1)[1].strip())
+                                except Exception:
+                                    content_length = None
+                                break
+
+                        img_start = headers_end + 4
+                        jpeg_bytes = None
+                        if content_length is not None:
+                            if len(buf) < img_start + content_length:
+                                # espera mais dados
+                                continue
+                            jpeg_bytes = buf[img_start:img_start + content_length]
+                            buf = buf[img_start + content_length:]
+                        else:
+                            # sem Content-Length: busca próximo boundary
+                            j = buf.find(boundary, img_start)
+                            if j != -1:
+                                jpeg_bytes = buf[img_start:j]
+                                buf = buf[j:]
+                            else:
+                                # ou tenta SOI/EOI dentro do payload
+                                jpg, rest = self._extract_jpeg_soi_eoi(buf[img_start:])
+                                if jpg:
+                                    jpeg_bytes = jpg
+                                    buf = rest
+                                else:
+                                    continue
+
+                        if jpeg_bytes:
+                            ts_ms = int(time.time() * 1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg_bytes
+                                self._last_ts_ms = ts_ms
+                            self._frames += 1
+                            now = time.time()
+                            if now - self._last_fps_tick >= 1.0:
+                                self._fps = self._frames / (now - self._last_fps_tick)
+                                self._frames = 0
+                                self._last_fps_tick = now
+                            self._last_err = ""
+
+            except Exception as e:
+                self._last_err = f"exc: {type(e).__name__}"
+                time.sleep(backoff); backoff = min(backoff*2, 5.0)
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None: return None
+            if int(time.time() * 1000) - self._last_ts_ms > max_age_ms: return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time() * 1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {
+                "ip": self._ip,
+                "hasFrame": self._last_jpeg is not None,
+                "age_ms": age_ms,
+                "fps_in": round(self._fps, 2),
+                "ts_ms": self._last_ts_ms,
+                "boundary": self._boundary_bytes.decode("latin-1", errors="ignore"),
+                "last_err": self._last_err,
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — adaptei os dois arquivos completos para casar com a lógica nova do ESP (stream em /:80/stream, boundary = frame, robustez de parsing, e sincronização de IP via /config). No app, mantive o modo AUTO (usa servidor se estiver OK, senão cai para DIRECT com WebView do ESP), e acrescentei pequenos ajustes de estabilidade.
 
 
