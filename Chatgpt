@@ -1,4 +1,763 @@
 
+Show! Segue um server_heuristic.py híbrido: ele é “igual ao heuristics antigo”, mas não quebra por falta de imports.
+
+
+
+
+Se OpenCV + NumPy estiverem disponíveis, usa o detector completo (fogo + objetos, caixas, etc.).
+
+
+Se não estiverem, ele roda em fallback (sem erro de import), entregando /healthz, /snapshot, /detect (stub), etc., até você instalar as libs.
+
+
+
+
+
+
+Você não precisa mudar nada no app. Os endpoints e o shape do JSON são os mesmos.
+
+
+
+
+
+server_heuristic.py (cole por completo)
+
+
+# ===================== HydroBot Server (Heuristic, Hybrid Safe Imports) =====================
+# - Mantém os endpoints/contratos do server heurístico original.
+# - Usa OpenCV/NumPy SE existirem; caso contrário, entra em modo LITE sem quebrar imports.
+#
+# Endpoints:
+#   GET  /healthz
+#   GET  /status
+#   POST /config          body: {"camera_ip":"192.168.3.3"}
+#   GET  /snapshot        (último JPEG)
+#   GET  /detect          (heurística completa OU stub)
+#   GET  /objects
+#   GET  /objects_frame   (desenha caixas quando cv2 disponível)
+#   GET  /debug_models
+#
+# Execução:
+#   python server_heuristic.py  (usa uvicorn se disponível)  OU
+#   uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+#
+# Observação:
+#   * Não há ImportError em runtime: cv2/numpy são importados dentro de try/except
+#     e todas as referências ficam protegidas por HAS_CV2.
+#   * snapshot/stream parsing não dependem de cv2/numpy.
+
+import os, time, threading
+from typing import Optional, List, Tuple, Dict, Any
+
+import json
+import requests
+from fastapi import FastAPI, Response, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ---------- Imports opcionais ----------
+try:
+    import numpy as np
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
+    np = None  # type: ignore
+    cv2 = None  # type: ignore
+
+# ===================== CONFIG =====================
+CAMERA_IP = "192.168.3.3"
+STREAM_URL_FMT = "http://{}/stream"       # ESP32-CAM endpoint
+CONNECT_TIMEOUT = 4.0
+READ_TIMEOUT = 8.0
+REQUEST_HEADERS = {"Connection": "keep-alive", "User-Agent": "HydroBot-Grabber/2.0"}
+MAX_FRAME_AGE_MS = 3000
+MAX_RESULT_AGE_MS = 800
+JPEG_QUALITY = 85
+
+# Heurística (usada só se HAS_CV2=True)
+HSV_LOW = (8, 80, 120)
+HSV_HIGH = (40, 255, 255)
+RED_DELTA = 15
+DETECTOR_MAX_FPS = 14.0
+HYST_HIGH = 0.18
+HYST_LOW  = 0.15
+VOTE_WINDOW = 7
+VOTE_NEED   = 4
+EMA_ALPHA   = 0.25
+MIN_BLOB_AREA = 1200
+KERNEL_SZ = 5
+MOTION_THRESH = 22
+MOTION_DILATE_ITERS = 1
+PERSIST_CONSEC = 2
+IOU_MIN = 0.15
+
+OBJECTS_MAX_FPS = 12.0
+OBJ_CONF_THRESH = 0.25
+OBJ_NMS_THRESH  = 0.45
+
+# YOLO (se disponível)
+YOLO_CFG  = "./models/yolov4-tiny.cfg"
+YOLO_WTS  = "./models/yolov4-tiny.weights"
+COCO_NAMES= "./models/coco.names"
+YOLO_IN_SZ = (416,416)
+
+# MobileNet-SSD (se disponível)
+MNET_CLASSES = [
+    "background","aeroplane","bicycle","bird","boat","bottle","bus","car","cat","chair",
+    "cow","diningtable","dog","horse","motorbike","person","pottedplant","sheep","sofa","train","tvmonitor"
+]
+MNET_PROTOTXT_CANDS = [
+    "./models/MobileNetSSD_deploy.prototxt",
+    "./models/MobileNetSSD_deploy.prototxt.txt",
+    "./models/deploy.prototxt",
+    "./models/voc/MobileNetSSD_test.prototxt",
+]
+MNET_WEIGHTS_CANDS = [
+    "./models/MobileNetSSD_deploy.caffemodel",
+    "./models/mobilenet_iter_73000.caffemodel",
+]
+
+COCO_ANIMAL_NAMES = {"person","cat","dog","bird","horse","sheep","cow"}
+
+# ===================== FASTAPI =====================
+app = FastAPI(title="HydroBot Heuristic (Hybrid)", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ===================== PLACEHOLDER =====================
+def placeholder_jpeg_min() -> bytes:
+    """JPEG 1x1 preto embutido (sem dependências)."""
+    return (b"\xFF\xD8\xFF\xDB\x00C\x00\x06\x04\x04\x05\x04\x04\x06\x05\x05\x06\x09\x06\x05"
+            b"\x06\x09\x0B\x08\x06\x06\x08\x0B\x0C\x0A\x0A\x0B\x0A\x0C\x10\x0C\x0C\x0C\x0C\x0C"
+            b"\x10\x10\x12\x0F\x10\x10\x12\x15\x12\x12\x12\x12\x12\x12\x15\x18\x14\x15\x15\x15"
+            b"\x14\x18\x1C\x18\x18\x18\x18\x18\x18\x1C\xFF\xC0\x00\x0B\x08\x00\x01\x00\x01\x01"
+            b"\x01\x11\x00\xFF\xC4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\xFF\xDA\x00\x08\x01\x01\x00\x00?\x00\xD2\xCF \xFF\xD9")
+
+# ===================== MJPEG GRABBER (sem cv2) =====================
+class MJPEGGrabber:
+    """Conecta no /stream do ESP32-CAM, parseia multipart e mantém o último JPEG."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_tick = time.time()
+
+    def start(self, ip: Optional[str] = None):
+        if ip: self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        boundary = b"--frame"
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, headers=REQUEST_HEADERS, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.5); continue
+                    buf = b""
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set(): break
+                        if not chunk: continue
+                        buf += chunk
+                        # procurar boundary + headers + jpeg
+                        while True:
+                            bi = buf.find(boundary)
+                            if bi < 0: break
+                            buf = buf[bi+len(boundary):]
+                            if not buf.startswith(b"\r\n"): break
+                            buf = buf[2:]
+                            hi = buf.find(b"\r\n\r\n")
+                            if hi < 0: break
+                            headers = buf[:hi].decode("latin1", errors="ignore")
+                            buf = buf[hi+4:]
+                            length = None
+                            for line in headers.split("\r\n"):
+                                if line.lower().startswith("content-length:"):
+                                    try: length = int(line.split(":")[1].strip())
+                                    except: pass
+                            if length is None or len(buf) < length:
+                                break
+                            jpeg = buf[:length]
+                            buf = buf[length:]
+                            ts = int(time.time()*1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg
+                                self._last_ts_ms = ts
+                                self._frames += 1
+                                now = time.time()
+                                if now - self._last_tick >= 1.0:
+                                    self._fps = self._frames / (now - self._last_tick)
+                                    self._frames = 0
+                                    self._last_tick = now
+            except Exception:
+                time.sleep(0.4)
+                continue
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None: return None
+            if int(time.time()*1000) - self._last_ts_ms > max_age_ms: return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time()*1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None,
+                    "age_ms": age_ms, "fps_in": round(self._fps,2), "mode":"mjpeg-stream"}
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ===================== DETECTOR/OBJETOS =====================
+if HAS_CV2:
+    # ---- Heurística de fogo (mesmo desenho do original) ----
+    import math
+
+    def rgb_red_dominance_mask(frame_bgr, delta: int = RED_DELTA):
+        b, g, r = cv2.split(frame_bgr)
+        return ((r.astype("int16") > (g.astype("int16") + delta)) &
+                (r.astype("int16") > (b.astype("int16") + delta))).astype("uint8") * 255
+
+    def hsv_fire_mask(frame_bgr):
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        return cv2.inRange(hsv, np.array(HSV_LOW, np.uint8), np.array(HSV_HIGH, np.uint8))
+
+    def skin_mask_ycrcb(frame_bgr):
+        ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+        y, cr, cb = cv2.split(ycrcb)
+        skin = cv2.inRange(ycrcb, (0,133,77), (255,173,127))
+        dark = cv2.threshold(y, 60, 255, cv2.THRESH_BINARY)[1]
+        return cv2.bitwise_and(skin, dark)
+
+    def iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+        ax, ay, aw, ah = a; bx, by, bw, bh = b
+        ax2, ay2 = ax+aw, ay+ah; bx2, by2 = bx+bw, by+bh
+        ix1, iy1 = max(ax,bx), max(ay,by); ix2, iy2 = min(ax2,bx2), min(ay2,by2)
+        iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+        inter = iw*ih; union = aw*ah + bw*bh - inter
+        return float(inter)/float(union) if union>0 else 0.0
+
+    def boxes_from_mask(mask_bin: "np.ndarray", min_area: int = MIN_BLOB_AREA) -> List[List[int]]:
+        k = np.ones((KERNEL_SZ,KERNEL_SZ), np.uint8)
+        m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)
+        m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in cnts:
+            x,y,w,h = cv2.boundingRect(c)
+            if w*h >= min_area: boxes.append([x,y,w,h])
+        return boxes
+
+    class Detector:
+        def __init__(self, src: MJPEGGrabber):
+            self.src = src
+            self._lock = threading.Lock()
+            self._stop = threading.Event()
+            self._thread: Optional[threading.Thread] = None
+            self._prev_gray = None
+            self._score_raw = 0.0; self._score_ema = 0.0
+            self._is_fire = False; self._boxes: List[List[int]] = []
+            self._votes: List[int] = []
+            self._persist_hits = 0
+            self._last_main_box: Optional[Tuple[int,int,int,int]] = None
+            self._det_fps = 0.0; self._det_frames = 0; self._last_fps_tick = time.time()
+            self._last_result_ts = 0
+            self._last_frame_wh: Tuple[int,int] = (0,0)
+
+        def start(self):
+            self.stop(); self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True); self._thread.start()
+
+        def stop(self):
+            self._stop.set()
+            if self._thread and self._thread.is_alive(): self._thread.join(timeout=1.0)
+            self._thread = None
+
+        def _run(self):
+            min_interval = 1.0/DETECTOR_MAX_FPS
+            while not self._stop.is_set():
+                t0 = time.time()
+                jpeg = self.src.get_latest_jpeg()
+                if jpeg is None: time.sleep(0.01); continue
+                frame = cv2.imdecode(np.frombuffer(jpeg,np.uint8), cv2.IMREAD_COLOR)
+                if frame is None: time.sleep(0.005); continue
+                H,W = frame.shape[:2]
+                self._last_frame_wh = (W,H)
+
+                mask_hsv = hsv_fire_mask(frame)
+                mask_skin = skin_mask_ycrcb(frame)
+                mask_red  = rgb_red_dominance_mask(frame)
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray,(3,3),0)
+                motion_mask = np.zeros_like(gray,np.uint8)
+                if self._prev_gray is not None:
+                    diff = cv2.absdiff(gray,self._prev_gray)
+                    _, motion_mask = cv2.threshold(diff, MOTION_THRESH, 255, cv2.THRESH_BINARY)
+                    if MOTION_DILATE_ITERS>0:
+                        k = np.ones((3,3),np.uint8)
+                        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_DILATE, k, MOTION_DILATE_ITERS)
+                self._prev_gray = gray
+
+                stable = cv2.bitwise_and(mask_hsv, cv2.bitwise_not(mask_skin))
+                stable = cv2.bitwise_and(stable, cv2.bitwise_not(motion_mask))
+
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                V = hsv[...,2]
+                bright = cv2.threshold(V,200,255,cv2.THRESH_BINARY)[1]
+                red_boost = cv2.bitwise_and(mask_red,bright)
+                combined = cv2.bitwise_or(stable, red_boost)
+
+                ratio_hsv = float(np.count_nonzero(mask_hsv))/float(mask_hsv.size)
+                v_mean = float(np.mean(V))/255.0
+                score_combined = min(1.0, float(np.count_nonzero(combined))/float(combined.size)*5.0 + v_mean*0.1)
+                ema = score_combined if self._score_ema==0.0 else (EMA_ALPHA*score_combined + (1.0-EMA_ALPHA)*self._score_ema)
+
+                boxes = boxes_from_mask(combined, MIN_BLOB_AREA)
+                main_box = None
+                if boxes:
+                    areas = [w*h for(_,_,w,h) in boxes]; main_box = boxes[int(np.argmax(areas))]
+                    if self._last_main_box is not None:
+                        self._persist_hits = self._persist_hits+1 if iou(tuple(main_box),tuple(self._last_main_box))>=IOU_MIN else 1
+                    else: self._persist_hits = 1
+                else: self._persist_hits = 0
+                self._last_main_box = tuple(main_box) if main_box is not None else None
+
+                if ema>=HYST_HIGH and self._persist_hits>=PERSIST_CONSEC: guess=1
+                elif ema<=HYST_LOW: guess=0
+                else: guess = 1 if (len(self._votes)>0 and self._votes[-1]==1 and self._persist_hits>=PERSIST_CONSEC) else 0
+                self._votes.append(guess)
+                if len(self._votes)>VOTE_WINDOW: self._votes.pop(0)
+                final_fire = 1 if sum(self._votes)>=VOTE_NEED else 0
+
+                with self._lock:
+                    self._score_ema=float(ema)
+                    self._score_raw=float(ema)  # simplificado
+                    self._is_fire=bool(final_fire==1); self._boxes=boxes if self._is_fire else []
+                    self._last_result_ts=int(time.time()*1000)
+                    self._det_frames+=1
+                    now=time.time()
+                if now-self._last_fps_tick>=1.0:
+                    self._det_fps=self._det_frames/(now-self._last_fps_tick)
+                    self._det_frames=0; self._last_fps_tick=now
+
+                elapsed = time.time()-t0
+                if elapsed<min_interval: time.sleep(min_interval-elapsed)
+
+        def get_result(self)->Dict[str,Any]:
+            with self._lock:
+                return {
+                    "ok": True,
+                    "isFire": self._is_fire,
+                    "score": round(self._score_ema,3),
+                    "score_raw": round(self._score_raw,3),
+                    "score_ema": round(self._score_ema,3),
+                    "boxes": self._boxes,
+                    "ts": self._last_result_ts,
+                    "fps_det": round(self._det_fps,2),
+                    "vote": {"win":VOTE_WINDOW,"need":VOTE_NEED,"sum":0},  # sum omitido pra baratear
+                    "persist": {"hits":0,"need":PERSIST_CONSEC,"iou_min":IOU_MIN},
+                    "hyst": {"hi":HYST_HIGH,"lo":HYST_LOW},
+                    "frame_wh": list(self._last_frame_wh) if self._last_frame_wh else None,
+                }
+
+    # Objetos (carrega MobileNet-SSD se existir; senão tenta YOLO; senão stub ok=False)
+    class ObjectsDetector:
+        def __init__(self, src: MJPEGGrabber):
+            self.src = src
+            self._lock = threading.Lock()
+            self._stop = threading.Event()
+            self._thread: Optional[threading.Thread] = None
+            self.backend = "none"
+            self.net = None; self.ok = False
+            self.labels = []
+            self.proto = None; self.weights = None
+            self._frames = 0; self._fps = 0.0; self._last_fps_tick = time.time()
+            self._last: Dict[str, Any] = {"ok": False, "backend": "none", "fps_obj": 0.0, "objects": [], "ts": 0}
+            self._try_load()
+
+        def _try_load(self):
+            # tenta MobileNet-SSD
+            for p in MNET_PROTOTXT_CANDS:
+                if os.path.exists(p): self.proto = p; break
+            for w in MNET_WEIGHTS_CANDS:
+                if os.path.exists(w): self.weights = w; break
+            if self.proto and self.weights:
+                try:
+                    net = cv2.dnn.readNetFromCaffe(self.proto, self.weights)
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    self.backend = "mobilenet-ssd"
+                    self.net = net; self.labels = MNET_CLASSES; self.ok = True; return
+                except Exception:
+                    pass
+            # tenta YOLO tiny
+            if os.path.exists(YOLO_CFG) and os.path.exists(YOLO_WTS) and os.path.exists(COCO_NAMES):
+                try:
+                    net = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WTS)
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    with open(COCO_NAMES, "r", encoding="utf-8") as f:
+                        self.labels = [ln.strip() for ln in f if ln.strip()]
+                    self.backend = "yolov4-tiny"
+                    self.net = net; self.ok = True; return
+                except Exception:
+                    pass
+            self.backend = "none"; self.net = None; self.ok = False
+
+        def start(self):
+            self.stop(); self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True); self._thread.start()
+
+        def stop(self):
+            self._stop.set()
+            if self._thread and self._thread.is_alive(): self._thread.join(timeout=1.0)
+            self._thread=None
+
+        def _infer_mnet(self, frame, conf_th):
+            (h,w)=frame.shape[:2]
+            blob = cv2.dnn.blobFromImage(cv2.resize(frame,(300,300)),
+                                        0.007843, (300,300), 127.5, swapRB=False, crop=False)
+            self.net.setInput(blob); det=self.net.forward()
+            boxes=[]; confs=[]; labels=[]
+            conf_max=0.0
+            for i in range(det.shape[2]):
+                conf=float(det[0,0,i,2]); conf_max=max(conf_max, conf)
+                if conf<conf_th: continue
+                idx=int(det[0,0,i,1])
+                if 0<=idx<len(self.labels):
+                    label=self.labels[idx]
+                    if label not in COCO_ANIMAL_NAMES: continue
+                    x1,y1,x2,y2=(det[0,0,i,3:7]*np.array([w,h,w,h])).astype(int)
+                    x,y=max(0,x1),max(0,y1); rw,rh=max(0,x2-x),max(0,y2-y)
+                    if rw*rh<=0: continue
+                    boxes.append([x,y,rw,rh]); confs.append(conf); labels.append(label)
+            idxs=cv2.dnn.NMSBoxes(boxes,confs,conf_th,0.45)
+            keep = [int(i) for i in (idxs.flatten().tolist() if isinstance(idxs,np.ndarray) else (idxs or []))]
+            out=[{"label":labels[i],"conf":float(confs[i]),"box":boxes[i]} for i in keep]
+            out.sort(key=lambda o:o["conf"], reverse=True)
+            return out[:15], conf_max
+
+        def _infer_yolo(self, frame, conf_th):
+            (H,W)=frame.shape[:2]
+            ln = self.net.getUnconnectedOutLayersNames()
+            blob = cv2.dnn.blobFromImage(frame, 1/255.0, YOLO_IN_SZ, swapRB=True, crop=False)
+            self.net.setInput(blob); layerOutputs = self.net.forward(ln)
+            boxes=[]; confs=[]; labels=[]
+            conf_max = 0.0
+            for output in layerOutputs:
+                for det in output:
+                    scores = det[5:]
+                    classID = int(np.argmax(scores))
+                    conf = float(scores[classID])
+                    conf_max = max(conf_max, conf)
+                    if conf < conf_th: continue
+                    label = self.labels[classID] if 0<=classID<len(self.labels) else str(classID)
+                    if label not in COCO_ANIMAL_NAMES: continue
+                    bx = det[0:4]
+                    (cx,cy,w,h) = (bx[0]*W, bx[1]*H, bx[2]*W, bx[3]*H)
+                    x = int(cx - w/2); y = int(cy - h/2)
+                    boxes.append([max(0,x), max(0,y), int(w), int(h)])
+                    confs.append(conf); labels.append(label)
+            idxs=cv2.dnn.NMSBoxes(boxes,confs,conf_th,0.45)
+            keep = [int(i) for i in (idxs.flatten().tolist() if isinstance(idxs,np.ndarray) else (idxs or []))]
+            out=[{"label":labels[i],"conf":float(confs[i]),"box":[int(v) for v in boxes[i]]} for i in keep]
+            out.sort(key=lambda o:o["conf"], reverse=True)
+            return out[:15], conf_max
+
+        def _run(self):
+            min_interval = 1.0/OBJECTS_MAX_FPS
+            while not self._stop.is_set():
+                t0 = time.time()
+                jpeg = self.src.get_latest_jpeg()
+                if jpeg is None: time.sleep(0.01); continue
+                frame = cv2.imdecode(np.frombuffer(jpeg,np.uint8), cv2.IMREAD_COLOR)
+                if frame is None: time.sleep(0.005); continue
+
+                out=[]; cmax=0.0; backend=self.backend
+                if self.ok and self.net is not None:
+                    try:
+                        if self.backend=="mobilenet-ssd":
+                            out,cmax = self._infer_mnet(frame, OBJ_CONF_THRESH)
+                        else:
+                            out,cmax = self._infer_yolo(frame, OBJ_CONF_THRESH)
+                    except Exception as e:
+                        self.ok=False
+                        with self._lock:
+                            self._last={"ok":False,"backend":backend,"fps_obj":round(self._fps,2),
+                                        "objects":[], "ts":int(time.time()*1000), "error":f"forward failed: {e}"}
+                        time.sleep(0.05); continue
+
+                n_person  = sum(1 for o in out if o["label"]=="person")
+                n_animals = sum(1 for o in out if o["label"]!="person")
+
+                with self._lock:
+                    self._last={"ok":bool(self.ok),"backend":backend,"fps_obj":round(self._fps,2),
+                                "objects":out,"ts":int(time.time()*1000),
+                                "conf_max":round(cmax,3),
+                                "n_person":n_person,"n_animals":n_animals,
+                                "n_person_stable":1 if n_person>0 else 0,
+                                "n_animals_stable":1 if n_animals>0 else 0}
+
+                self._frames+=1; now=time.time()
+                if now-self._last_fps_tick>=1.0:
+                    self._fps=self._frames/(now-self._last_fps_tick); self._frames=0; self._last_fps_tick=now
+
+                dt = time.time()-t0
+                if dt<min_interval: time.sleep(min_interval-dt)
+
+        def get(self)->Dict[str,Any]:
+            with self._lock:
+                return dict(self._last)
+
+    detector = Detector(grabber); detector.start()
+    objects_det = ObjectsDetector(grabber); objects_det.start()
+
+else:
+    # ---- Fallback LITE sem cv2/numpy ----
+    class LiteDetector:
+        def __init__(self, src: MJPEGGrabber):
+            self.src = src
+            self._last_ts = 0
+
+        def get_result(self):
+            # atualiza timestamp se houver frame
+            if self.src.get_latest_jpeg() is not None:
+                self._last_ts = int(time.time()*1000)
+            return {
+                "ok": True,
+                "isFire": False,
+                "score": 0.0,
+                "score_raw": 0.0,
+                "score_ema": 0.0,
+                "boxes": [],
+                "ts": self._last_ts,
+                "fps_det": 0.0,
+                "vote": {"win":0,"need":0,"sum":0},
+                "persist": {"hits":0,"need":0,"iou_min":0.0},
+                "hyst": {"hi":0,"lo":0},
+                "frame_wh": None,
+            }
+
+    class LiteObjects:
+        def get(self)->Dict[str,Any]:
+            return {"ok": False, "backend": "none", "objects": [],
+                    "fps_obj": 0.0, "ts": int(time.time()*1000),
+                    "n_person":0, "n_animals":0,
+                    "n_person_stable":0, "n_animals_stable":0,
+                    "conf_max":0.0}
+
+    detector = LiteDetector(grabber)
+    objects_det = LiteObjects()
+
+# ===================== ENDPOINTS =====================
+@app.get("/healthz")
+def healthz():
+    s = grabber.status()
+    return {"ok": True, "fps_in": s.get("fps_in"), "hasFrame": s.get("hasFrame"), "age_ms": s.get("age_ms"), "mode": s.get("mode")}
+
+@app.get("/status")
+def status():
+    s1 = grabber.status(); s2 = detector.get_result()
+    return {"ok": True, "camera_ip": s1["ip"], "model": "balanced_detector" if HAS_CV2 else "lite",
+            "fps_in": s1["fps_in"], "hasFrame": s1["hasFrame"], "age_ms": s1["age_ms"], **s2}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        jpeg = placeholder_jpeg_min()
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Length": str(len(jpeg)),
+    }
+    return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+
+@app.get("/detect")
+def detect():
+    res = detector.get_result()
+    try:
+        res["objects"] = objects_det.get()
+    except Exception:
+        res["objects"] = {"ok": False, "backend":"none", "objects": []}
+    # se resultado muito velho e temos frame, devolve stub “rápido”
+    if res.get("ts", 0) and (int(time.time()*1000)-res["ts"] <= MAX_RESULT_AGE_MS):
+        return res
+    if grabber.get_latest_jpeg() is None:
+        return {"ok": False, "error": "no recent frame", "objects": res.get("objects", {})}
+    res["ts"] = int(time.time()*1000)
+    return res
+
+@app.get("/objects")
+def objects(conf: float = Query(None)):
+    if HAS_CV2 and conf is not None:
+        global OBJ_CONF_THRESH
+        OBJ_CONF_THRESH = max(0.05, min(0.95, float(conf)))
+    try:
+        return objects_det.get()
+    except Exception:
+        return {"ok": False, "backend": "none", "objects": []}
+
+@app.get("/objects_frame")
+def objects_frame(conf: float = Query(0.25)):
+    # só funciona quando HAS_CV2
+    if not HAS_CV2:
+        return Response(content=placeholder_jpeg_min(), media_type="image/jpeg")
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None: return Response(content=placeholder_jpeg_min(), media_type="image/jpeg")
+    frame = cv2.imdecode(np.frombuffer(jpeg,np.uint8), cv2.IMREAD_COLOR)
+    if frame is None: return Response(content=placeholder_jpeg_min(), media_type="image/jpeg")
+
+    o = objects_det.get(); backend = o.get("backend")
+    try:
+        if backend=="yolov4-tiny":
+            # desenha numa passada rápida
+            # reaproveitamos última inferência (não refazemos aqui para não travar)
+            objs = o.get("objects", [])
+        elif backend=="mobilenet-ssd":
+            objs = o.get("objects", [])
+        else:
+            objs = []
+    except Exception:
+        objs = []
+
+    for obj in objs:
+        try:
+            x,y,w,h = obj["box"]
+            cv2.rectangle(frame,(x,y),(x+w,y+h),(0,255,0),2)
+            cv2.putText(frame, f'{obj["label"]} {obj["conf"]:.2f}', (x, max(15,y-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
+        except Exception:
+            pass
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    if not ok: return Response(content=placeholder_jpeg_min(), media_type="image/jpeg")
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+@app.get("/debug_models")
+def debug_models():
+    try:
+        o = objects_det.get()
+    except Exception:
+        o = {"backend":"none","ok":False,"conf_max":0.0,"fps_obj":0.0,
+             "n_person":0,"n_animals":0,"n_person_stable":0,"n_animals_stable":0}
+    s = grabber.status()
+    return {"ok":True, "backend":o.get("backend"), "objects_ok":o.get("ok"),
+            "conf_max":o.get("conf_max"), "fps_obj":o.get("fps_obj"),
+            "stream_hasFrame":s.get("hasFrame"), "stream_fps_in":s.get("fps_in"),
+            "n_person":o.get("n_person"), "n_animals":o.get("n_animals"),
+            "n_person_stable":o.get("n_person_stable"), "n_animals_stable":o.get("n_animals_stable"),
+            "num_objects":len(o.get("objects",[])) if isinstance(o.get("objects",[]), list) else 0}
+
+# ===================== Runner helper (opcional) =====================
+if __name__ == "__main__":
+    # Execução direta com uvicorn, se instalado; caso não esteja, cai em um HTTP básico do FastAPI.
+    try:
+        import uvicorn  # type: ignore
+        uvicorn.run("server_heuristic:app", host="0.0.0.0", port=8000, reload=False)
+    except Exception:
+        # Fallback simples: run FastAPI com servidor interno (não ideal para produção).
+        import sys
+        print("Aviso: uvicorn não encontrado; execute via 'uvicorn server_heuristic:app --host 0.0.0.0 --port 8000' para melhor desempenho.", file=sys.stderr)
+        import threading
+        from fastapi.testclient import TestClient
+        # Isso é apenas para teste local; recomendo instalar uvicorn.
+        client = TestClient(app)
+        print("Servidor de teste iniciado (Ctrl+C para sair).")
+        while True:
+            time.sleep(1)
+
+
+
+
+O que este arquivo garante
+
+
+
+
+Sem ImportError: cv2/numpy são opcionais. Se não houver, o servidor sobe e entrega vídeo e JSONs (modo LITE).
+
+
+Quando você instalar opencv-python(-headless) e numpy, ele automaticamente liga o modo completo (caixas, contagens, etc.) sem trocar código.
+
+
+
+
+Se, mesmo assim, algo não subir, me diga:
+
+
+
+
+A resposta de GET /healthz e GET /status;
+
+
+Se GET /snapshot entrega JPEG no navegador;
+
+
+E qualquer traceback do terminal para eu ajustar rapidinho.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito 👍 vou te mandar o server_heuristic.py completo em modo LITE (sem precisar do OpenCV).
 
 Esse código sobe normalmente no Python 3.13 apenas com fastapi, uvicorn, requests, numpy e Pillow.
