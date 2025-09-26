@@ -1,4 +1,738 @@
 
+/*  ESP32-CAM (AI Thinker) — Bridge HTTP ↔ UART (Arduino) via Roteador
+    - Conecta no Wi-Fi do seu roteador (STA) com IP fixo
+    - Endpoints HTTP (porta 80):
+        GET /status                  -> JSON de saúde
+        GET /uart?line=...           -> envia "line\n" na UART para o Arduino
+        GET /pump?on=0|1             -> envia "CMD:PUMP:0|1\n"
+        GET /joystick?x=..&y=..      -> encaminha a própria linha GET e também um CMD discreto
+    - Usa UART0 (GPIO1=TX0 -> RX do Arduino | GPIO3=RX0 <- TX do Arduino com divisor 5V→3.3V)
+    - Não usa câmera (máxima estabilidade)
+    - Desativa brownout detector e Wi-Fi sleep
+    - Board no Arduino IDE: "AI Thinker ESP32-CAM"
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "soc/rtc_cntl_reg.h"
+
+// ====== Wi-Fi do roteador (troque aqui) ======
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+// IP fixo (altere se precisar)
+IPAddress IP(192,168,3,3);
+IPAddress GW(192,168,3,1);
+IPAddress MASK(255,255,255,0);
+IPAddress DNS1(8,8,8,8);
+IPAddress DNS2(1,1,1,1);
+
+// ====== HTTP ======
+WebServer server(80);
+
+// ====== helpers ======
+static String urlDecode(const String &s) {
+  String out; out.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for (size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if (c=='+') out+=' ';
+    else if (c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if (h1>=0 && h2>=0) { out+=(char)((h1<<4)|h2); i+=2; }
+      else out+=c;
+    } else out+=c;
+  }
+  return out;
+}
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ====== endpoints ======
+void handle_status() {
+  sendCORS();
+  String j = "{\"ok\":true,\"role\":\"bridge\",\"ip\":\""+WiFi.localIP().toString()+"\"}";
+  server.send(200,"application/json",j);
+}
+
+void handle_uart() {
+  sendCORS();
+  if (!server.hasArg("line")) { server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  Serial.print(line);
+  if (!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump() {
+  sendCORS();
+  if (!server.hasArg("on")) { server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on? "PUMP_ON\n" : "PUMP_OFF\n");
+}
+
+void handle_joystick() {
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // 1) Encaminha a própria URL para compatibilidade com seu Arduino
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // 2) Redundância: comando discreto proporcional ao módulo
+  float m = sqrtf(x*x + y*y);
+  if (m < 0.20f) {
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir = "LEFT";
+    if (deg > -45 && deg <= 45) dir="RIGHT";
+    else if (deg > 45 && deg <= 135) dir="FWD";
+    else if (deg <= -45 && deg > -135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f, m)*260.0f); // 120..380 ms
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+void handle_options() { // CORS preflight
+  sendCORS();
+  server.send(204);
+}
+
+// ====== setup/loop ======
+void setup() {
+  // UART0 -> Arduino (GPIO1 TX0 / GPIO3 RX0)
+  // ATENÇÃO: Arduino TX (5V) -> ESP RX0 (GPIO3) precisa de DIVISOR 5V->3.3V
+  Serial.begin(115200);
+  delay(50);
+
+  // melhora estabilidade com fontes limítrofes
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.config(IP, GW, MASK, DNS1, DNS2);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0 < 15000) {
+    delay(200);
+  }
+
+  server.on("/status",    HTTP_GET, handle_status);
+  server.on("/uart",      HTTP_GET, handle_uart);
+  server.on("/pump",      HTTP_GET, handle_pump);
+  server.on("/joystick",  HTTP_GET, handle_joystick);
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+  server.on("/", HTTP_OPTIONS, handle_options);
+  server.on("/uart", HTTP_OPTIONS, handle_options);
+  server.on("/pump", HTTP_OPTIONS, handle_options);
+  server.on("/joystick", HTTP_OPTIONS, handle_options);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  delay(1); // coopera com WDT
+}
+
+
+
+Ligação com o Arduino (via roteador como intermediário):
+
+
+
+
+ESP32-CAM conecta ao roteador (WIFI_SSID/PASS).
+
+
+App/servidor chama http://192.168.3.3/uart?line=..., /pump?on=1, /joystick?....
+
+
+ESP repassa para o Arduino via UART0:
+
+
+
+ESP U0TXD (GPIO1) → Arduino RX (D0)
+
+
+Arduino TX (D1) → divisor 5V→3.3V → ESP U0RXD (GPIO3)
+
+
+
+
+
+
+GND comum entre ESP e Arduino.
+
+
+Fonte 5V dedicada ao ESP32-CAM (≥1 A). Não use o 5V do FTDI/Arduino para alimentar a câmera.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*  ESP32-CAM (AI Thinker) — Bridge HTTP ↔ UART (Arduino) via Roteador
+    - Conecta no Wi-Fi do seu roteador (STA) com IP fixo
+    - Endpoints HTTP (porta 80):
+        GET /status                  -> JSON de saúde
+        GET /uart?line=...           -> envia "line\n" na UART para o Arduino
+        GET /pump?on=0|1             -> envia "CMD:PUMP:0|1\n"
+        GET /joystick?x=..&y=..      -> encaminha a própria linha GET e também um CMD discreto
+    - Usa UART0 (GPIO1=TX0 -> RX do Arduino | GPIO3=RX0 <- TX do Arduino com divisor 5V→3.3V)
+    - Não usa câmera (máxima estabilidade)
+    - Desativa brownout detector e Wi-Fi sleep
+    - Board no Arduino IDE: "AI Thinker ESP32-CAM"
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "soc/rtc_cntl_reg.h"
+
+// ====== Wi-Fi do roteador (troque aqui) ======
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+// IP fixo (altere se precisar)
+IPAddress IP(192,168,3,3);
+IPAddress GW(192,168,3,1);
+IPAddress MASK(255,255,255,0);
+IPAddress DNS1(8,8,8,8);
+IPAddress DNS2(1,1,1,1);
+
+// ====== HTTP ======
+WebServer server(80);
+
+// ====== helpers ======
+static String urlDecode(const String &s) {
+  String out; out.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for (size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if (c=='+') out+=' ';
+    else if (c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if (h1>=0 && h2>=0) { out+=(char)((h1<<4)|h2); i+=2; }
+      else out+=c;
+    } else out+=c;
+  }
+  return out;
+}
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ====== endpoints ======
+void handle_status() {
+  sendCORS();
+  String j = "{\"ok\":true,\"role\":\"bridge\",\"ip\":\""+WiFi.localIP().toString()+"\"}";
+  server.send(200,"application/json",j);
+}
+
+void handle_uart() {
+  sendCORS();
+  if (!server.hasArg("line")) { server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  Serial.print(line);
+  if (!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump() {
+  sendCORS();
+  if (!server.hasArg("on")) { server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on? "PUMP_ON\n" : "PUMP_OFF\n");
+}
+
+void handle_joystick() {
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // 1) Encaminha a própria URL para compatibilidade com seu Arduino
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // 2) Redundância: comando discreto proporcional ao módulo
+  float m = sqrtf(x*x + y*y);
+  if (m < 0.20f) {
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir = "LEFT";
+    if (deg > -45 && deg <= 45) dir="RIGHT";
+    else if (deg > 45 && deg <= 135) dir="FWD";
+    else if (deg <= -45 && deg > -135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f, m)*260.0f); // 120..380 ms
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+void handle_options() { // CORS preflight
+  sendCORS();
+  server.send(204);
+}
+
+// ====== setup/loop ======
+void setup() {
+  // UART0 -> Arduino (GPIO1 TX0 / GPIO3 RX0)
+  // ATENÇÃO: Arduino TX (5V) -> ESP RX0 (GPIO3) precisa de DIVISOR 5V->3.3V
+  Serial.begin(115200);
+  delay(50);
+
+  // melhora estabilidade com fontes limítrofes
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.config(IP, GW, MASK, DNS1, DNS2);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0 < 15000) {
+    delay(200);
+  }
+
+  server.on("/status",    HTTP_GET, handle_status);
+  server.on("/uart",      HTTP_GET, handle_uart);
+  server.on("/pump",      HTTP_GET, handle_pump);
+  server.on("/joystick",  HTTP_GET, handle_joystick);
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+  server.on("/", HTTP_OPTIONS, handle_options);
+  server.on("/uart", HTTP_OPTIONS, handle_options);
+  server.on("/pump", HTTP_OPTIONS, handle_options);
+  server.on("/joystick", HTTP_OPTIONS, handle_options);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  delay(1); // coopera com WDT
+}
+
+
+
+Ligação com o Arduino (via roteador como intermediário):
+
+
+
+
+ESP32-CAM conecta ao roteador (WIFI_SSID/PASS).
+
+
+App/servidor chama http://192.168.3.3/uart?line=..., /pump?on=1, /joystick?....
+
+
+ESP repassa para o Arduino via UART0:
+
+
+
+ESP U0TXD (GPIO1) → Arduino RX (D0)
+
+
+Arduino TX (D1) → divisor 5V→3.3V → ESP U0RXD (GPIO3)
+
+
+
+
+
+
+GND comum entre ESP e Arduino.
+
+
+Fonte 5V dedicada ao ESP32-CAM (≥1 A). Não use o 5V do FTDI/Arduino para alimentar a câmera.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*  ESP32-CAM (AI Thinker) — Bridge HTTP ↔ UART (Arduino) via Roteador
+    - Conecta no Wi-Fi do seu roteador (STA) com IP fixo
+    - Endpoints HTTP (porta 80):
+        GET /status                  -> JSON de saúde
+        GET /uart?line=...           -> envia "line\n" na UART para o Arduino
+        GET /pump?on=0|1             -> envia "CMD:PUMP:0|1\n"
+        GET /joystick?x=..&y=..      -> encaminha a própria linha GET e também um CMD discreto
+    - Usa UART0 (GPIO1=TX0 -> RX do Arduino | GPIO3=RX0 <- TX do Arduino com divisor 5V→3.3V)
+    - Não usa câmera (máxima estabilidade)
+    - Desativa brownout detector e Wi-Fi sleep
+    - Board no Arduino IDE: "AI Thinker ESP32-CAM"
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "soc/rtc_cntl_reg.h"
+
+// ====== Wi-Fi do roteador (troque aqui) ======
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+// IP fixo (altere se precisar)
+IPAddress IP(192,168,3,3);
+IPAddress GW(192,168,3,1);
+IPAddress MASK(255,255,255,0);
+IPAddress DNS1(8,8,8,8);
+IPAddress DNS2(1,1,1,1);
+
+// ====== HTTP ======
+WebServer server(80);
+
+// ====== helpers ======
+static String urlDecode(const String &s) {
+  String out; out.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for (size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if (c=='+') out+=' ';
+    else if (c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if (h1>=0 && h2>=0) { out+=(char)((h1<<4)|h2); i+=2; }
+      else out+=c;
+    } else out+=c;
+  }
+  return out;
+}
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ====== endpoints ======
+void handle_status() {
+  sendCORS();
+  String j = "{\"ok\":true,\"role\":\"bridge\",\"ip\":\""+WiFi.localIP().toString()+"\"}";
+  server.send(200,"application/json",j);
+}
+
+void handle_uart() {
+  sendCORS();
+  if (!server.hasArg("line")) { server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  Serial.print(line);
+  if (!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump() {
+  sendCORS();
+  if (!server.hasArg("on")) { server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on? "PUMP_ON\n" : "PUMP_OFF\n");
+}
+
+void handle_joystick() {
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // 1) Encaminha a própria URL para compatibilidade com seu Arduino
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // 2) Redundância: comando discreto proporcional ao módulo
+  float m = sqrtf(x*x + y*y);
+  if (m < 0.20f) {
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir = "LEFT";
+    if (deg > -45 && deg <= 45) dir="RIGHT";
+    else if (deg > 45 && deg <= 135) dir="FWD";
+    else if (deg <= -45 && deg > -135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f, m)*260.0f); // 120..380 ms
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+void handle_options() { // CORS preflight
+  sendCORS();
+  server.send(204);
+}
+
+// ====== setup/loop ======
+void setup() {
+  // UART0 -> Arduino (GPIO1 TX0 / GPIO3 RX0)
+  // ATENÇÃO: Arduino TX (5V) -> ESP RX0 (GPIO3) precisa de DIVISOR 5V->3.3V
+  Serial.begin(115200);
+  delay(50);
+
+  // melhora estabilidade com fontes limítrofes
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.config(IP, GW, MASK, DNS1, DNS2);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0 < 15000) {
+    delay(200);
+  }
+
+  server.on("/status",    HTTP_GET, handle_status);
+  server.on("/uart",      HTTP_GET, handle_uart);
+  server.on("/pump",      HTTP_GET, handle_pump);
+  server.on("/joystick",  HTTP_GET, handle_joystick);
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+  server.on("/", HTTP_OPTIONS, handle_options);
+  server.on("/uart", HTTP_OPTIONS, handle_options);
+  server.on("/pump", HTTP_OPTIONS, handle_options);
+  server.on("/joystick", HTTP_OPTIONS, handle_options);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  delay(1); // coopera com WDT
+}
+
+
+
+Ligação com o Arduino (via roteador como intermediário):
+
+
+
+
+ESP32-CAM conecta ao roteador (WIFI_SSID/PASS).
+
+
+App/servidor chama http://192.168.3.3/uart?line=..., /pump?on=1, /joystick?....
+
+
+ESP repassa para o Arduino via UART0:
+
+
+
+ESP U0TXD (GPIO1) → Arduino RX (D0)
+
+
+Arduino TX (D1) → divisor 5V→3.3V → ESP U0RXD (GPIO3)
+
+
+
+
+
+
+GND comum entre ESP e Arduino.
+
+
+Fonte 5V dedicada ao ESP32-CAM (≥1 A). Não use o 5V do FTDI/Arduino para alimentar a câmera.
+
+
+
+
 // ====== HydroBot Arduino - Driver & Sensors (robusto p/ ESP HTTP bridge) ======
 // Aceita comandos por UART em vários formatos:
 //  1) "CMD:FWD:ms=400:spd=70", "CMD:BACK:ms=300", "CMD:LEFT:ms=200", "CMD:RIGHT:ms=200", "CMD:STOP"
