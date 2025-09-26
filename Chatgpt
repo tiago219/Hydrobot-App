@@ -1,3 +1,597 @@
+
+Perfeito — vou te entregar um firmware completo para o ESP32-CAM (AI-Thinker) que:
+
+
+
+
+Conecta no roteador (Wi-Fi STA).
+
+
+Expõe os mesmos endpoints esperados pelo seu App/Servidor:
+
+
+
+GET /status (JSON)
+
+
+GET /led?on=0|1
+
+
+GET /pump?on=0|1
+
+
+GET /joystick?x=…&y=… (contínuo)
+
+
+GET /uart?line=… (discreto)
+
+
+GET /stream (MJPEG com --frame + Content-Length, compatível com o seu parser)
+
+
+
+
+
+
+Faz backpressure no stream (pega o próximo frame só depois de enviar o atual), limita FPS e ajusta qualidade para evitar reboots quando a câmera vê “muita informação”.
+
+
+Envia comandos ao Arduino via UART (TX0/RX0: GPIO1/3) no formato que seu Arduino já entende.
+
+
+
+
+
+
+⚠️ Ligações recomendadas
+
+• UART para Arduino: ESP32-CAM TX0 (GPIO1) → RX do Arduino e ESP32-CAM RX0 (GPIO3) → TX do Arduino, com GND comum.
+
+• BOMBA via módulo MOSFET/relé (não ligue direto no ESP32): neste código uso GPIO14 como saída para a bomba.
+
+• LED do flash usa GPIO4 do ESP32-CAM AI-Thinker.
+
+
+
+
+
+ESP32-CAM – Firmware (coloque em um único .ino)
+
+
+// ===================== HydroBot ESP32-CAM (AI-Thinker) =====================
+// Conecta no Wi-Fi (roteador), expõe endpoints REST e stream MJPEG compatível
+// com o App (CameraScreen.tsx) e o servidor (server_heuristic.py).
+//
+// Endpoints:
+//  - GET /status                  -> JSON: {ip, mode, led, pump}
+//  - GET /led?on=0|1              -> liga/desliga flash (GPIO4)
+//  - GET /pump?on=0|1             -> liga/desliga bomba (GPIO14)
+//  - GET /joystick?x=-1..1&y=-1..1-> controle contínuo: ecoa para UART "JOY:x=..:y=.."
+//  - GET /uart?line=...           -> envia linha crua + '\n' para Arduino
+//  - GET /stream                  -> MJPEG: boundary "--frame" + Content-Length
+//
+// Estável mesmo quando apontado para cenários detalhados: qualidade ajustada,
+// limitação de FPS e backpressure no envio.
+// ===========================================================================
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "soc/soc.h"          // desabilitar brownout
+#include "soc/rtc_cntl_reg.h" // idem
+#include "esp_timer.h"
+
+
+// -------------------- CONFIG Wi-Fi --------------------
+const char* WIFI_SSID = "SEU_SSID_AQUI";
+const char* WIFI_PASS = "SUA_SENHA_AQUI";
+
+
+// -------------------- PINAGEM --------------------
+// LED (flash) do AI-Thinker
+#define LED_FLASH_PIN 4
+// Saída para bomba (use um relé/MOSFET)
+#define PUMP_PIN 14
+
+
+// -------------------- HTTP --------------------
+WebServer server(80);
+
+
+// -------------------- STREAM --------------------
+static const char* BOUNDARY = "frame";
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace; boundary=frame";
+static const int   STREAM_JPEG_QUALITY = 18;      // 1063 (maior = mais compressão). 1620 é estável.
+static const framesize_t STREAM_FRAMESIZE = FRAMESIZE_VGA; // 640x480 para bater com App
+static const int   STREAM_TARGET_FPS = 12;        // limite de FPS de saída
+static const int   STREAM_CHUNK_PAUSE_MS = 3;     // pequena folga entre writes
+
+
+// -------------------- UART p/ Arduino --------------------
+static const uint32_t UART_BAUD = 115200;
+
+
+// -------------------- ESTADO --------------------
+volatile bool ledOn  = false;
+volatile bool pumpOn = false;
+
+
+// -------------------- UTIL --------------------
+String localIP() {
+return WiFi.isConnected() ? WiFi.localIP().toString() : String("0.0.0.0");
+}
+
+
+// -------------------- CAMERA INIT --------------------
+bool initCamera() {
+// AI-Thinker (padrão)
+camera_config_t config;
+config.ledc_channel = LEDC_CHANNEL_0;
+config.ledc_timer   = LEDC_TIMER_0;
+config.pin_d0 = 5;
+config.pin_d1 = 18;
+config.pin_d2 = 19;
+config.pin_d3 = 21;
+config.pin_d4 = 36;
+config.pin_d5 = 39;
+config.pin_d6 = 34;
+config.pin_d7 = 35;
+config.pin_xclk = 0;
+config.pin_pclk = 22;
+config.pin_vsync = 25;
+config.pin_href = 23;
+config.pin_sscb_sda = 26;
+config.pin_sscb_scl = 27;
+config.pin_pwdn = 32;
+config.pin_reset = -1;
+config.xclk_freq_hz = 20000000; // 20 MHz mais estável
+config.pixel_format = PIXFORMAT_JPEG;
+if(psramFound()){
+config.frame_size = STREAM_FRAMESIZE;
+config.jpeg_quality = STREAM_JPEG_QUALITY;
+config.fb_count = 2; // 2 buffers dá fluidez sem estourar RAM
+config.grab_mode = CAMERA_GRAB_LATEST;
+} else {
+config.frame_size = FRAMESIZE_QVGA;
+config.jpeg_quality = 20;
+config.fb_count = 1;
+config.grab_mode = CAMERA_GRAB_LATEST;
+}
+
+
+esp_err_t err = esp_camera_init(&config);
+if (err != ESP_OK) {
+Serial.printf("Camera init failed: 0x%x\n", err);
+return false;
+}
+
+
+sensor_t* s = esp_camera_sensor_get();
+// Pequenos ajustes para estabilidade:
+s->set_brightness(s, 0);      // -2..2
+s->set_contrast(s, 0);        // -2..2
+s->set_saturation(s, 0);      // -2..2
+s->set_special_effect(s, 0);  // 0 off
+s->set_whitebal(s, 1);
+s->set_awb_gain(s, 1);
+s->set_wb_mode(s, 0);
+s->set_exposure_ctrl(s, 1);
+s->set_aec_value(s, 300);
+s->set_aec2(s, 0);
+s->set_gain_ctrl(s, 1);
+s->set_agc_gain(s, 0);
+s->set_gainceiling(s, (gainceiling_t)0);
+s->set_bpc(s, 0);
+s->set_wpc(s, 1);
+s->set_raw_gma(s, 1);
+s->set_lenc(s, 1);
+s->set_hmirror(s, 0);
+s->set_vflip(s, 0);
+s->set_dcw(s, 1);             // downsize para estabilidade
+s->set_colorbar(s, 0);
+
+
+return true;
+}
+
+
+// -------------------- HANDLERS --------------------
+void handleStatus() {
+String json = "{";
+json += ""ok":true,";
+json += ""ip":"" + localIP() + "",";
+json += ""mode":"mjpeg-stream",";
+json += ""led":" + String(ledOn ? "true":"false") + ",";
+json += ""pump":" + String(pumpOn ? "true":"false");
+json += "}";
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", json);
+}
+
+
+void handleLed() {
+bool on = server.hasArg("on") ? (server.arg("on") != "0") : !ledOn;
+ledOn = on;
+digitalWrite(LED_FLASH_PIN, on ? HIGH : LOW);
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", String("{"ok":true,"led":") + (on?"true":"false") + "}");
+}
+
+
+void handlePump() {
+bool on = server.hasArg("on") ? (server.arg("on") != "0") : !pumpOn;
+pumpOn = on;
+digitalWrite(PUMP_PIN, on ? HIGH : LOW);
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", String("{"ok":true,"pump":") + (on?"true":"false") + "}");
+}
+
+
+void handleUART() {
+if (!server.hasArg("line")) {
+server.send(400, "application/json", "{"ok":false,"err":"missing line"}");
+return;
+}
+String line = server.arg("line");
+Serial.print(line);
+Serial.print("\n");
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", "{"ok":true}");
+}
+
+
+void handleJoystick() {
+float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.0f;
+float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.0f;
+// Ecoamos em formato contínuo para quem quiser ler no Arduino:
+// JOY:x=0.12:y=-0.77
+Serial.printf("JOY:x=%.3f:y=%.3f\n", x, y);
+
+
+// Opcional: gerar direção discreta (pulsos) como fallback
+const float mag = sqrtf(xx + yy);
+const char* dir = "STOP";
+if (mag >= 0.2f) {
+float deg = atan2f(y, x) * 180.0f / 3.1415926f;
+if (deg > -45 && deg <= 45) dir = "RIGHT";
+else if (deg > 45 && deg <= 135) dir = "FWD";
+else if (deg <= -45 && deg > -135) dir = "BACK";
+else dir = "LEFT";
+}
+// Você pode comentar estas 2 linhas se preferir só o contínuo:
+Serial.printf("CMD:%s:ms=%d:spd=%d\n", dir, (mag<0.2f?0:200 + int(200min(1.0f,mag))), (mag<0.2f?0:50 + int(50min(1.0f,mag))));
+
+
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", "{"ok":true}");
+}
+
+
+// Stream MJPEG com boundary "--frame" + Content-Length (compatível com seu parser)
+void handleStream() {
+WiFiClient client = server.client();
+client.setTimeout(2000);
+
+
+// Cabeçalho HTTP manual (mantém conexão aberta)
+String hdr =
+"HTTP/1.1 200 OK\r\n"
+"Cache-Control: no-cache, no-store, must-revalidate\r\n"
+"Pragma: no-cache\r\n"
+"Expires: 0\r\n"
+"Connection: close\r\n"
+"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+client.print(hdr);
+
+
+const uint64_t minFrameIntervalUs = 1000000ULL / STREAM_TARGET_FPS;
+uint64_t lastSentUs = 0;
+
+
+while (client.connected()) {
+uint64_t nowUs = (uint64_t)esp_timer_get_time();
+if (nowUs - lastSentUs < minFrameIntervalUs) {
+delay(1);
+continue;
+}
+
+
+camera_fb_t* fb = esp_camera_fb_get();
+if (!fb) {
+  // Falha pontual; espera e tenta de novo
+  delay(5);
+  continue;
+}
+
+// Se não estiver em JPEG, converte (normalmente já vem em JPEG)
+if (fb->format != PIXFORMAT_JPEG) {
+  uint8_t* jpgBuf = NULL;
+  size_t   jpgLen = 0;
+  bool ok = frame2jpg(fb, STREAM_JPEG_QUALITY, &jpgBuf, &jpgLen);
+  esp_camera_fb_return(fb);
+  if (!ok) { delay(2); continue; }
+
+  // Escreve um frame
+  client.printf("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", BOUNDARY, (unsigned)jpgLen);
+  size_t toWrite = jpgLen;
+  const uint8_t* p = jpgBuf;
+  while (toWrite > 0) {
+    size_t n = client.write(p, min((size_t)1024, toWrite));
+    if (n == 0) break;
+    p += n; toWrite -= n;
+    delay(STREAM_CHUNK_PAUSE_MS);
+  }
+  client.print("\r\n");
+  lastSentUs = (uint64_t)esp_timer_get_time();
+  free(jpgBuf);
+} else {
+  // Já em JPEG: envia direto
+  client.printf("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", BOUNDARY, (unsigned)fb->len);
+  size_t toWrite = fb->len;
+  const uint8_t* p = fb->buf;
+  while (toWrite > 0) {
+    size_t n = client.write(p, min((size_t)1024, toWrite));
+    if (n == 0) break;
+    p += n; toWrite -= n;
+    delay(STREAM_CHUNK_PAUSE_MS);
+  }
+  client.print("\r\n");
+  lastSentUs = (uint64_t)esp_timer_get_time();
+  esp_camera_fb_return(fb);
+}
+
+// Pequena pausa para dar “respiro” ao Wi-Fi/TCP
+delay(1);
+// Se o cliente caiu, sai
+if (!client.connected()) break;
+
+
+
+}
+
+
+// Fecha conexão deste handler
+client.stop();
+}
+
+
+// -------------------- WIFI --------------------
+void connectWiFi() {
+WiFi.mode(WIFI_STA);
+WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+
+unsigned long t0 = millis();
+while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+delay(200);
+}
+}
+
+
+void ensureWiFi() {
+static unsigned long lastCheck = 0;
+unsigned long now = millis();
+if (now - lastCheck < 2000) return;
+lastCheck = now;
+
+
+if (WiFi.status() != WL_CONNECTED) {
+WiFi.disconnect();
+delay(100);
+connectWiFi();
+}
+}
+
+
+// -------------------- SETUP / LOOP --------------------
+void setup() {
+// Evita reset por brownout em boards mais sensíveis
+WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+
+pinMode(LED_FLASH_PIN, OUTPUT);
+digitalWrite(LED_FLASH_PIN, LOW);
+pinMode(PUMP_PIN, OUTPUT);
+digitalWrite(PUMP_PIN, LOW);
+
+
+Serial.begin(UART_BAUD);
+delay(200);
+
+
+if (!initCamera()) {
+// Se a câmera falhar, tente reduzir resolução/qualidade aqui
+// (por simplicidade, reinicie)
+ESP.restart();
+}
+
+
+connectWiFi();
+
+
+// Rotas
+server.on("/status", HTTP_GET, handleStatus);
+server.on("/led",    HTTP_GET, handleLed);
+server.on("/pump",   HTTP_GET, handlePump);
+server.on("/uart",   HTTP_GET, handleUART);
+server.on("/joystick", HTTP_GET, handleJoystick);
+server.on("/stream", HTTP_GET, handleStream);
+
+
+// Raiz só para saber que está vivo
+server.on("/", HTTP_GET,  {
+server.send(200, "text/plain", "HydroBot ESP32-CAM OK\n/stream, /status, /led, /pump, /joystick, /uart");
+});
+
+
+server.begin();
+}
+
+
+void loop() {
+server.handleClient();
+ensureWiFi();
+delay(1);
+}
+
+
+
+Notas importantes
+
+
+
+
+Estabilidade do stream: usei jpeg_quality = 18, fb_count = 2, limite de ~12 FPS e envio com Content-Length. Isso evita estouros quando a cena é muito detalhada (o problema clássico de reboot ao “apontar longe”).
+
+
+Compatibilidade com o seu servidor: o endpoint GET /stream usa boundary --frame + header Content-Length, exatamente como o seu MJPEGGrabber espera.
+
+
+Compatibilidade com o App:
+
+
+
+GET /status devolve mode:"mjpeg-stream", ip, led, pump.
+
+
+GET /led?on=1/0, GET /pump?on=1/0 trocam os pinos.
+
+
+GET /joystick?x=&y= ecoa contínuo em Serial e também manda um fallback discreto (CMD:FWD/LEFT/...) para manter o mesmo comportamento que você programou no app.
+
+
+GET /uart?line=... escreve linha crua + \n na UART — perfeito para CMD:FWD:ms=...:spd=....
+
+
+
+
+
+
+
+
+Como usar (passo rápido)
+
+
+
+
+Troque WIFI_SSID e WIFI_PASS pelos do seu roteador.
+
+
+Grave no ESP32-CAM (AI-Thinker) usando a placa ESP32 Wrover Module, PSRAM Enabled.
+
+
+Ao ligar, pegue o IP no Serial Monitor ou no roteador (ou acesse http://<ip>/).
+
+
+No App, use esse IP no campo “ESP IP” (ex.: 192.168.3.3).
+
+
+No Servidor FastAPI, você já posta {"camera_ip": "<ip>"} em /config — o seu código já faz isso.
+
+
+
+
+Se quiser, posso te enviar uma variante com ESPAsyncWebServer (ainda mais robusta para streams longos), mas evitei dependências extras aqui para facilitar o recomeço.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // HydroBotApp2/src/screens/CameraScreen.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
