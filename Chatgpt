@@ -1,4 +1,160 @@
 
+Pelo print dá pra ver 3 coisas:
+
+
+
+
+O seu requirements_heuristic.txt está errado (ex.: fastapi==0.312.0 não existe).
+
+
+O VS Code está usando um interpretor/venv diferente do que você instalou.
+
+
+Por isso o Pylance marca fastapi, starlette, pydantic, numpy, cv2 como “reportMissingImports”.
+
+
+
+
+Vamos arrumar em 3 passos curtos.
+
+
+
+1) Corrija o requirements_heuristic.txt
+
+
+Substitua tudo pelo conteúdo abaixo (compatível com Python 3.13):
+
+
+# núcleo do servidor
+fastapi==0.115.5
+starlette==0.38.5
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+requests==2.32.3
+
+# numérico
+numpy==2.1.3
+
+# OpenCV é OPCIONAL; se quiser modo completo:
+# use --pre, pois 3.13 ainda pode precisar de pré-release
+# opencv-python-headless >= 4.10
+
+
+
+
+
+Observação: o starlette vem como dependência do FastAPI, mas eu fixei explicitamente para evitar resolver versões quebradas.
+
+
+
+
+
+2) Recrie e aponte o ambiente 3.13
+
+
+No PowerShell dentro da pasta do servidor:
+
+
+# apague qualquer venv antigo (se existir)
+Remove-Item -Recurse -Force .venv 2>$null
+
+# crie venv no Python 3.13
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+
+# instale as dependências corrigidas
+pip install -r requirements_heuristic.txt
+
+# (opcional – modo completo com OpenCV)
+pip install --pre opencv-python-headless
+
+
+
+Agora, no VS Code:
+
+
+
+
+Ctrl+Shift+P → Python: Select Interpreter → escolha .\.venv\Scripts\python.exe.
+
+
+Ctrl+Shift+P → Developer: Reload Window (para o Pylance atualizar).
+
+As bandeirinhas amarelas devem sumir.
+
+
+
+
+
+3) Rode o servidor
+
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000
+
+
+
+Teste no navegador:
+
+
+
+
+http://localhost:8000/healthz
+
+
+http://localhost:8000/snapshot
+
+
+
+
+No app, campo Servidor = http://<IP_DO_PC>:8000.
+
+
+
+Se o OpenCV não for instalado
+
+
+Sem o OpenCV o meu server_heuristic.py híbrido já entra em modo LITE (sem caixas), mas sem erro de import. O Pylance só para de reclamar quando você está usando o mesmo venv com os pacotes instalados; por isso é fundamental o Select Interpreter e o reload.
+
+
+Se após isso ainda aparecer “reportMissingImports”:
+
+
+
+
+Me diga o caminho do interpretador mostrado no status bar do VS Code.
+
+
+Cole aqui o resultado de:
+
+.\.venv\Scripts\python.exe -c "import fastapi,starlette,pydantic,numpy; print('ok')"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Show! Segue um server_heuristic.py híbrido: ele é “igual ao heuristics antigo”, mas não quebra por falta de imports.
 
 
