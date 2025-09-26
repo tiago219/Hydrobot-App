@@ -1,3 +1,323 @@
+
+Perfeito 👍 vou te mandar o server_heuristic.py completo em modo LITE (sem precisar do OpenCV).
+
+Esse código sobe normalmente no Python 3.13 apenas com fastapi, uvicorn, requests, numpy e Pillow.
+
+Ele entrega os endpoints /healthz, /status, /snapshot, /detect, /objects, /debug_models — mas sem usar cv2.
+
+
+
+📄 server_heuristic.py
+
+
+# ===================== HydroBot Server (LITE) =====================
+# Fire heuristic + Objects (LITE: sem OpenCV)
+# Apenas entrega último frame do ESP32-CAM e responde com JSON básico.
+# Python 3.13 compatível.
+
+import os, time, threading
+from typing import Optional, Dict, Any
+from collections import deque
+
+import numpy as np
+import requests
+from fastapi import FastAPI, Response, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from PIL import Image
+from io import BytesIO
+
+# ===================== CONFIG =====================
+CAMERA_IP = "192.168.3.3"
+STREAM_URL_FMT = "http://{}/stream"
+CONNECT_TIMEOUT = 4.0
+READ_TIMEOUT = 8.0
+REQUEST_HEADERS = {"Connection": "keep-alive", "User-Agent": "HydroBot-Grabber/2.0"}
+MAX_FRAME_AGE_MS = 3000
+JPEG_QUALITY = 85
+
+# ===================== FASTAPI =====================
+app = FastAPI(title="HydroBot Fire + Objects (LITE)", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ===================== PLACEHOLDER IMG =====================
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+    import numpy as np
+    import cv2  # só usado se disponível
+    img = np.zeros((270, 480, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    try:
+        import cv2
+        cv2.putText(img, msg, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2, cv2.LINE_AA)
+        cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return buf.tobytes() if ok else b""
+    except Exception:
+        # fallback puro Pillow se cv2 não estiver
+        from PIL import Image, ImageDraw, ImageFont
+        im = Image.fromarray(img)
+        d = ImageDraw.Draw(im)
+        d.text((20,120), msg, fill=(255,255,255))
+        buf = BytesIO()
+        im.save(buf, format="JPEG")
+        return buf.getvalue()
+
+# ===================== MJPEG GRABBER =====================
+class MJPEGGrabber:
+    """Conecta no /stream do ESP32-CAM, parse multipart e mantém último JPEG."""
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_tick = time.time()
+        self._lock = threading.Lock()
+
+    def start(self, ip: Optional[str] = None):
+        if ip: self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        boundary = b"--frame"
+        while not self._stop.is_set():
+            url = STREAM_URL_FMT.format(self._ip)
+            try:
+                with requests.get(url, headers=REQUEST_HEADERS,
+                                  stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                    if r.status_code != 200:
+                        time.sleep(0.5); continue
+                    buf = b""
+                    for chunk in r.iter_content(chunk_size=4096):
+                        if self._stop.is_set(): break
+                        if not chunk: continue
+                        buf += chunk
+                        while True:
+                            bi = buf.find(boundary)
+                            if bi < 0: break
+                            buf = buf[bi+len(boundary):]
+                            if not buf.startswith(b"\r\n"): break
+                            buf = buf[2:]
+                            hi = buf.find(b"\r\n\r\n")
+                            if hi < 0: break
+                            headers = buf[:hi].decode("latin1", errors="ignore")
+                            buf = buf[hi+4:]
+                            length = None
+                            for line in headers.split("\r\n"):
+                                if line.lower().startswith("content-length:"):
+                                    try: length = int(line.split(":")[1].strip())
+                                    except: pass
+                            if length is None or len(buf) < length: break
+                            jpeg = buf[:length]
+                            buf = buf[length:]
+                            ts = int(time.time()*1000)
+                            with self._lock:
+                                self._last_jpeg = jpeg
+                                self._last_ts_ms = ts
+                                self._frames += 1
+                                now = time.time()
+                                if now - self._last_tick >= 1.0:
+                                    self._fps = self._frames / (now - self._last_tick)
+                                    self._frames = 0
+                                    self._last_tick = now
+            except Exception:
+                time.sleep(0.4)
+                continue
+
+    def get_latest_jpeg(self, max_age_ms: int = MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None: return None
+            if int(time.time()*1000) - self._last_ts_ms > max_age_ms: return None
+            return self._last_jpeg
+
+    def status(self):
+        with self._lock:
+            age_ms = (int(time.time()*1000) - self._last_ts_ms) if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None,
+                    "age_ms": age_ms, "fps_in": round(self._fps,2), "mode":"mjpeg-lite"}
+
+grabber = MJPEGGrabber()
+grabber.start(CAMERA_IP)
+
+# ===================== DETECTOR LITE =====================
+class LiteDetector:
+    def __init__(self, src: MJPEGGrabber):
+        self.src = src
+        self._last_ts = 0
+        self._wh = (0, 0)
+
+    def get_result(self):
+        jpeg = self.src.get_latest_jpeg()
+        if jpeg:
+            try:
+                im = Image.open(BytesIO(jpeg))
+                self._wh = im.size
+            except Exception:
+                pass
+            self._last_ts = int(time.time()*1000)
+        return {
+            "ok": True,
+            "isFire": False,   # sem heurística
+            "score": 0.0,
+            "score_raw": 0.0,
+            "score_ema": 0.0,
+            "boxes": [],
+            "ts": self._last_ts,
+            "fps_det": 0.0,
+            "vote": {"win":0,"need":0,"sum":0},
+            "persist": {"hits":0,"need":0,"iou_min":0.0},
+            "hyst": {"hi":0,"lo":0},
+            "frame_wh": list(self._wh) if self._wh!=(0,0) else None,
+        }
+
+detector = LiteDetector(grabber)
+
+# ===================== OBJETOS LITE =====================
+class LiteObjects:
+    def get(self)->Dict[str,Any]:
+        return {"ok": False, "backend": "none", "objects": [],
+                "fps_obj": 0.0, "ts": int(time.time()*1000),
+                "n_person":0, "n_animals":0,
+                "n_person_stable":0, "n_animals_stable":0,
+                "conf_max":0.0}
+
+objects_det = LiteObjects()
+
+# ===================== ENDPOINTS =====================
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, **grabber.status()}
+
+@app.get("/status")
+def status():
+    s1 = grabber.status(); s2 = detector.get_result()
+    return {"ok": True, "camera_ip": s1["ip"], "model": "lite",
+            "fps_in": s1["fps_in"], "hasFrame": s1["hasFrame"],
+            "age_ms": s1["age_ms"], **s2}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        jpeg = placeholder_jpeg("NO FRAME")
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache",
+               "Expires": "0", "Content-Length": str(len(jpeg))}
+    return Response(content=jpeg, media_type="image/jpeg", headers=headers)
+
+@app.get("/detect")
+def detect():
+    res = detector.get_result()
+    res["objects"] = objects_det.get()
+    return res
+
+@app.get("/objects")
+def objects(conf: float = Query(None)):
+    return objects_det.get()
+
+@app.get("/debug_models")
+def debug_models():
+    o = objects_det.get(); s = grabber.status()
+    return {"ok":True, "backend":o.get("backend"), "objects_ok":o.get("ok"),
+            "conf_max":o.get("conf_max"),
+            "fps_obj":o.get("fps_obj"),
+            "stream_hasFrame":s.get("hasFrame"), "stream_fps_in":s.get("fps_in"),
+            "n_person":o.get("n_person"), "n_animals":o.get("n_animals")}
+
+
+
+
+✅ Como usar
+
+
+
+
+Ative o venv 3.13:
+
+.\.venv\Scripts\Activate.ps1
+
+
+
+
+
+Instale dependências mínimas:
+
+pip install fastapi uvicorn requests numpy pillow
+
+
+
+
+
+Rode:
+
+uvicorn server_heuristic:app --host 0.0.0.0 --port 8000 --reload
+
+
+
+
+
+Teste no navegador:
+
+
+
+http://localhost:8000/healthz
+
+
+http://localhost:8000/snapshot
+
+
+
+
+
+
+
+
+
+Quer que eu te mande também uma versão mista (que ativa o modo FULL com OpenCV se disponível, e cai pra LITE se não) para você não precisar trocar o arquivo quando instalar o opencv no 3.13?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Beleza — o app estava amarrado só ao servidor (/snapshot). Se o FastAPI cair/não responder, a tela fica sem vídeo. Te entrego abaixo um CameraScreen.tsx completo com:
 
 
