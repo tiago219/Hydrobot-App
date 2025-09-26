@@ -1,3 +1,535 @@
+
+Perfeito — abaixo está um firmware completo para ESP32-CAM (AI-Thinker) que:
+
+
+
+
+Conecta no roteador SSID HydroBot | senha loud2025emibr em modo STA
+
+
+Inicia a câmera e expõe /snapshot (JPEG único por requisição)
+
+
+Expõe os endpoints que seu app já usa:
+
+
+
+/status → JSON de saúde/estados
+
+
+/led?on=0|1 → liga/desliga o flash (GPIO 4)
+
+
+/pump?on=0|1 → repassa ao Arduino via UART (CMD:PUMP:1/0)
+
+
+/joystick?x=..&y=.. → controle contínuo (loop em background converte vetor em pulsos CMD:FWD/BACK/LEFT/RIGHT com ms/spd)
+
+
+/uart?line=... → pass-through para o Arduino (sua string é enviada crua + \n)
+
+
+
+
+
+
+Usa UART2 para falar com o Arduino (TX=GPIO 14, RX=GPIO 15, 115200 bps).
+
+
+É robusto (sem stream MJPEG), mantendo só snapshot — isso reduz muito reboots.
+
+
+
+
+
+
+Ligações sugeridas (ESP32-CAM ↔ Arduino):
+
+
+
+
+ESP32-CAM TX2 (GPIO14) → RX do Arduino (via divisor de tensão 5V→3.3V se necessário)
+
+
+ESP32-CAM RX2 (GPIO15) ← TX do Arduino (NUNCA 5V direto; use divisor para 3.3V)
+
+
+GND comum entre os dois.
+
+
+Motores/bomba continuam controlados no Arduino; o ESP apenas envia comandos UART.
+
+
+
+
+
+
+
+ESP32-CAM (AI-Thinker) – HydroBot_ESP32Cam_HTTP_UART.ino
+
+
+
+
+Biblioteca: já vem com esp32-camera ao instalar o core ESP32; use Board: “AI Thinker ESP32-CAM”.
+
+
+
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include <esp_timer.h>
+#include <ArduinoJson.h>
+#include <driver/ledc.h>
+#include <esp_task_wdt.h>
+#include <ctype.h>
+
+/* ========= Wi-Fi ========= */
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+/* ========= Pinos câmera (AI-Thinker) ========= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* ========= Flash / LED ========= */
+#define FLASH_PIN 4
+// Usamos PWM (LEDC) para não “chacoalhar” a alimentação
+#define FLASH_LEDC_CHANNEL 2
+#define FLASH_LEDC_FREQ    5000
+#define FLASH_LEDC_RES     LEDC_TIMER_8_BIT
+
+/* ========= UART para Arduino =========
+   ESP32-CAM UART2: TX = GPIO14, RX = GPIO15
+   (Atenção aos níveis lógicos: ESP é 3.3V)
+*/
+#define UART_BAUD 115200
+#define UART_TX   14
+#define UART_RX   15
+
+/* ========= HTTP ========= */
+WebServer server(80);
+
+/* ========= Estados ========= */
+volatile bool flashOn = false;
+volatile bool pumpOn  = false;   // espelha último comando enviado ao Arduino
+
+// Joystick (−1..+1) — atualizado via HTTP; consumido por task em background
+volatile float joyX = 0.0f;
+volatile float joyY = 0.0f;
+volatile uint32_t lastJoyUpdateMs = 0;
+
+/* ========= Util: URL decode simples ========= */
+String urlDecode(const String &s) {
+  String r; r.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '+') r += ' ';
+    else if (c == '%' && i + 2 < s.length() && isxdigit(s[i+1]) && isxdigit(s[i+2])) {
+      char h1 = s[i+1], h2 = s[i+2];
+      auto hex = [](char h) -> uint8_t {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        return 0;
+      };
+      r += char((hex(h1) << 4) | hex(h2));
+      i += 2;
+    } else r += c;
+  }
+  return r;
+}
+
+/* ========= Envio de linhas ao Arduino ========= */
+void sendLineToArduino(const String &line) {
+  Serial2.print(line);
+  Serial2.print('\n');
+}
+
+/* ========= Controle do flash ========= */
+void setFlash(bool on) {
+  flashOn = on;
+  if (on) {
+    ledcWrite(FLASH_LEDC_CHANNEL, 255); // 100%
+  } else {
+    ledcWrite(FLASH_LEDC_CHANNEL, 0);
+  }
+}
+
+/* ========= Câmera: init ========= */
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+
+  // Resolução estável p/ snapshot no app (640x480)
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;      // 10~20 (menor = melhor qualidade)
+  config.fb_count     = 2;       // 2 framebuffers ajuda a estabilidade
+
+  esp_err_t err = esp_camera_init(&config);
+  return (err == ESP_OK);
+}
+
+/* ========= Endpoint: /snapshot ========= */
+void handleSnapshot() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->format != PIXFORMAT_JPEG) {
+    if (fb) esp_camera_fb_return(fb);
+    server.send(503, "text/plain", "NO FRAME");
+    return;
+  }
+  // Cabeçalhos anti-cache (o app já coloca ?ts=)
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+/* ========= Endpoint: /status ========= */
+void handleStatus() {
+  StaticJsonDocument<384> doc;
+  doc["ok"]   = true;
+  doc["ip"]   = WiFi.localIP().toString();
+  doc["mode"] = "joystick+uart";
+  doc["led"]  = flashOn;
+  doc["pump"] = pumpOn;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+/* ========= Endpoint: /led?on=0|1 ========= */
+void handleLed() {
+  bool on = false;
+  if (server.hasArg("on")) {
+    on = server.arg("on") == "1";
+  }
+  setFlash(on);
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= Endpoint: /pump?on=0|1  → UART p/ Arduino ========= */
+void handlePump() {
+  bool on = false;
+  if (server.hasArg("on")) {
+    on = server.arg("on") == "1";
+  }
+  pumpOn = on;
+  sendLineToArduino(on ? "CMD:PUMP:1" : "CMD:PUMP:0");
+  server.send(200, "text/plain", on ? "1" : "0");
+}
+
+/* ========= Endpoint: /uart?line=...  → pass-through ========= */
+void handleUart() {
+  if (!server.hasArg("line")) {
+    server.send(400, "text/plain", "missing line");
+    return;
+  }
+  String line = urlDecode(server.arg("line"));
+  line.trim();
+  if (line.length() == 0) {
+    server.send(400, "text/plain", "empty line");
+    return;
+  }
+  sendLineToArduino(line);
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= Endpoint: /joystick?x=&y=  (−1..+1) =========
+   Apenas armazena; uma task em background manda pulsos ao Arduino.
+*/
+void handleJoystick() {
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.0f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.0f;
+  if (x > 1) x = 1; if (x < -1) x = -1;
+  if (y > 1) y = 1; if (y < -1) y = -1;
+  joyX = x; joyY = y;
+  lastJoyUpdateMs = millis();
+  server.send(200, "text/plain", "ok");
+}
+
+/* ========= Joystick → comandos discretos =========
+   Converte vetor (x,y) em direção + intensidade e envia pulsos no padrão do seu Arduino.
+*/
+String vecToDir(float x, float y) {
+  float mag = sqrtf(x*x + y*y);
+  if (mag < 0.2f) return "STOP";
+  float deg = atan2f(y, x) * 180.0f / PI;
+  if (deg > -45 && deg <= 45)  return "RIGHT";
+  if (deg > 45  && deg <= 135) return "FWD";
+  if (deg <= -45 && deg > -135) return "BACK";
+  return "LEFT";
+}
+
+void joystickTask(void* _) {
+  const uint32_t TICK_MS = 120;
+  String lastDir = "STOP";
+  for (;;) {
+    float x = joyX;
+    float y = joyY;
+    float mag = sqrtf(x*x + y*y);
+    String dir = vecToDir(x, y);
+
+    if (dir == "STOP") {
+      if (lastDir != "STOP") {
+        sendLineToArduino("CMD:STOP");
+        lastDir = "STOP";
+      }
+    } else {
+      int ms  = 140 + int(260.0f * (mag > 1 ? 1 : mag)); // 140..400
+      int spd = 50  + int(50.0f  * (mag > 1 ? 1 : mag)); // 50..100
+      char buf[64];
+      snprintf(buf, sizeof(buf), "CMD:%s:ms=%d:spd=%d", dir.c_str(), ms, spd);
+      sendLineToArduino(String(buf));
+      lastDir = dir;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+  }
+}
+
+/* ========= Setup ========= */
+void setup() {
+  // Console
+  Serial.begin(115200);
+  delay(200);
+
+  // UART2 → Arduino
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+
+  // Flash como PWM
+  ledcSetup(FLASH_LEDC_CHANNEL, FLASH_LEDC_FREQ, FLASH_LEDC_RES);
+  ledcAttachPin(FLASH_PIN, FLASH_LEDC_CHANNEL);
+  setFlash(false);
+
+  // Câmera
+  if (!initCamera()) {
+    Serial.println("[ERR] Camera init failed");
+    // Ainda oferecemos HTTP p/ debug
+  } else {
+    Serial.println("[OK] Camera init");
+  }
+
+  // Wi-Fi STA
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Failed — will keep retrying in loop()");
+  }
+
+  // HTTP rotas
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/status",   HTTP_GET, handleStatus);
+  server.on("/led",      HTTP_GET, handleLed);
+  server.on("/pump",     HTTP_GET, handlePump);
+  server.on("/uart",     HTTP_GET, handleUart);
+  server.on("/joystick", HTTP_GET, handleJoystick);
+  server.onNotFound([](){
+    server.send(404, "text/plain", "not found");
+  });
+  server.begin();
+
+  // Task de joystick (core 0 para aliviar core 1 da câmera)
+  xTaskCreatePinnedToCore(joystickTask, "joyTask", 4096, nullptr, 1, nullptr, 0);
+
+  // “Acorda” Arduino com um ping
+  sendLineToArduino("REQ:STATUS");
+}
+
+/* ========= Loop ========= */
+void loop() {
+  // mantém HTTP
+  server.handleClient();
+
+  // reconecta Wi-Fi se cair
+  static uint32_t lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 2000) {
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+
+  // watchdog leve para o flash ficar “limpo”
+  // (nada a fazer aqui — tasks e handlers já são curtos)
+}
+
+
+
+
+Notas rápidas
+
+
+
+
+Câmera em VGA (640×480) e /snapshot único: é exatamente o que seu app espera hoje.
+
+
+/status retorna {ok, ip, mode, led, pump} — o app mostra isso na barra.
+
+
+Flash no GPIO 4 com PWM (suave e estável).
+
+
+Bomba: o ESP não comanda relé; ele apenas envia CMD:PUMP:1/0 ao Arduino, que de fato liga/desliga. Assim, o estado que o app vê é espelhado por software e fica consistente com seu protocolo.
+
+
+Joystick: mesmo sem o app mandar /uart?..., o /joystick já converte o vetor em pulsos discretos compatíveis com seu Arduino (ms + spd), exatamente como o fallback do app — isso dá latência menor e suavidade.
+
+
+Pass-through: se quiser mandar qualquer coisa manualmente, use /uart?line=SET:SPEED:70 etc.
+
+
+
+
+Se precisar que o ESP também ofereça /stream (multipart MJPEG) para testar em navegador, dá pra adicionar depois — mas manter apenas /snapshot costuma eliminar os reboots que você viu ao apontar a câmera para cenas complexas.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // HydroBotApp2/src/screens/CameraScreen.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
