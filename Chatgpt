@@ -1,4 +1,328 @@
 
+// HydroBot ESP32-CAM - Stable (fixed IP) - ASCII only
+// Endpoints: /status /led /pump /joystick /uart /stream /snapshot (/jpg)
+// Key: fb_count=2 + CAMERA_GRAB_LATEST, adaptive JPEG quality, no Nagle, non-blocking writes.
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_timer.h"
+#include "esp_task_wdt.h"
+#include "esp_idf_version.h"
+#include <math.h>
+#include <algorithm>
+
+// WiFi (static IP)
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+IPAddress LOCAL_IP(192,168,3,3);
+IPAddress GATEWAY (192,168,3,1);
+IPAddress SUBNET  (255,255,255,0);
+IPAddress DNS1    (8,8,8,8);
+IPAddress DNS2    (1,1,1,1);
+
+// Pins (AI-Thinker)
+#define LED_FLASH_PIN 4
+#define PUMP_PIN      14
+
+WebServer server(80);
+
+// Stream params
+static const char*   BOUNDARY              = "frame";
+static const framesize_t STREAM_FRAMESIZE  = FRAMESIZE_QVGA; // 320x240
+static int           g_jpeg_quality        = 26;             // 18..34 adaptive
+static const int     STREAM_TARGET_FPS     = 10;
+static const uint32_t UART_BAUD            = 115200;
+
+// ABR thresholds
+static const size_t  ABR_BIG_FRAME   = 52000;   // bytes
+static const size_t  ABR_SMALL_FRAME = 24000;   // bytes
+static const int     Q_MIN = 18;
+static const int     Q_MAX = 34;
+static const uint32_t SEND_SLOW_MS = 220;
+
+volatile bool ledOn=false, pumpOn=false;
+
+String localIP() { return WiFi.isConnected() ? WiFi.localIP().toString() : String("0.0.0.0"); }
+static inline void feedWDT(){ esp_task_wdt_reset(); yield(); }
+
+// Camera init
+bool initCamera(){
+  camera_config_t c;
+  c.ledc_channel = LEDC_CHANNEL_0; c.ledc_timer = LEDC_TIMER_0;
+  c.pin_d0=5;  c.pin_d1=18; c.pin_d2=19; c.pin_d3=21; c.pin_d4=36; c.pin_d5=39; c.pin_d6=34; c.pin_d7=35;
+  c.pin_xclk=0; c.pin_pclk=22; c.pin_vsync=25; c.pin_href=23;
+  c.pin_sscb_sda=26; c.pin_sscb_scl=27;
+  c.pin_pwdn=32; c.pin_reset=-1;
+  c.xclk_freq_hz=20000000;
+  c.pixel_format=PIXFORMAT_JPEG;
+
+  c.frame_size   = STREAM_FRAMESIZE;
+  c.jpeg_quality = g_jpeg_quality;
+  c.fb_count     = 2;                        // double buffer
+  c.fb_location  = CAMERA_FB_IN_PSRAM;
+  c.grab_mode    = CAMERA_GRAB_LATEST;       // drop old, keep newest
+
+  esp_err_t err = esp_camera_init(&c);
+  if(err!=ESP_OK){ Serial.printf("Camera init failed: 0x%x\n", err); return false; }
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s,0); s->set_contrast(s,0); s->set_saturation(s,0);
+  s->set_whitebal(s,1); s->set_awb_gain(s,1);
+  s->set_exposure_ctrl(s,1); s->set_aec2(s,0);
+  s->set_gain_ctrl(s,1); s->set_agc_gain(s,0); s->set_gainceiling(s,(gainceiling_t)0);
+  s->set_bpc(s,0); s->set_wpc(s,1); s->set_raw_gma(s,1); s->set_lenc(s,1);
+  s->set_hmirror(s,0); s->set_vflip(s,0); s->set_dcw(s,1); s->set_colorbar(s,0);
+  return true;
+}
+
+static inline void sendCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); }
+
+void handleStatus(){
+  String j="{\"ok\":true,\"ip\":\""+localIP()+"\",\"mode\":\"mjpeg-stream\",\"led\":"+String(ledOn?"true":"false")+
+           ",\"pump\":"+String(pumpOn?"true":"false")+",\"heap\":"+String(ESP.getFreeHeap())+
+           ",\"q\":"+String(g_jpeg_quality)+"}";
+  sendCORS(); server.send(200,"application/json",j);
+}
+
+void handleLed(){
+  bool on = server.hasArg("on") ? (server.arg("on")!="0") : !ledOn;
+  ledOn = on; digitalWrite(LED_FLASH_PIN,on?HIGH:LOW);
+  sendCORS(); server.send(200,"application/json",String("{\"ok\":true,\"led\":")+(on?"true":"false")+"}");
+}
+
+void handlePump(){
+  bool on = server.hasArg("on") ? (server.arg("on")!="0") : !pumpOn;
+  pumpOn = on; digitalWrite(PUMP_PIN,on?HIGH:LOW);
+  sendCORS(); server.send(200,"application/json",String("{\"ok\":true,\"pump\":")+(on?"true":"false")+"}");
+}
+
+void handleUART(){
+  if(!server.hasArg("line")){ server.send(400,"application/json","{\"ok\":false,\"err\":\"missing line\"}"); return; }
+  Serial.print(server.arg("line")); Serial.print("\n");
+  sendCORS(); server.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleJoystick(){
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.0f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.0f;
+  Serial.printf("JOY:x=%.3f:y=%.3f\n",x,y);
+  float mag = sqrtf(x*x+y*y);
+  const char* dir="STOP";
+  if(mag>=0.2f){
+    float deg = atan2f(y,x)*180.0f/3.1415926f;
+    if(deg>-45 && deg<=45) dir="RIGHT";
+    else if(deg>45 && deg<=135) dir="FWD";
+    else if(deg<=-45 && deg>-135) dir="BACK";
+    else dir="LEFT";
+  }
+  int ms=(mag<0.2f)?0:180+int(200*std::min(1.0f,mag));
+  int spd=(mag<0.2f)?0: 50+int( 50*std::min(1.0f,mag));
+  Serial.printf("CMD:%s:ms=%d:spd=%d\n",dir,ms,spd);
+  sendCORS(); server.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleSnapshot(){
+  camera_fb_t* fb = esp_camera_fb_get();
+  if(!fb){ server.send(503,"text/plain","NO_FRAME"); return; }
+  uint8_t* jpg = fb->buf; size_t len = fb->len; bool freeIt=false;
+  if(fb->format!=PIXFORMAT_JPEG){
+    if(!frame2jpg(fb,g_jpeg_quality,&jpg,&len)){ esp_camera_fb_return(fb); server.send(500,"text/plain","ENCODE_FAIL"); return; }
+    freeIt=true;
+  }
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma","no-cache"); server.sendHeader("Expires","0");
+  server.setContentLength(len); server.send(200,"image/jpeg","");
+  WiFiClient cli = server.client(); const uint8_t* p=jpg; size_t todo=len;
+  while(todo>0){
+    size_t can = cli.availableForWrite();
+    if(can==0){ feedWDT(); continue; }
+    size_t n = cli.write(p, std::min((size_t)1460, std::min(todo, can)));
+    if(n==0){ feedWDT(); continue; }
+    p+=n; todo-=n; feedWDT();
+  }
+  if(freeIt) free(jpg); esp_camera_fb_return(fb);
+}
+
+void handleStream(){
+  WiFiClient cli = server.client();
+  cli.setTimeout(2000);
+  cli.setNoDelay(true);
+  cli.print(
+    "HTTP/1.1 200 OK\r\n"
+    "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+    "Pragma: no-cache\r\n"
+    "Expires: 0\r\n"
+    "Connection: close\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+  );
+
+  const uint64_t minIv = 1000000ULL/STREAM_TARGET_FPS;
+  uint64_t last=0;
+  uint8_t zeroWrites=0;
+  sensor_t* s = esp_camera_sensor_get();
+
+  while(cli.connected()){
+    uint64_t now=(uint64_t)esp_timer_get_time();
+    if(now-last<minIv){ feedWDT(); continue; }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if(!fb){ feedWDT(); continue; }
+
+    uint8_t* jpg=fb->buf; size_t len=fb->len; bool freeIt=false;
+    if(fb->format!=PIXFORMAT_JPEG){
+      if(!frame2jpg(fb,g_jpeg_quality,&jpg,&len)){ esp_camera_fb_return(fb); feedWDT(); continue; }
+      freeIt=true;
+    }
+
+    cli.printf("--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",BOUNDARY,(unsigned)len);
+
+    uint32_t t0 = millis();
+    const uint8_t* p=jpg; size_t todo=len;
+    zeroWrites = 0;
+
+    while(todo>0){
+      size_t can = cli.availableForWrite();
+      if(can==0){
+        zeroWrites++;
+        if(zeroWrites>40){ break; }
+        feedWDT(); continue;
+      }
+      size_t n = cli.write(p, std::min((size_t)1460, std::min(todo, can)));
+      if(n==0){
+        zeroWrites++;
+        if(zeroWrites>40) break;
+        feedWDT(); continue;
+      }
+      zeroWrites = 0;
+      p+=n; todo-=n;
+      feedWDT();
+    }
+    cli.print("\r\n");
+
+    if(freeIt) free(jpg);
+    esp_camera_fb_return(fb);
+    last=(uint64_t)esp_timer_get_time();
+
+    // ABR: adjust quality based on size and send time
+    uint32_t dt = millis() - t0;
+    bool slow = (dt > SEND_SLOW_MS);
+    if(todo==0){
+      if(len > ABR_BIG_FRAME || slow){
+        g_jpeg_quality = std::min(Q_MAX, g_jpeg_quality + 2);
+        s->set_quality(s, g_jpeg_quality);
+      }else if(len < ABR_SMALL_FRAME && !slow){
+        g_jpeg_quality = std::max(Q_MIN, g_jpeg_quality - 1);
+        s->set_quality(s, g_jpeg_quality);
+      }
+    }else{
+      g_jpeg_quality = std::min(Q_MAX, g_jpeg_quality + 3);
+      s->set_quality(s, g_jpeg_quality);
+      break;
+    }
+
+    if(!cli.connected()) break;
+    feedWDT();
+  }
+  cli.stop();
+}
+
+// WiFi
+void connectWiFi(){
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  if(!WiFi.config(LOCAL_IP, GATEWAY, SUBNET, DNS1, DNS2)){
+    Serial.println("WiFi.config failed; falling back to DHCP");
+  }
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<20000UL){ delay(200); }
+}
+
+void ensureWiFi(){
+  static unsigned long last=0; unsigned long now=millis(); if(now-last<2000) return; last=now;
+  if(WiFi.status()!=WL_CONNECTED){ WiFi.disconnect(true,true); delay(100); connectWiFi(); }
+}
+
+// Setup / Loop
+void setup(){
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  pinMode(LED_FLASH_PIN,OUTPUT); digitalWrite(LED_FLASH_PIN,LOW);
+  pinMode(PUMP_PIN,OUTPUT);      digitalWrite(PUMP_PIN,LOW);
+  setCpuFrequencyMhz(160);
+  Serial.begin(UART_BAUD); delay(200);
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+  const esp_task_wdt_config_t cfg = { .timeout_ms = 8000, .idle_core_mask = (1<<portNUM_PROCESSORS)-1, .trigger_panic = true };
+  esp_task_wdt_init(&cfg);
+#else
+  esp_task_wdt_init(8,true);
+#endif
+  esp_task_wdt_add(NULL);
+
+  if(!initCamera()){ delay(500); ESP.restart(); }
+  connectWiFi();
+
+  server.on("/status",   HTTP_GET, handleStatus);
+  server.on("/led",      HTTP_GET, handleLed);
+  server.on("/pump",     HTTP_GET, handlePump);
+  server.on("/uart",     HTTP_GET, handleUART);
+  server.on("/joystick", HTTP_GET, handleJoystick);
+  server.on("/stream",   HTTP_GET, handleStream);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/jpg",      HTTP_GET, handleSnapshot);
+  server.on("/", HTTP_GET, [](){ server.send(200,"text/plain",
+    "HydroBot ESP32-CAM OK\n/stream, /snapshot, /jpg, /status, /led, /pump, /joystick, /uart"); });
+
+  server.begin();
+}
+
+void loop(){
+  server.handleClient();
+  ensureWiFi();
+  feedWDT();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — o problema principal era o servidor tentar puxar o MJPEG do ESP32-CAM pela porta 81 (“:81/stream”), enquanto seu firmware serve /stream na porta 80 (WebServer padrão). Com isso, o grabber nunca recebia frames e o app ficava em “Aguardando servidor…”. Também desativei o Wi-Fi sleep no ESP para estabilizar a stream no roteador externo.
 
 
