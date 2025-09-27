@@ -1,4 +1,702 @@
 
+Perfeito—vou adaptar apenas o necessário para casar com o seu firmware atual (STA, endpoints /status, /snapshot, /stream, POST /uart|/led|/restart, mDNS hydrobot.local). Abaixo vão dois arquivos completos:
+
+
+
+1) server_heuristic.py (FastAPI)
+
+
+
+
+Consome direto http://<ESP_IP>/stream do seu firmware.
+
+
+Mantém um leitor MJPEG em thread com backpressure (sempre guarda só o último frame).
+
+
+Expõe:
+
+
+
+GET /healthz → estado do stream.
+
+
+GET /frame.jpg → último JPEG (para apps que fazem “pull”).
+
+
+GET /stream → re-stream MJPEG (app pode usar via WebView).
+
+
+GET /esp/status → proxy do /status do ESP.
+
+
+POST /esp/uart?cmd=..., POST /esp/led?on=0|1, POST /esp/restart → proxys para o seu firmware.
+
+
+GET /ui/stream?mode=server|direct → HTML simples (útil para testar em browser).
+
+
+
+
+
+
+CORS liberado.
+
+
+Sem mudar o nome do arquivo.
+
+
+
+
+# server_heuristic.py
+# HydroBot - Proxy/Heurística para ESP32-CAM em STA
+# - Conecta no ESP em /stream (MJPEG) e mantém o último frame em memória
+# - Reexpõe /stream (re-stream) e /frame.jpg (último frame)
+# - Faz proxy dos comandos UART/LED/Restart e do /status do ESP
+#
+# Rodar:
+#   uvicorn server_heuristic:app --host 0.0.0.0 --port 8000
+#
+# Ajuste ESP_HOST abaixo (pode usar mDNS "hydrobot.local" se resolver na sua rede)
+
+import io
+import time
+import threading
+from typing import Optional, Tuple
+
+import requests
+from fastapi import FastAPI, Response, Request
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
+
+# ========= CONFIG =========
+ESP_HOST = "hydrobot.local"        # ou "192.168.0.50" se IP fixo
+ESP_BASE = f"http://{ESP_HOST}"
+ESP_STREAM = f"{ESP_BASE}/stream"
+ESP_STATUS = f"{ESP_BASE}/status"
+ESP_SNAPSHOT = f"{ESP_BASE}/snapshot"
+ESP_UART = f"{ESP_BASE}/uart"
+ESP_LED = f"{ESP_BASE}/led"
+ESP_RESTART = f"{ESP_BASE}/restart"
+
+CONNECT_TIMEOUT = 4.0
+READ_TIMEOUT = 10.0
+REQUEST_HEADERS = {"Connection": "keep-alive", "User-Agent": "HydroBot-Server/1.0"}
+MAX_FRAME_AGE_MS = 5000
+
+# ========= APP / CORS =========
+app = FastAPI(title="HydroBot Server (STA)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+# ========= STATE =========
+_last_jpeg: Optional[bytes] = None
+_last_jpeg_ts_ms: int = 0
+_stream_ok: bool = False
+_stop_reader = False
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _parse_mjpeg_and_store(resp: requests.Response):
+    global _last_jpeg, _last_jpeg_ts_ms, _stream_ok
+
+    # Tenta ler o boundary do cabeçalho
+    ctype = resp.headers.get("Content-Type", "")
+    boundary = None
+    if "multipart/x-mixed-replace" in ctype:
+        # Ex.: multipart/x-mixed-replace;boundary=frame
+        parts = ctype.split("boundary=")
+        if len(parts) == 2:
+            boundary = parts[1].strip()
+    if not boundary:
+        boundary = "frame"  # fallback, seu firmware usa "frame"
+
+    delimiter = ("--" + boundary).encode()
+
+    buf = b""
+    for chunk in resp.iter_content(chunk_size=4096):
+        if _stop_reader:
+            break
+        if not chunk:
+            continue
+        buf += chunk
+
+        # Procura delimitadores
+        while True:
+            start = buf.find(delimiter)
+            if start < 0:
+                break
+            # corta o prefixo antes do delimiter
+            buf = buf[start + len(delimiter):]
+
+            # Agora esperamos os headers dessa parte até \r\n\r\n
+            head_end = buf.find(b"\r\n\r\n")
+            if head_end < 0:
+                # ainda não temos todos os headers; precisa de mais dados
+                break
+
+            headers_blob = buf[:head_end].decode(errors="ignore")
+            buf = buf[head_end + 4:]  # avança além do \r\n\r\n
+
+            # Descobre o tamanho via Content-Length (se existir)
+            content_length = None
+            for line in headers_blob.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    try:
+                        content_length = int(line.split(":")[1].strip())
+                    except:
+                        content_length = None
+
+            if content_length is not None:
+                # Espera exatamente content_length bytes para o JPEG
+                if len(buf) < content_length:
+                    # esperar mais dados
+                    break
+                jpg = buf[:content_length]
+                buf = buf[content_length:]
+            else:
+                # Sem Content-Length, tenta achar próximo delimiter
+                next_delim = buf.find(delimiter)
+                if next_delim < 0:
+                    # não chegou ainda a próxima parte
+                    break
+                jpg = buf[:next_delim]
+                buf = buf[next_delim:]
+
+            # Guarda o frame
+            _last_jpeg = bytes(jpg)
+            _last_jpeg_ts_ms = _now_ms()
+            _stream_ok = True
+
+def _reader_thread():
+    global _stream_ok
+    while not _stop_reader:
+        try:
+            _stream_ok = False
+            with requests.get(ESP_STREAM, stream=True,
+                              headers=REQUEST_HEADERS,
+                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as r:
+                if r.status_code == 200:
+                    _parse_mjpeg_and_store(r)
+                else:
+                    _stream_ok = False
+                    time.sleep(1.0)
+        except Exception:
+            _stream_ok = False
+            time.sleep(1.0)
+
+_reader_started = False
+_reader_lock = threading.Lock()
+
+def ensure_reader_started():
+    global _reader_started
+    with _reader_lock:
+        if not _reader_started:
+            t = threading.Thread(target=_reader_thread, daemon=True)
+            t.start()
+            _reader_started = True
+
+# ========= ROUTES =========
+
+@app.on_event("startup")
+def _startup():
+    ensure_reader_started()
+
+@app.get("/healthz")
+def healthz():
+    age = _now_ms() - _last_jpeg_ts_ms if _last_jpeg_ts_ms else None
+    return {
+        "stream_ok": _stream_ok,
+        "has_frame": _last_jpeg is not None,
+        "frame_age_ms": age
+    }
+
+@app.get("/frame.jpg")
+def frame_jpg():
+    if _last_jpeg and (_now_ms() - _last_jpeg_ts_ms) <= MAX_FRAME_AGE_MS:
+        return Response(content=_last_jpeg, media_type="image/jpeg")
+    return Response(content=b"", media_type="image/jpeg", status_code=503)
+
+@app.get("/stream")
+def stream_proxy():
+    """
+    Re-stream do último frame em MJPEG (server-side).
+    Útil para clientes que querem uma URL estável mesmo se o ESP reiniciar.
+    """
+    def gen():
+        boundary = b"--frame"
+        yield b"HTTP/1.1 200 OK\r\n"
+        yield b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        yield b"Cache-Control: no-cache\r\n\r\n"
+
+        while True:
+            if _last_jpeg:
+                part = (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(_last_jpeg)).encode() + b"\r\n\r\n" +
+                    _last_jpeg + b"\r\n"
+                )
+                yield part
+            time.sleep(0.04)  # ~25 FPS alvo (controlado pelo ESP de toda forma)
+
+    return Response(content=gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/esp/status")
+def esp_status():
+    try:
+        r = requests.get(ESP_STATUS, headers=REQUEST_HEADERS, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return Response(content=r.content, media_type=r.headers.get("Content-Type", "application/json"),
+                        status_code=r.status_code)
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/esp/uart")
+def esp_uart(cmd: str):
+    try:
+        r = requests.post(ESP_UART, params={"cmd": cmd}, headers=REQUEST_HEADERS,
+                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return Response(content=r.content, media_type=r.headers.get("Content-Type", "application/json"),
+                        status_code=r.status_code)
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/esp/led")
+def esp_led(on: int):
+    try:
+        r = requests.post(ESP_LED, params={"on": on}, headers=REQUEST_HEADERS,
+                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return Response(content=r.content, media_type=r.headers.get("Content-Type", "application/json"),
+                        status_code=r.status_code)
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/esp/restart")
+def esp_restart():
+    try:
+        r = requests.post(ESP_RESTART, headers=REQUEST_HEADERS,
+                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return Response(content=r.content, media_type=r.headers.get("Content-Type", "application/json"),
+                        status_code=r.status_code)
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/ui/stream")
+def ui_stream(mode: str = "server"):
+    """
+    Página simples p/ testar stream no navegador:
+      - mode=server -> usa /stream deste servidor
+      - mode=direct -> usa /stream direto do ESP
+    """
+    src = "/stream" if mode == "server" else ESP_STREAM
+    html = f"""
+<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HydroBot Stream</title>
+<style>
+body{{background:#0b0b0f;color:#e5e7eb;margin:0;font-family:system-ui}}
+.top{{padding:12px;background:#121218;position:sticky;top:0;display:flex;gap:8px;align-items:center}}
+a.button{{padding:8px 12px;background:#e6403a;color:#fff;text-decoration:none;border-radius:8px}}
+.container{{display:flex;justify-content:center;align-items:center;padding:12px}}
+img{{max-width:100vw;max-height:80vh;display:block}}
+small{{opacity:.7}}
+</style></head>
+<body>
+<div class="top">
+  <a class="button" href="/ui/stream?mode=server">Server Stream</a>
+  <a class="button" href="/ui/stream?mode=direct">Direct ESP</a>
+  <small>ESP: <code>{ESP_BASE}</code> | modo: <b>{mode}</b></small>
+</div>
+<div class="container">
+  <img src="{src}" alt="stream"/>
+</div>
+</body></html>
+    """.strip()
+    return Response(content=html, media_type="text/html")
+
+
+
+
+2) HydroBotApp2/src/screens/CameraScreen.tsx (React Native)
+
+
+
+
+Mantém o visual que você já vinha usando (paleta, textos), e adiciona um seletor “Fonte de vídeo”:
+
+
+
+Direto do ESP (http://hydrobot.local/stream) — aproveita o seu endpoint novo.
+
+
+Via servidor (http://<server>:8000/stream) — útil se você preferir o re-stream do FastAPI.
+
+
+
+
+
+
+Como o <Image> do React Native não toca MJPEG, uso um WebView leve com um HTML inline só com <img src="...">.
+
+
+Inclui teste de /status do ESP, botões de LED ON/OFF e envio de UART (ex: CMD:FWD:ms=400:spd=70), casando com seus POSTs.
+
+
+Não depende do seu servidor para funcionar “direto” com o ESP.
+
+
+
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+import React, { useMemo, useRef, useState } from "react";
+import { View, Text, TextInput, Pressable, StyleSheet, Platform, KeyboardAvoidingView, ScrollView } from "react-native";
+import { WebView } from "react-native-webview";
+
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+type SourceMode = "direct" | "server";
+
+export default function CameraScreen() {
+  // IP/host do ESP (mDNS por padrão) e do servidor FastAPI
+  const [espHost, setEspHost] = useState<string>("hydrobot.local"); // ou "192.168.0.50"
+  const [serverHost, setServerHost] = useState<string>("192.168.0.100:8000"); // ajuste se precisar
+  const [mode, setMode] = useState<SourceMode>("direct");
+
+  const [statusText, setStatusText] = useState<string>("");
+
+  const streamURL = useMemo(() => {
+    if (mode === "server") {
+      return `http://${serverHost}/stream`;
+    }
+    return `http://${espHost}/stream`;
+  }, [mode, espHost, serverHost]);
+
+  const html = useMemo(() => {
+    // HTML mínimo para exibir MJPEG de forma robusta
+    // Mantemos fundo/estilo parecidos com o app
+    const escapedSrc = streamURL.replace(/"/g, "&quot;");
+    return `
+<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  html,body{margin:0;padding:0;background:#0b0b0f;color:#e5e7eb;height:100%;}
+  .wrap{display:flex;align-items:center;justify-content:center;height:100%;}
+  img{max-width:100vw;max-height:100vh;display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <img id="m" src="${escapedSrc}" alt="stream"/>
+</div>
+</body></html>
+    `.trim();
+  }, [streamURL]);
+
+  async function testStatus() {
+    try {
+      const url = `http://${espHost}/status`;
+      const res = await fetch(url, { method: "GET" });
+      const txt = await res.text();
+      setStatusText(`OK ${res.status}: ${txt}`);
+    } catch (e: any) {
+      setStatusText(`ERRO: ${String(e?.message || e)}`);
+    }
+  }
+
+  async function led(on: boolean) {
+    try {
+      const url = `http://${espHost}/led?on=${on ? 1 : 0}`;
+      const res = await fetch(url, { method: "POST" });
+      const txt = await res.text();
+      setStatusText(`LED ${on ? "ON" : "OFF"} => ${res.status}: ${txt}`);
+    } catch (e: any) {
+      setStatusText(`ERRO LED: ${String(e?.message || e)}`);
+    }
+  }
+
+  const [uartCmd, setUartCmd] = useState<string>("CMD:FWD:ms=400:spd=70");
+
+  async function sendUART() {
+    try {
+      // Garante \n do lado do ESP (ele adiciona se faltar, mas mantemos simples)
+      const url = `http://${espHost}/uart?cmd=${encodeURIComponent(uartCmd)}`;
+      const res = await fetch(url, { method: "POST" });
+      const txt = await res.text();
+      setStatusText(`UART => ${res.status}: ${txt}`);
+    } catch (e: any) {
+      setStatusText(`ERRO UART: ${String(e?.message || e)}`);
+    }
+  }
+
+  return (
+    <KeyboardAvoidingView style={{ flex: 1, backgroundColor: PALETTE.bg }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <View style={styles.header}>
+        <Text style={styles.title}>HydroBot — Câmera</Text>
+        <Text style={styles.subtitle}>Monitoramento (ESP STA)</Text>
+      </View>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP host:</Text>
+        <TextInput
+          style={styles.input}
+          value={espHost}
+          onChangeText={setEspHost}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="hydrobot.local ou 192.168.0.50"
+          placeholderTextColor="#6b7280"
+        />
+      </View>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>Servidor:</Text>
+        <TextInput
+          style={styles.input}
+          value={serverHost}
+          onChangeText={setServerHost}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="IP:porta (ex: 192.168.0.100:8000)"
+          placeholderTextColor="#6b7280"
+        />
+      </View>
+
+      <View style={[styles.row, { justifyContent: "space-between" }]}>
+        <View style={styles.modeGroup}>
+          <Pressable style={[styles.modeBtn, mode === "direct" && styles.modeBtnActive]} onPress={() => setMode("direct")}>
+            <Text style={styles.modeText}>Direto ESP</Text>
+          </Pressable>
+          <Pressable style={[styles.modeBtn, mode === "server" && styles.modeBtnActive]} onPress={() => setMode("server")}>
+            <Text style={styles.modeText}>Via Servidor</Text>
+          </Pressable>
+        </View>
+
+        <Pressable style={styles.testBtn} onPress={testStatus}>
+          <Text style={styles.btnText}>Testar /status</Text>
+        </Pressable>
+      </View>
+
+      {/* VIEW DO VÍDEO (via WebView com <img src="...">) */}
+      <View style={styles.viewer}>
+        <WebView originWhitelist={["*"]} source={{ html }} allowsInlineMediaPlayback />
+      </View>
+
+      <ScrollView style={styles.controls} contentContainerStyle={{ paddingBottom: 24 }}>
+        <View style={styles.btnRow}>
+          <Pressable style={styles.actionBtn} onPress={() => led(true)}>
+            <Text style={styles.btnText}>LED ON</Text>
+          </Pressable>
+          <Pressable style={styles.actionBtn} onPress={() => led(false)}>
+            <Text style={styles.btnText}>LED OFF</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.row}>
+          <Text style={styles.label}>UART:</Text>
+          <TextInput
+            style={styles.input}
+            value={uartCmd}
+            onChangeText={setUartCmd}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            placeholder="ex: CMD:FWD:ms=400:spd=70"
+            placeholderTextColor="#6b7280"
+          />
+        </View>
+        <Pressable style={styles.actionBtn} onPress={sendUART}>
+          <Text style={styles.btnText}>Enviar UART</Text>
+        </Pressable>
+
+        {!!statusText && (
+          <View style={styles.statusBox}>
+            <Text style={styles.statusText}>{statusText}</Text>
+          </View>
+        )}
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+
+const styles = StyleSheet.create({
+  header: { padding: 16, paddingBottom: 8 },
+  title: { color: PALETTE.text, fontSize: 18, fontWeight: "700" },
+  subtitle: { color: "#9ca3af", marginTop: 2 },
+  row: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, gap: 8, marginTop: 8 },
+  label: { color: "#9ca3af", width: 84 },
+  input: { flex: 1, backgroundColor: PALETTE.card, borderColor: PALETTE.border, borderWidth: 1, borderRadius: 10, color: PALETTE.text, paddingHorizontal: 12, height: 40 },
+  modeGroup: { flexDirection: "row", gap: 8 },
+  modeBtn: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, backgroundColor: PALETTE.card, borderWidth: 1, borderColor: PALETTE.border },
+  modeBtnActive: { backgroundColor: PALETTE.accent, borderColor: PALETTE.accent },
+  modeText: { color: "#fff" },
+  testBtn: { backgroundColor: PALETTE.accent, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  btnText: { color: "#fff", fontWeight: "600" },
+  viewer: { height: 280, margin: 16, borderRadius: 12, overflow: "hidden", borderColor: PALETTE.border, borderWidth: 1, backgroundColor: "#000" },
+  controls: { flex: 1, paddingHorizontal: 16 },
+  btnRow: { flexDirection: "row", gap: 10, marginTop: 8 },
+  actionBtn: { backgroundColor: PALETTE.accent, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+  statusBox: { marginTop: 12, backgroundColor: PALETTE.card, borderRadius: 10, borderWidth: 1, borderColor: PALETTE.border, padding: 12 },
+  statusText: { color: "#e5e7eb", fontSize: 12 },
+});
+
+
+
+
+Como usar / validar rápido
+
+
+
+
+ESP ligado no roteador
+
+Acesse no navegador do celular/PC:
+
+
+
+
+
+
+http://hydrobot.local/
+
+
+http://hydrobot.local/stream
+
+
+http://hydrobot.local/snapshot
+
+Se não resolver mDNS, use o IP (ex.: http://192.168.0.50/stream).
+
+
+
+
+
+
+Servidor FastAPI
+
+
+
+
+
+
+Inicie: uvicorn server_heuristic:app --host 0.0.0.0 --port 8000
+
+
+Teste no navegador:
+
+
+
+http://<server>:8000/ui/stream?mode=server (re-stream)
+
+
+http://<server>:8000/ui/stream?mode=direct (direto do ESP)
+
+
+http://<server>:8000/healthz e http://<server>:8000/frame.jpg
+
+
+
+
+
+
+
+
+
+
+App (CameraScreen)
+
+
+
+
+
+
+Em “ESP host” deixe hydrobot.local (ou o IP).
+
+
+Em “Servidor” defina IP:porta do FastAPI se for usar “Via Servidor”.
+
+
+Toque Direto ESP (ou Via Servidor) conforme preferir.
+
+
+Use Testar /status para validar a comunicação.
+
+
+LED/ UART já casam com seus POST atuais do firmware.
+
+
+
+
+
+Por que isso resolve seus sintomas anteriores?
+
+
+
+
+Reboot ao “olhar longe”: manter /stream + fb_count=2 e consumir via WebView <img> evita estourar RAM do app. O servidor, se usado, faz re-stream e aplica “backpressure” guardando apenas o último frame, reduzindo risco de travas quando a cena tem muitos detalhes.
+
+
+“No live frame”: o endpoint /frame.jpg sempre devolve o último frame válido em JPEG (útil como fallback).
+
+
+CORS e POSTs: tudo alinhado ao seu firmware atual—sem endpoints inventados.
+
+
+
+
+Se quiser, depois posso incluir um fallback por snapshot (pull 5–10 FPS) no mesmo WebView, mas quis manter enxuto e fiel à sua lógica atual.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
   HydroBot - ESP32-CAM em modo STA (roteador externo)
   - Endpoints:
