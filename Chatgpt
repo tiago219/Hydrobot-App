@@ -1,5 +1,295 @@
 
 /*
+  ESP32-CAM (AI Thinker) — MÍNIMO E ESTÁVEL
+  - Conecta em Wi-Fi STA (roteador externo):
+      SSID: HydroBot
+      PASS: loud2025emibr
+  - ÚNICA rota:  GET /stream   -> MJPEG (multipart/x-mixed-replace)
+  - mDNS opcional: http://cam.local/stream
+  - Foco em estabilidade: 1 cliente por vez, mutex, grab_mode LATEST, PSRAM, chunks ~1460 B, xclk 10 MHz.
+
+  Requisitos:
+    - Placa: "AI Thinker ESP32-CAM"
+    - PSRAM habilitada nas preferências da placa
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===== Wi-Fi (roteador externo) =====
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50), gateway(192,168,0,1), subnet(255,255,255,0), dns1(8,8,8,8), dns2(1,1,1,1);
+
+// mDNS (opcional)
+const char* MDNS_NAME = "cam"; // http://cam.local/stream
+
+// ===== Câmera (AI Thinker) =====
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ===== HTTP =====
+WebServer server(80);
+
+// ===== Concurrency guard =====
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t g_camLock = nullptr;
+static volatile bool g_streaming = false;
+#define CAM_LOCK_TIMEOUT_MS 150
+
+// ===== Stream =====
+static const char* STREAM_BOUNDARY = "frame";
+static const char* STREAM_CT = "multipart/x-mixed-replace;boundary=frame";
+
+// ===== Wi-Fi =====
+void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true); // ajuda estabilidade com fontes “ok”
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+// ===== Câmera (perfil mínimo e estável) =====
+bool initCamera() {
+  // desarma brownout (fontes com pico podem resetar sem isso)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t cfg{};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 10000000;             // 10 MHz (mais estável que 20 MHz)
+  cfg.pixel_format = PIXFORMAT_JPEG;
+
+  // Perfil seguro para stream
+  cfg.frame_size   = FRAMESIZE_QVGA;       // 320x240 (estável para diagnóstico)
+  cfg.jpeg_quality = 17;                   // 10..20 (17 = leve e estável)
+  cfg.fb_count     = 2;                    // 2 buffers para stream
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;   // evita fila acumular
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;   // usa PSRAM
+
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  // neutro (não muda flip espelho; ajuste se quiser)
+  s->set_vflip(s, false);
+  s->set_hmirror(s, false);
+  s->set_aec2(s, true);
+  s->set_gainceiling(s, GAINCEILING_2X);
+  s->set_brightness(s, 0);
+  s->set_saturation(s, 0);
+
+  return true;
+}
+
+// ===== Handlers =====
+// Única rota pública: /stream
+void handleStream() {
+  // 1 stream por vez
+  if (g_streaming) {
+    server.send(429, "text/plain", "stream already running");
+    return;
+  }
+  if (!g_camLock || !xSemaphoreTake(g_camLock, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS))) {
+    server.send(503, "text/plain", "camera busy");
+    return;
+  }
+
+  g_streaming = true;
+  WiFiClient client = server.client();
+
+  client.println("HTTP/1.1 200 OK");
+  client.println(String("Content-Type: ") + STREAM_CT);
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.println("Connection: close");
+  client.println();
+
+  // loop de envio
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    // cabeçalhos do frame
+    client.print("--"); client.println(STREAM_BOUNDARY);
+    client.println("Content-Type: image/jpeg");
+    client.print("Content-Length: "); client.println(fb->len);
+    client.println();
+
+    // envia em chunks (MTU-ish) para aliviar lwIP
+    const uint8_t* p = fb->buf;
+    size_t remain = fb->len;
+    bool abortWrite = false;
+    while (remain > 0) {
+      size_t n = remain > 1460 ? 1460 : remain;
+      size_t w = client.write(p, n);
+      if (w == 0) { abortWrite = true; break; }
+      p += w; remain -= w;
+      delay(1); yield();
+    }
+    client.println(); // CRLF após o JPEG
+    esp_camera_fb_return(fb);
+
+    if (abortWrite) break;
+
+    // Pace suave para não formar fila
+    delay(6);
+    yield();
+  }
+
+  g_streaming = false;
+  xSemaphoreGive(g_camLock);
+}
+
+// Página raiz mínima (apenas para facilitar teste manual)
+void handleRoot() {
+  server.send(200, "text/html",
+    "<!doctype html><meta charset=utf-8>"
+    "<title>ESP32-CAM</title>"
+    "<body style='font-family:system-ui;background:#0b0b0f;color:#e5e7eb'>"
+    "<h3>ESP32-CAM — mínimo</h3>"
+    "<p><a href='/stream'>/stream</a></p>"
+    "</body>");
+}
+
+void setupServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.onNotFound([](){ server.send(404, "text/plain", "not found"); });
+  server.begin();
+}
+
+// ===== Setup/Loop =====
+void setup() {
+  // desarma brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  delay(150);
+
+  if (!initCamera()) {
+    delay(1000);
+    // última tentativa com perfil ainda mais leve
+    // (mantemos a estrutura; se falhar de novo, reinicie)
+    esp_camera_deinit();
+    camera_config_t cfg{};
+    cfg.ledc_channel = LEDC_CHANNEL_0;
+    cfg.ledc_timer   = LEDC_TIMER_0;
+    cfg.pin_d0       = Y2_GPIO_NUM;
+    cfg.pin_d1       = Y3_GPIO_NUM;
+    cfg.pin_d2       = Y4_GPIO_NUM;
+    cfg.pin_d3       = Y5_GPIO_NUM;
+    cfg.pin_d4       = Y6_GPIO_NUM;
+    cfg.pin_d5       = Y7_GPIO_NUM;
+    cfg.pin_d6       = Y8_GPIO_NUM;
+    cfg.pin_d7       = Y9_GPIO_NUM;
+    cfg.pin_xclk     = XCLK_GPIO_NUM;
+    cfg.pin_pclk     = PCLK_GPIO_NUM;
+    cfg.pin_vsync    = VSYNC_GPIO_NUM;
+    cfg.pin_href     = HREF_GPIO_NUM;
+    cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+    cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+    cfg.pin_pwdn     = PWDN_GPIO_NUM;
+    cfg.pin_reset    = RESET_GPIO_NUM;
+    cfg.xclk_freq_hz = 10000000;
+    cfg.pixel_format = PIXFORMAT_JPEG;
+    cfg.frame_size   = FRAMESIZE_QQVGA;    // fallback 160x120
+    cfg.jpeg_quality = 18;
+    cfg.fb_count     = 1;
+    cfg.grab_mode    = CAMERA_GRAB_LATEST;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+    if (esp_camera_init(&cfg) != ESP_OK) {
+      // sem câmera, não há o que servir
+      while (true) { delay(1000); }
+    }
+  }
+
+  connectWiFi();
+
+  // mDNS (opcional)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(MDNS_NAME)) {
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+
+  // Mutex da câmera
+  g_camLock = xSemaphoreCreateMutex();
+
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+  // nada além do stream
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
   HydroBot - ESP32-CAM em modo STA (roteador externo)
   - Endpoints:
       GET  /              -> página info rápida
