@@ -1,3 +1,39 @@
+// Aplica P&B/qualidade/tamanho sem reinicializar (compatível com libs antigas)
+bool applyCameraTweaks(bool gray, int quality /*10..63*/, int fs_code /*-1 = manter*/) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+
+  // P&B direto no sensor (2 = GRAYSCALE)
+  if (s->set_special_effect) s->set_special_effect(s, gray ? 2 : 0);
+
+  // Reduz saturação quando cinza (ajuda encoder)
+  if (s->set_saturation)     s->set_saturation(s, gray ? -2 : 0);
+
+  // >>> AQUI ESTÁ A MUDANÇA: usar set_whitebal (algumas libs não têm set_awb)
+  if (s->set_whitebal)       s->set_whitebal(s, 0);   // 0 = desliga AWB (fixa balanço)
+  // (algumas versões também expõem set_wb_mode; mantenha sob guard)
+  if (s->set_wb_mode)        s->set_wb_mode(s, 0);    // mantém modo base
+
+  // Qualidade (número MAIOR = MAIS compressão = arquivo menor)
+  if (quality >= 10 && quality <= 63 && s->set_quality) {
+    s->set_quality(s, quality);
+  }
+
+  // Tamanho do frame
+  if (fs_code > 0 && s->set_framesize) {
+    s->set_framesize(s, (framesize_t)fs_code);
+  }
+
+  return true;
+}
+
+
+
+
+
+
+
+
 
 Segue o firmware ESP32-CAM completo (compatível com versões antigas da esp32-camera) já com o endpoint POST /cam para ligar/desligar preto-e-branco, ajustar qualidade e resolução sem reinicializar.
 
