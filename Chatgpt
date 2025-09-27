@@ -1,3 +1,1244 @@
+
+Vamos atacar o gargalo real: quando a câmera olha “longe” (muita textura/detalhe), os JPEGs ficam grandes, a captura demora mais, a PSRAM fragmenta e o Wi-Fi congestiona — isso faz travar/rebootar. Corrigi isso de 3 lados:
+
+
+
+
+
+
+ESP32-CAM:
+
+
+
+
+Buffer único pré-alocado em PSRAM (tamanho fixo) — sem malloc/free por frame.
+
+
+Queda agressiva de resolução/qualidade quando um frame passa do limite, e recuperação gradual quando aliviar.
+
+
+Drops “duros” seguros para frames imensos (protege rádio e PSRAM).
+
+
+fb_count=1, GRAB_LATEST, WiFi sem sleep e reinit da câmera em streak de falhas.
+
+
+
+
+
+
+
+
+Server (FastAPI):
+
+
+
+
+/snapshot passa a entregar apenas o último frame em cache do grabber (sem refazer requisição direta ao ESP).
+
+
+Grabber com FPS alvo menor (6–7) e backoff suave para redes mais lentas.
+
+
+
+
+
+
+
+
+App (CameraScreen):
+
+
+
+
+Poll de imagem ajustado (~5–6 fps) com backoff em falha.
+
+
+Mantida a lógica de fallback (server → ESP direto) mas com menos pressão.
+
+
+
+
+
+
+
+
+Abaixo os arquivos completos já ajustados.
+
+
+
+1) server_heuristic.py (com cache único e /snapshot leve)
+
+
+# server_heuristic.py
+# FastAPI proxy + heurística de fogo (leve) para ESP32-CAM snapshot (robusto)
+import time
+import threading
+from typing import Optional, Dict, Any, List, Tuple
+
+import cv2
+import numpy as np
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ========= CONFIG =========
+CAMERA_IP = "192.168.3.3"                          # ESP32-CAM IP (roteador)
+SNAPSHOT_URL_FMT = "http://{}/snapshot"
+CONNECT_TIMEOUT = 4.0
+READ_TIMEOUT = 10.0
+POLL_FPS_TARGET = 6.0                              # ~6 fps para aliviar rede/ESP
+MAX_FRAME_AGE_MS = 15000                           # relaxado p/ redes lentas
+MAX_RESULT_AGE_MS = 800
+REQUEST_HEADERS = {
+    "Connection": "keep-alive",
+    "User-Agent": "HydroBot-Grabber/1.1",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+ACCEPT_CT_PREFIX = ("image/jpeg", "image/jpg", "image/pjpeg", "application/octet-stream")
+
+def is_jpeg_bytes(b: bytes) -> bool:
+    return len(b) > 4 and b[0] == 0xFF and b[1] == 0xD8
+
+# ========= FASTAPI =========
+app = FastAPI(title="HydroBot Server (proxy + fire-heuristic)", version="2.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ========= PLACEHOLDER =========
+def placeholder_jpeg(msg: str = "NO LIVE FRAME") -> bytes:
+    img = np.zeros((240, 320, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ========= SNAPSHOT GRABBER =========
+class SnapshotGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_fps_tick = time.time()
+        self._session = requests.Session()
+        self._last_err: Optional[str] = None
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _ok_ct(self, ct: str) -> bool:
+        if not ct:
+            return True
+        ct = ct.lower()
+        return any(ct.startswith(p) for p in ACCEPT_CT_PREFIX)
+
+    def _fetch_once(self) -> Optional[bytes]:
+        u = f"{SNAPSHOT_URL_FMT.format(self._ip)}?ts={int(time.time()*1000)}"
+        r = self._session.get(u, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                              headers=REQUEST_HEADERS, stream=False)
+        if r.status_code == 200:
+            ct = r.headers.get("Content-Type", "")
+            b = r.content or b""
+            if (self._ok_ct(ct) and b) or is_jpeg_bytes(b):
+                return b
+        return None
+
+    def _run(self):
+        min_interval = 1.0 / POLL_FPS_TARGET
+        backoff = 0.0
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                jpeg = self._fetch_once()
+                if jpeg:
+                    with self._lock:
+                        self._last_jpeg = jpeg
+                        self._last_ts_ms = int(time.time()*1000)
+                        self._last_err = None
+                    self._frames += 1
+                    now = time.time()
+                    if now - self._last_fps_tick >= 1.0:
+                        self._fps = self._frames / (now - self._last_fps_tick)
+                        self._frames = 0
+                        self._last_fps_tick = now
+                    backoff = 0.0
+                else:
+                    backoff = min(2.0, max(0.2, (backoff * 1.7) or 0.2))
+            except Exception as e:
+                with self._lock:
+                    self._last_err = f"{type(e).__name__}: {e}"
+                backoff = min(3.0, max(0.2, (backoff * 1.7) or 0.2))
+
+            elapsed = time.time() - t0
+            sleep = max(0.0, min_interval - elapsed) + backoff
+            if self._stop.is_set():
+                break
+            time.sleep(sleep)
+
+    def get_latest_jpeg(self, max_age_ms=MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None:
+                return None
+            if int(time.time()*1000) - self._last_ts_ms > max_age_ms:
+                return None
+            return self._last_jpeg
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            age = int(time.time()*1000) - self._last_ts_ms if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age,
+                    "fps_in": round(self._fps, 2), "last_err": self._last_err}
+
+grabber = SnapshotGrabber()
+grabber.start(CAMERA_IP)
+
+# ========= HEURÍSTICA FOGO =========
+HSV_LOW = (8, 80, 120)
+HSV_HIGH = (40, 255, 255)
+EMA_ALPHA = 0.25
+HYST_HIGH = 0.18
+HYST_LOW  = 0.15
+MIN_BLOB_AREA = 900
+KERNEL_SZ = 5
+
+def hsv_fire_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array(HSV_LOW, np.uint8), np.array(HSV_HIGH, np.uint8))
+
+def boxes_from_mask(mask_bin: np.ndarray, min_area: int = MIN_BLOB_AREA) -> List[List[int]]:
+    k = np.ones((KERNEL_SZ, KERNEL_SZ), np.uint8)
+    m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if w*h >= min_area:
+            out.append([int(x), int(y), int(w), int(h)])
+    return out
+
+class FireDetector:
+    def __init__(self, src: SnapshotGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ema = 0.0
+        self._score_raw = 0.0
+        self._is_fire = False
+        self._boxes: List[List[int]] = []
+        self._last_ts = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_fps_tick = time.time()
+        self._frame_wh: Optional[Tuple[int,int]] = None
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / 8.0
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.03); continue
+            frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.02); continue
+            H, W = frame.shape[:2]
+            self._frame_wh = (W, H)
+
+            mask = hsv_fire_mask(frame)
+            v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[...,2])) / 255.0
+            ratio = float(np.count_nonzero(mask))/float(mask.size)
+            score_raw = min(1.0, ratio*4.0 + v_mean*0.1)
+            ema = score_raw if self._ema==0.0 else EMA_ALPHA*score_raw + (1.0-EMA_ALPHA)*self._ema
+
+            boxes = boxes_from_mask(mask)
+
+            if   ema >= HYST_HIGH: is_fire = True
+            elif ema <= HYST_LOW : is_fire = False
+            else: is_fire = self._is_fire
+
+            with self._lock:
+                self._ema = ema
+                self._score_raw = score_raw
+                self._is_fire = is_fire
+                self._boxes = boxes if is_fire else []
+                self._last_ts = int(time.time()*1000)
+                self._frames += 1
+                now = time.time()
+                if now - self._last_fps_tick >= 1.0:
+                    self._fps = self._frames / (now - self._last_fps_tick)
+                    self._frames = 0
+                    self._last_fps_tick = now
+
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def get(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "isFire": bool(self._is_fire),
+                "score": round(float(self._ema), 3),
+                "score_raw": round(float(self._score_raw), 3),
+                "score_ema": round(float(self._ema), 3),
+                "boxes": list(self._boxes),
+                "ts": int(self._last_ts),
+                "fps_det": round(float(self._fps), 2),
+                "frame_wh": list(self._frame_wh) if self._frame_wh else None
+            }
+
+det = FireDetector(grabber); det.start()
+
+# ========= ENDPOINTS =========
+@app.get("/healthz")
+def healthz():
+    s = grabber.status()
+    return {"ok": True, "camera_ip": s.get("ip"), "fps_in": s.get("fps_in"),
+            "hasFrame": s.get("hasFrame"), "age_ms": s.get("age_ms"), "last_err": s.get("last_err")}
+
+@app.get("/status")
+def status():
+    s = grabber.status(); d = det.get()
+    return {"ok": True, "camera_ip": s["ip"], **s, **d}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    # Agora SEM requisitar o ESP aqui: apenas entrega o último do grabber (reduz carga)
+    b = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if not b:
+        b = placeholder_jpeg("NO LIVE FRAME")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Type": "image/jpeg"
+    }
+    return Response(content=b, headers=headers, media_type="image/jpeg")
+
+@app.get("/detect")
+def detect():
+    res = det.get()
+    if res.get("ts", 0) and (int(time.time()*1000) - res["ts"] <= MAX_RESULT_AGE_MS):
+        return res
+    jpeg = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if jpeg is None:
+        return {"ok": False, "error": "no recent frame"}
+    frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return {"ok": False, "error": "decode failed"}
+    H, W = frame.shape[:2]
+    mask = hsv_fire_mask(frame)
+    v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[...,2])) / 255.0
+    ratio = float(np.count_nonzero(mask))/float(mask.size)
+    score = min(1.0, ratio*4.0 + v_mean*0.1)
+    is_fire = bool(score >= HYST_HIGH)
+    return {"ok": True, "isFire": is_fire, "score": round(score,3), "score_raw": round(score,3),
+            "score_ema": round(score,3), "boxes": [], "ts": int(time.time()*1000), "frame_wh": [W,H], "fallback": True}
+
+
+
+
+2) CameraScreen.tsx (poll mais leve e fallback mantido)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet,
+  PanResponder, GestureResponderEvent, PanResponderGestureState,
+  Image, Animated, LayoutChangeEvent,
+} from "react-native";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+
+const textsByLang = {
+  pt: { heroSubtitle:"Monitoramento e Controle", espIp:"ESP IP:", pumpOn:"BOMBA ON", pumpOff:"BOMBA OFF",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Aguardando servidor…", statusFail:"Falha ao conectar. Confira o Wi-Fi/IP.",
+        noVideo:"Sem vídeo (snapshot). Verifique o servidor.", fireOn:(s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sem fogo • score ${s.toFixed(2)}`, synced:"Server sincronizado",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+  en: { heroSubtitle:"Monitoring & Control", espIp:"ESP IP:", pumpOn:"PUMP ON", pumpOff:"PUMP OFF",
+        server:"Server:", detecting:"Detecting…", waiting:"Waiting for server…", statusFail:"Failed to connect. Check Wi-Fi/IP.",
+        noVideo:"No video (snapshot). Check the server.", fireOn:(s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`No fire • score ${s.toFixed(2)}`, synced:"Server sync OK",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+  es: { heroSubtitle:"Monitoreo y Control", espIp:"ESP IP:", pumpOn:"BOMBA ENC.", pumpOff:"BOMBA APAG.",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Esperando servidor…", statusFail:"Error de conexión. Revisa Wi-Fi/IP.",
+        noVideo:"Sin vídeo (snapshot). Revisa el servidor.", fireOn:(s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sin fuego • score ${s.toFixed(2)}`, synced:"Sincronizado con servidor",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+};
+
+const DEFAULT_IP = "192.168.3.3";
+const DEFAULT_SERVER = "http://192.168.3.4:8000";
+const DEFAULT_FRAME_WH = { w: 320, h: 240 };
+
+const appLogo = require("../../assets/logo.png");
+
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+function CrossfadeImage({
+  currentUri, nextUri, onNextLoadStart, onNextShown,
+}: { currentUri: string; nextUri: string; onNextLoadStart: () => void; onNextShown: (ok: boolean) => void; }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            key={nextUri}
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown(true); fade.setValue(0); setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+type SrcBox = { x:number; y:number; w:number; h:number; type:"fire" };
+function BoxesOverlay({ frameWH, containerWH, boxes }:{
+  frameWH:{w:number;h:number}|null; containerWH:{w:number;h:number}|null; boxes:SrcBox[];
+}) {
+  const f = frameWH && frameWH.w>0 && frameWH.h>0 ? frameWH : DEFAULT_FRAME_WH;
+  if (!containerWH || containerWH.w<=0 || containerWH.h<=0) return null;
+  const scale = Math.min(containerWH.w / f.w, containerWH.h / f.h);
+  const dispW = f.w * scale, dispH = f.h * scale;
+  const offsetX = (containerWH.w - dispW)/2, offsetY = (containerWH.h - dispH)/2;
+  return (
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+      <View style={{ position:"absolute", left:offsetX, top:offsetY, width:dispW, height:dispH }}>
+        {boxes.map((b,i)=>{
+          const left=b.x*scale, top=b.y*scale, width=b.w*scale, height=b.h*scale;
+          return (
+            <View key={i} style={{ position:"absolute", left, top, width, height, borderWidth:3, borderColor:"#ff3b30", borderRadius:6 }}>
+              <View style={{ position:"absolute", left:0, top:-18, paddingHorizontal:6, paddingVertical:2, borderRadius:4, backgroundColor:"#ff3b30" }}>
+                <Text style={{ color:"#000", fontWeight:"800", fontSize:10 }}>FOGO</Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  const [statusText, setStatusText] = useState(T.waiting);
+  const [pumpOn, setPumpOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+  const [overlayBoxes, setOverlayBoxes] = useState<SrcBox[]>([]);
+  const [frameWH, setFrameWH] = useState<{w:number;h:number}|null>(null);
+  const [videoContainerWH, setVideoContainerWH] = useState<{w:number;h:number}|null>(null);
+
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  const [useDirectSnapshot, setUseDirectSnapshot] = useState(false);
+  const failCountRef = useRef(0);
+
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+
+  const clean = (s:string)=>s.replace(/\/+$/,"");
+
+  // Server endpoints
+  const healthUrl   = useMemo(()=>`${clean(server)}/healthz`,[server]);
+  const detectUrl   = useMemo(()=>`${clean(server)}/detect`,[server]);
+  const snapshotSrv = useMemo(()=>`${clean(server)}/snapshot`,[server]);
+  const configUrl   = useMemo(()=>`${clean(server)}/config`,[server]);
+
+  // ESP endpoints
+  const pumpUrl     = useMemo(()=> (on:boolean)=>`http://${ip}/pump?on=${on?"1":"0"}`,[ip]);
+  const joystickUrl = useMemo(()=> (x:number,y:number)=>`http://${ip}/joystick?x=${x.toFixed(2)}&y=${y.toFixed(2)}`,[ip]);
+  const uartUrl     = useMemo(()=> (line:string)=>`http://${ip}/uart?line=${encodeURIComponent(line)}`,[ip]);
+  const snapshotEsp = useMemo(()=> `http://${ip}/snapshot`, [ip]);
+
+  // Sincroniza IP no server
+  useEffect(()=>{
+    let aborted=false;
+    (async()=>{
+      try{
+        const r=await fetch(configUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_ip:ip})});
+        const j=await r.json();
+        if(!aborted && j?.ok) setStatusText(`${T.synced} (${j.camera_ip})`);
+      }catch{ if(!aborted) setStatusText(T.statusFail); }
+    })();
+    return()=>{aborted=true};
+  },[ip, configUrl, T]);
+
+  // Health
+  useEffect(()=>{
+    let stop=false, backoff=600;
+    const poll=async()=>{
+      if(stop) return;
+      try{
+        const r=await fetch(healthUrl); const j=await r.json();
+        if(j?.ok){ setStatusText(`Server OK • fps_in:${j.fps_in} • hasFrame:${j.hasFrame}`); setTimeout(poll, 1500); return; }
+      }catch{}
+      setStatusText(T.waiting);
+      setTimeout(poll, backoff); backoff=Math.min(backoff*1.6, 5000);
+    };
+    poll(); return()=>{stop=true};
+  },[healthUrl, T]);
+
+  // SNAPSHOT loop (menos pressão)
+  useEffect(()=>{
+    let stop=false;
+    let interval=190; // ~5.2 fps
+    const pickBase = ()=> useDirectSnapshot ? snapshotEsp : snapshotSrv;
+
+    setCurrentFrameUri(`${pickBase()}?ts=${Date.now()}`);
+    const tick=()=>{
+      if(stop) return;
+      try{
+        if(!loadingNextRef.current){
+          const base = pickBase();
+          setNextFrameUri(`${base}?ts=${Date.now()}`);
+        }
+        interval=190;
+      }catch{
+        interval=Math.min(interval*1.7, 1400);
+      }
+      setTimeout(tick, interval);
+    };
+    tick();
+    return()=>{stop=true};
+  },[snapshotSrv, snapshotEsp, useDirectSnapshot]);
+
+  const onNextLoadStart = ()=>{ loadingNextRef.current=true; };
+  const onNextShown = (ok:boolean)=>{
+    if(ok){
+      failCountRef.current = 0;
+      if(useDirectSnapshot){ setUseDirectSnapshot(false); }
+      if(nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    }else{
+      failCountRef.current += 1;
+      if(!useDirectSnapshot && failCountRef.current >= 3){
+        setUseDirectSnapshot(true);
+        failCountRef.current = 0;
+      }
+    }
+    loadingNextRef.current=false;
+  };
+
+  // DETECT loop
+  useEffect(()=>{
+    let stop=false, interval=300;
+    const loop=async()=>{
+      if(stop) return;
+      try{
+        const r=await fetch(detectUrl); const j=await r.json();
+        if(j && j.ok!==false){
+          setIsFire(!!j.isFire); setFireScore(Number(j.score||0));
+          const wh = Array.isArray(j.frame_wh)&&j.frame_wh.length===2
+                     ? {w:Number(j.frame_wh[0])||0, h:Number(j.frame_wh[1])||0}:null;
+          if(wh && wh.w>0 && wh.h>0) setFrameWH(wh);
+          const boxes:SrcBox[]=[];
+          if(j.isFire && Array.isArray(j.boxes)){
+            for(const b of j.boxes){
+              if(Array.isArray(b)&&b.length>=4){
+                const [x,y,w,h]=b.map((n:any)=>Number(n)||0);
+                boxes.push({x,y,w,h,type:"fire"});
+              }
+            }
+          }
+          setOverlayBoxes(boxes); interval=300;
+        }
+      }catch{
+        setIsFire(false); setFireScore(0); setOverlayBoxes([]);
+        interval=Math.min(interval*1.5,1500);
+      }finally{ setTimeout(loop, interval); }
+    };
+    loop(); return()=>{stop=true};
+  },[detectUrl]);
+
+  // Joystick (mantido)
+  const RADIUS=64;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder:()=>true,
+      onMoveShouldSetPanResponder:()=>true,
+      onPanResponderMove:(_e:GestureResponderEvent,g:PanResponderGestureState)=>{
+        let nx=g.dx/RADIUS, ny=g.dy/RADIUS;
+        const len=Math.hypot(nx,ny); if(len>1){ nx/=len; ny/=len; }
+        setJoy({x:nx, y:-ny});
+      },
+      onPanResponderRelease:()=>{ setJoy({x:0,y:0}); },
+      onPanResponderTerminate:()=>{ setJoy({x:0,y:0}); },
+    })
+  ).current;
+
+  const lastSendRef = useRef(0);
+  const lastDirRef  = useRef<string>("STOP");
+  const trySendJoystick = async (x:number,y:number)=>{ try{ await fetch(joystickUrl(x,y)); return true; }catch{ return false; } };
+  const sendDiscreteCmd  = async (line:string)=>{ try{ await fetch(uartUrl(line)); return true; }catch{ return false; } };
+  const vecToDir=(x:number,y:number):"FWD"|"BACK"|"LEFT"|"RIGHT"|"STOP"=>{
+    const mag=Math.hypot(x,y); if(mag<0.2) return "STOP";
+    const deg=(Math.atan2(y,x)*180)/Math.PI;
+    if(deg>-45&&deg<=45) return "RIGHT";
+    if(deg>45&&deg<=135) return "FWD";
+    if(deg<=-45&&deg>-135) return "BACK";
+    return "LEFT";
+  };
+
+  useEffect(()=>{
+    let cancelled=false;
+    const tick=async()=>{
+      if(cancelled) return;
+      const now=Date.now();
+      if(now-lastSendRef.current<120){ setTimeout(tick,20); return; }
+      lastSendRef.current=now;
+
+      const {x,y}=joy; const mag=Math.hypot(x,y);
+      const ok = await trySendJoystick(x,y);
+      if(ok){
+        if(mag<0.2 && lastDirRef.current!=="STOP"){ await sendDiscreteCmd("CMD:STOP"); lastDirRef.current="STOP"; }
+        setTimeout(tick,120); return;
+      }
+      const dir=vecToDir(x,y);
+      if(dir!==lastDirRef.current){
+        const ms=140+Math.round(260*Math.min(1,mag));
+        const spd=50+Math.round(50*Math.min(1,mag));
+        await sendDiscreteCmd( dir==="STOP" ? "CMD:STOP" : `CMD:${dir}:ms=${ms}:spd=${spd}` );
+        lastDirRef.current=dir;
+      }else if(dir!=="STOP"){
+        const ms=120+Math.round(200*Math.min(1,mag));
+        const spd=50+Math.round(50*Math.min(1,mag));
+        await sendDiscreteCmd(`CMD:${dir}:ms=${ms}:spd=${spd}`);
+      }
+      setTimeout(tick,120);
+    };
+    tick(); return()=>{cancelled=true};
+  },[joy, ip]);
+
+  // Bomba
+  async function togglePump(){
+    try{ const t=!pumpOn; await fetch(pumpUrl(t)); setPumpOn(t); }
+    catch{ setStatusText(T.statusFail); }
+  }
+
+  function onVideoLayout(e:LayoutChangeEvent){
+    const {width,height}=e.nativeEvent.layout; setVideoContainerWH({w:width,h:height});
+  }
+
+  return (
+    <View style={styles.container}>
+      <AppHero subtitle={T.heroSubtitle} />
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder={T.placeholderIp} placeholderTextColor="#8a93a5"
+                   autoCapitalize="none" autoCorrect={false} style={styles.input} keyboardType="numeric" />
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput value={server} onChangeText={setServer}
+                   placeholder={T.placeholderServer} placeholderTextColor="#8a93a5" autoCapitalize="none" autoCorrect={false}
+                   style={[styles.input,{minWidth:220}]} />
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn?styles.btnOn:styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn?T.pumpOn:T.pumpOff}</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.statusRow,{paddingTop:4,paddingBottom:8}]}>
+        <Text numberOfLines={2} style={styles.status}>{statusText} {useDirectSnapshot ? "• (snapshot direto)" : ""}</Text>
+        <View style={[styles.badge,{backgroundColor:"#065f46"}]}>
+          <Text style={{ color:"#fff", fontWeight:"800" }}>{isFire ? T.detecting : T.waiting}</Text>
+        </View>
+      </View>
+
+      <View style={[styles.fireBanner, isFire?styles.fireOn:styles.fireOff]}>
+        <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+      </View>
+
+      <View style={{ flex:1 }} onLayout={onVideoLayout}>
+        <CrossfadeImage currentUri={currentFrameUri} nextUri={nextFrameUri}
+                        onNextLoadStart={()=> (loadingNextRef.current=true)}
+                        onNextShown={onNextShown}/>
+        {overlayBoxes.length>0 && (
+          <BoxesOverlay frameWH={frameWH} containerWH={videoContainerWH} boxes={overlayBoxes} />
+        )}
+      </View>
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap,{width:64*2+24,height:64*2+24}]}
+              {...pan.panHandlers}>
+          <View style={[styles.joyBase,{width:64*2,height:64*2,borderRadius:64}]} />
+          <View style={[styles.joyKnob,{width:22*2,height:22*2,borderRadius:22,
+                        transform:[{translateX:joy.x*64},{translateY:-joy.y*64}], opacity: 0.9}]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)} y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container:{ flex:1, backgroundColor:PALETTE.bg },
+  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
+  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
+  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
+  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
+
+  topbar:{ flexDirection:"row", alignItems:"center", paddingHorizontal:12, paddingVertical:10, gap:8,
+           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  label:{ color:"#cfd3d8", fontSize:12 },
+  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
+          borderWidth:1, borderColor:PALETTE.border, minWidth:120 },
+  btn:{ backgroundColor:PALETTE.accent, paddingHorizontal:10, paddingVertical:10, borderRadius:10 },
+  btnOn:{ backgroundColor:"#17a34a" }, btnOff:{ backgroundColor:"#374151" },
+  btnText:{ color:"white", fontWeight:"600" },
+
+  statusRow:{ flexDirection:"row", alignItems:"center", paddingHorizontal:12, paddingVertical:8, gap:8,
+              backgroundColor:"#0f1322", borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  badge:{ paddingHorizontal:10, paddingVertical:6, borderRadius:8, borderWidth:1, borderColor:PALETTE.border },
+  status:{ color:"#cbd5ff", flex:1, fontSize:12 },
+
+  fireBanner:{ alignItems:"center", justifyContent:"center", paddingVertical:6 },
+  fireOn:{ backgroundColor:"#8b0000" }, fireOff:{ backgroundColor:"#223" },
+  fireText:{ color:"white", fontWeight:"800" },
+
+  joyWrap:{ position:"absolute", bottom:24, left:24, alignItems:"center", justifyContent:"center" },
+  joyBase:{ position:"absolute", backgroundColor:"rgba(255,255,255,0.08)", borderWidth:2, borderColor:"rgba(255,255,255,0.14)" },
+  joyKnob:{ position:"absolute", backgroundColor:"rgba(230,64,58,0.9)", borderWidth:2, borderColor:"rgba(255,255,255,0.85)" },
+  joyText:{ position:"absolute", bottom:-22, color:"#cbd5ff", fontSize:12 },
+});
+
+
+
+
+3) Firmware ESP32-CAM (AI Thinker) — buffer fixo + adaptação agressiva
+
+
+/*  ESP32-CAM (AI Thinker) — Snapshot buffer fixo + Bridge HTTP<->UART
+    Anti-trava ao olhar "longe":
+      - Buffer PSRAM fixo (sem malloc/free por frame)
+      - Queda agressiva de qualidade/resolução ao detectar frame grande/lento
+      - Drop duro de frames > limite
+      - fb_count=1, GRAB_LATEST, reinit em streak de falhas
+    Endpoints:
+      /status, /snapshot, /uart?line=, /pump?on=0|1, /joystick?x=&y=
+    Rede: Wi-Fi STA DHCP + mDNS http://hydrobot-esp.local
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// ---------- Wi-Fi ----------
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+const char* MDNS_NAME  = "hydrobot-esp";
+
+// ---------- Web ----------
+WebServer server(80);
+
+// ---------- Pinos câmera (AI Thinker) ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---------- Buffer fixo do último frame ----------
+static uint8_t* g_buf = nullptr;
+static size_t   g_cap = 0;       // capacidade
+static size_t   g_len = 0;       // tamanho válido
+static volatile uint32_t g_ts_ms = 0;
+static SemaphoreHandle_t g_lock;
+
+static float g_cap_fps = 0.f;
+static uint32_t g_cap_frames = 0;
+static uint32_t g_cap_tick = 0;
+static uint32_t g_fail_streak = 0;
+
+// ---------- Estado adaptativo ----------
+static sensor_t* g_sensor = nullptr;
+static framesize_t g_fs   = FRAMESIZE_QVGA;
+static int g_quality      = 16;
+static uint8_t g_big_hits = 0;
+static uint8_t g_ok_hits  = 0;
+
+// thresholds (afinados p/ estabilidade)
+static const size_t HARD_DROP_BYTES  = 140*1024; // drop sempre acima disso
+static const size_t BIG_QVGA_BYTES   = 60*1024;
+static const size_t BIG_QQVGA_BYTES  = 26*1024;
+static const uint32_t SLOW_MS        = 500;      // captura >500ms conta como "grande"
+static const uint8_t  HITS_UP        = 2;        // reage rápido a cena pesada
+static const uint8_t  HITS_DOWN      = 40;       // recupera devagar
+
+// ---------- Utils ----------
+static void sendCORS(){
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+void handle_options(){ sendCORS(); server.send(204); }
+static uint32_t now_ms(){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
+
+// ---------- Câmera ----------
+static bool camera_begin(framesize_t fs, int quality) {
+  camera_config_t cfg{};
+  cfg.ledc_channel=LEDC_CHANNEL_0; cfg.ledc_timer=LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sccb_sda=SIOD_GPIO_NUM; cfg.pin_sccb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 20000000;             // 20 MHz estável
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = fs;
+  cfg.jpeg_quality = quality;              // (menor = melhor)
+  cfg.fb_count     = 1;                    // evita fragmentação
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) { Serial.printf("CAMERA_INIT_ERR 0x%x\n", err); return false; }
+
+  g_sensor = esp_camera_sensor_get();
+  if (g_sensor && g_sensor->id.PID == OV3660_PID) {
+    g_sensor->set_vflip(g_sensor, 1);
+    g_sensor->set_saturation(g_sensor, -1);
+  }
+  if (g_sensor) {
+    g_sensor->set_framesize(g_sensor, fs);
+    g_sensor->set_quality(g_sensor, quality);
+    g_sensor->set_exposure_ctrl(g_sensor, 1);
+    g_sensor->set_gain_ctrl(g_sensor, 1);
+    g_sensor->set_whitebal(g_sensor, 1);
+    g_sensor->set_awb_gain(g_sensor, 1);
+    g_sensor->set_gainceiling(g_sensor, GAINCEILING_8X);
+  }
+  g_fs = fs;
+  g_quality = quality;
+  return true;
+}
+
+static void camera_reconfigure(framesize_t fs, int quality) {
+  if (!g_sensor) return;
+  g_sensor->set_framesize(g_sensor, fs);
+  g_sensor->set_quality(g_sensor, quality);
+  g_fs = fs;
+  g_quality = quality;
+  Serial.printf("CAM_CFG fs=%s q=%d\n", (fs==FRAMESIZE_QVGA?"QVGA":"QQVGA"), quality);
+}
+
+static inline bool is_big_frame(size_t len, uint32_t took_ms) {
+  size_t lim = (g_fs==FRAMESIZE_QVGA) ? BIG_QVGA_BYTES : BIG_QQVGA_BYTES;
+  return (len > lim) || (took_ms > SLOW_MS);
+}
+
+static void adapt_if_needed() {
+  if (g_big_hits >= HITS_UP) {
+    g_big_hits = 0; g_ok_hits = 0;
+    if (g_quality < 22) { g_quality += 2; camera_reconfigure(g_fs, g_quality); }
+    else if (g_fs != FRAMESIZE_QQVGA)     camera_reconfigure(FRAMESIZE_QQVGA, g_quality);
+  } else if (g_ok_hits >= HITS_DOWN) {
+    g_ok_hits = 0;
+    if (g_fs == FRAMESIZE_QQVGA)          camera_reconfigure(FRAMESIZE_QVGA, g_quality);
+    else if (g_quality > 14)              { g_quality -= 2; if (g_quality<14) g_quality=14; camera_reconfigure(g_fs, g_quality); }
+  }
+}
+
+// ---------- Wi-Fi ----------
+static void wifi_begin_dhcp() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  uint32_t t0 = now_ms();
+  while (WiFi.status() != WL_CONNECTED && now_ms() - t0 < 20000) { delay(200); }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(MDNS_NAME);
+    MDNS.addService("http","tcp",80);
+    Serial.println("WIFI_OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+  } else {
+    Serial.println("WIFI_FAIL");
+  }
+}
+
+// ---------- Handlers ----------
+static void handle_status(){
+  sendCORS();
+  uint32_t age = g_ts_ms ? (now_ms() - g_ts_ms) : (uint32_t) -1;
+  String j = "{\"ok\":true,"
+             "\"ip\":\""+WiFi.localIP().toString()+"\","
+             "\"mode\":\"bridge+snapshot-buffer-fixo\","
+             "\"hasFrame\":" + String((g_len>0 && age < 15000) ? "true":"false") + ","
+             "\"age_ms\":" + String((int)age) + ","
+             "\"fps_cap\":" + String(g_cap_fps,1) + ","
+             "\"fs\":\"" + String(g_fs==FRAMESIZE_QVGA?"QVGA":"QQVGA") + "\","
+             "\"quality\":" + String(g_quality) +
+             "}";
+  server.send(200,"application/json",j);
+}
+
+static void handle_snapshot(){
+  sendCORS();
+  xSemaphoreTake(g_lock, portMAX_DELAY);
+  bool ok = (g_buf && g_len>0);
+  if(ok){
+    server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma","no-cache");
+    server.sendHeader("Expires","0");
+    server.setContentLength(g_len);
+    server.send(200,"image/jpeg","");
+    WiFiClient c = server.client();
+    c.write(g_buf, g_len);
+  } else {
+    server.send(503,"text/plain","no frame\n");
+  }
+  xSemaphoreGive(g_lock);
+}
+
+static String urlDecode(const String &s) {
+  String o; o.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for(size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') o+=' ';
+    else if(c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if(h1>=0 && h2>=0){ o+=(char)((h1<<4)|h2); i+=2; }
+      else o+=c;
+    } else o+=c;
+  }
+  return o;
+}
+
+static String url_uart_arg(){ return server.hasArg("line") ? urlDecode(server.arg("line")) : String(); }
+static void handle_uart(){
+  sendCORS();
+  String line = url_uart_arg();
+  if(line.length()==0){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  Serial.print(line); if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+static void handle_pump(){
+  sendCORS();
+  bool on = server.hasArg("on") && (server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE");
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on?"PUMP_ON\n":"PUMP_OFF\n");
+}
+
+static void handle_joystick(){
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  float m = sqrtf(x*x+y*y);
+  if(m<0.20f){ Serial.println("CMD:STOP"); }
+  else{
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if(deg>-45&&deg<=45) dir="RIGHT";
+    else if(deg>45&&deg<=135) dir="FWD";
+    else if(deg<=-45&&deg>-135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f,m)*260.0f);
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+// ---------- Captura contínua com buffer fixo ----------
+static void cam_task(void*){
+  const uint32_t MIN_INTERVAL_MS = 150;   // ~6–7 fps cap
+  g_cap_tick = now_ms();
+  while(true){
+    uint32_t t0 = now_ms();
+    camera_fb_t* fb = esp_camera_fb_get();
+    uint32_t took = now_ms() - t0;
+
+    if(!fb){
+      g_fail_streak++;
+      if(g_fail_streak >= 6){
+        Serial.println("CAM_REINIT");
+        esp_camera_deinit();
+        delay(120);
+        camera_begin(g_fs, g_quality);
+        g_fail_streak = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    g_fail_streak = 0;
+
+    // Drop duro protege rádio/PSRAM
+    if (fb->format != PIXFORMAT_JPEG || fb->len < 20 || fb->len > HARD_DROP_BYTES) {
+      esp_camera_fb_return(fb);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      g_big_hits++; g_ok_hits = 0; adapt_if_needed();
+      continue;
+    }
+
+    // Marca grande/leve p/ adaptação
+    if (is_big_frame(fb->len, took)) { g_big_hits++; g_ok_hits = 0; }
+    else { g_ok_hits++; if(g_big_hits) g_big_hits--; }
+    adapt_if_needed();
+
+    // Copia para buffer fixo (se couber)
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    if (fb->len <= g_cap) {
+      memcpy(g_buf, fb->buf, fb->len);
+      g_len = fb->len;
+      g_ts_ms = now_ms();
+    } else {
+      // não cabe → conta como grande e não atualiza o frame
+      g_big_hits++; g_ok_hits = 0;
+    }
+    xSemaphoreGive(g_lock);
+
+    esp_camera_fb_return(fb);
+
+    // FPS
+    g_cap_frames++;
+    uint32_t now = now_ms();
+    if(now - g_cap_tick >= 1000){
+      g_cap_fps = (float)g_cap_frames / ((now - g_cap_tick)/1000.f);
+      g_cap_frames = 0;
+      g_cap_tick = now;
+    }
+
+    // cap de taxa
+    uint32_t elapsed = now_ms() - t0;
+    if(elapsed < MIN_INTERVAL_MS) vTaskDelay(pdMS_TO_TICKS(MIN_INTERVAL_MS - elapsed));
+  }
+}
+
+// ---------- setup/loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+
+  g_lock = xSemaphoreCreateMutex();
+
+  // Buffer fixo: tenta 160KB, cai para 128KB se necessário
+  g_cap = 160*1024;
+  g_buf = (uint8_t*) heap_caps_malloc(g_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if(!g_buf){
+    g_cap = 128*1024;
+    g_buf = (uint8_t*) heap_caps_malloc(g_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if(!g_buf){
+    // último recurso: 96KB
+    g_cap = 96*1024;
+    g_buf = (uint8_t*) heap_caps_malloc(g_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+
+  wifi_begin_dhcp();
+
+  if(!camera_begin(FRAMESIZE_QVGA, 16)){
+    delay(300);
+    camera_begin(FRAMESIZE_QQVGA, 18);
+  }
+
+  xTaskCreatePinnedToCore(cam_task, "cam_task", 4096, nullptr, 1, nullptr, 0);
+
+  server.on("/status",    HTTP_GET,     handle_status);
+  server.on("/snapshot",  HTTP_GET,     handle_snapshot);
+  server.on("/uart",      HTTP_GET,     handle_uart);
+  server.on("/pump",      HTTP_GET,     handle_pump);
+  server.on("/joystick",  HTTP_GET,     handle_joystick);
+
+  server.on("/",          HTTP_OPTIONS, handle_options);
+  server.on("/snapshot",  HTTP_OPTIONS, handle_options);
+  server.on("/uart",      HTTP_OPTIONS, handle_options);
+  server.on("/pump",      HTTP_OPTIONS, handle_options);
+  server.on("/joystick",  HTTP_OPTIONS, handle_options);
+
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+
+  server.begin();
+  Serial.println("HTTP_READY");
+}
+
+void loop() {
+  server.handleClient();
+  delay(1);
+}
+
+
+
+
+Como isso resolve o seu sintoma “apontou longe ⇒ trava”
+
+
+
+
+JPEG grande/complexo agora:
+
+
+
+é identificado na hora (pelo tamanho e/ou tempo de captura),
+
+
+dispara queda de quality e até QQVGA rapidamente,
+
+
+nunca realoca PSRAM por frame (buffer fixo),
+
+
+descarta frames gigantes em vez de tentar servir/armazenar,
+
+
+server/app reduzem a pressão (menos fps e sem “requisição dupla”).
+
+
+
+
+
+
+
+
+Se algo ainda estourar (rede muito ruidosa), a task re-inicializa a câmera automaticamente e segue.
+
+
+Se quiser, depois podemos expor no /status o last_big_reason (por tamanho/tempo) e um endpoint /config no ESP para travar em QQVGA em ambientes muito texturizados — mas, com os ajustes acima, a tendência é estabilizar sem precisar disso.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # server_heuristic.py
 # FastAPI proxy + heurística de fogo (leve) para ESP32-CAM snapshot
 import time
