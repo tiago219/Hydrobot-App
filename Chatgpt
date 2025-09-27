@@ -1,4 +1,448 @@
 
+/*  ESP32-CAM (AI Thinker) — Snapshot buffer + Bridge HTTP<->UART
+    Modo estável com ADAPTATIVO:
+      - Começa em QVGA, quality=16, fb_count=1
+      - Se frames grandes/lerdos se repetirem, sobe quality (18, 20) e pode cair p/ QQVGA
+      - Quando aliviar, volta para QVGA/quality menores
+      - Dropa frames MUITO grandes para não matar PSRAM
+    Endpoints:
+      /status, /snapshot, /uart?line=, /pump?on=0|1, /joystick?x=&y=
+    Rede: Wi-Fi DHCP + mDNS http://hydrobot-esp.local
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// ---------- Wi-Fi ----------
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+const char* MDNS_NAME  = "hydrobot-esp";
+
+// ---------- Web ----------
+WebServer server(80);
+
+// ---------- Pinos câmera (AI Thinker) ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---------- Buffer do último frame ----------
+static uint8_t* g_jpeg = nullptr;
+static size_t   g_jlen = 0;
+static volatile uint32_t g_ts_ms = 0;
+static SemaphoreHandle_t g_lock;
+
+static float g_cap_fps = 0.f;
+static uint32_t g_cap_frames = 0;
+static uint32_t g_cap_tick = 0;
+
+static uint32_t g_fail_streak = 0;
+
+// ---------- Estado adaptativo ----------
+static sensor_t* g_sensor = nullptr;
+static framesize_t g_fs   = FRAMESIZE_QVGA; // atual
+static int g_quality      = 16;             // atual (10 melhor, 63 pior)
+static uint8_t g_big_hits = 0;              // contador de frames "grandes"
+static uint8_t g_ok_hits  = 0;              // contador de frames "leves"
+
+// thresholds (ajuste fino)
+static const size_t BIG_BYTES_QVGA   = 60*1024;   // QVGA > ~60KB = grande
+static const size_t BIG_BYTES_QQVGA  = 26*1024;   // QQVGA > ~26KB = grande
+static const size_t HARD_DROP_BYTES  = 120*1024;  // sempre dropar acima disso
+static const uint32_t SLOW_MS        = 600;       // captura que passou de 600ms conta como "grande"
+static const uint8_t  HITS_UP        = 3;         // 3 grandes seguidos -> subir compressão / reduzir res
+static const uint8_t  HITS_DOWN      = 30;        // 30 leves seguidos -> baixar compressão / subir res
+
+// ---------- Utils ----------
+static String urlDecode(const String &s) {
+  String o; o.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for(size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') o+=' ';
+    else if(c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if(h1>=0 && h2>=0){ o+=(char)((h1<<4)|h2); i+=2; }
+      else o+=c;
+    } else o+=c;
+  }
+  return o;
+}
+static void sendCORS(){
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+void handle_options(){ sendCORS(); server.send(204); }
+static uint32_t now_ms(){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
+
+// ---------- Câmera ----------
+static bool camera_begin(framesize_t fs, int quality) {
+  camera_config_t cfg{};
+  cfg.ledc_channel=LEDC_CHANNEL_0; cfg.ledc_timer=LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sccb_sda=SIOD_GPIO_NUM; cfg.pin_sccb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = fs;               // QVGA ou QQVGA
+  cfg.jpeg_quality = quality;          // 10..30 (menor = melhor)
+  cfg.fb_count     = 1;                // 1 buffer => menos fragmentação PSRAM
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) { Serial.printf("CAMERA_INIT_ERR 0x%x\n", err); return false; }
+
+  g_sensor = esp_camera_sensor_get();
+  if (g_sensor && g_sensor->id.PID == OV3660_PID) {
+    g_sensor->set_vflip(g_sensor, 1);
+    g_sensor->set_brightness(g_sensor, 0);
+    g_sensor->set_saturation(g_sensor, -1);
+  }
+  if (g_sensor) {
+    g_sensor->set_framesize(g_sensor, fs);
+    g_sensor->set_quality(g_sensor, quality);
+    g_sensor->set_exposure_ctrl(g_sensor, 1);    // AE
+    g_sensor->set_gain_ctrl(g_sensor, 1);        // AGC
+    g_sensor->set_whitebal(g_sensor, 1);         // AWB
+    g_sensor->set_awb_gain(g_sensor, 1);
+    g_sensor->set_gainceiling(g_sensor, GAINCEILING_8X); // um pouco mais de folga
+  }
+  g_fs = fs;
+  g_quality = quality;
+  return true;
+}
+
+static void camera_reconfigure(framesize_t fs, int quality) {
+  // troca leve sem reboot total (seguro)
+  if (!g_sensor) return;
+  g_sensor->set_framesize(g_sensor, fs);
+  g_sensor->set_quality(g_sensor, quality);
+  g_fs = fs;
+  g_quality = quality;
+  Serial.printf("CAM_CFG: fs=%s quality=%d\n",
+                (fs==FRAMESIZE_QVGA?"QVGA":"QQVGA"), quality);
+}
+
+static void camera_free_buffer(){
+  if(g_jpeg){ heap_caps_free(g_jpeg); g_jpeg=nullptr; g_jlen=0; }
+}
+
+// Decide se frame é "grande" demais para config atual
+static bool is_big_frame(size_t len, uint32_t took_ms) {
+  size_t lim = (g_fs==FRAMESIZE_QVGA) ? BIG_BYTES_QVGA : BIG_BYTES_QQVGA;
+  return (len > lim) || (took_ms > SLOW_MS);
+}
+
+// Adaptação após N hits
+static void adapt_if_needed() {
+  if (g_big_hits >= HITS_UP) {
+    g_big_hits = 0;
+    g_ok_hits  = 0;
+    if (g_quality < 22) {           // aumenta compressão primeiro
+      g_quality += 2;               // 16 -> 18 -> 20 -> 22
+      camera_reconfigure(g_fs, g_quality);
+    } else if (g_fs != FRAMESIZE_QQVGA) {
+      camera_reconfigure(FRAMESIZE_QQVGA, g_quality); // cai para QQVGA
+    }
+  } else if (g_ok_hits >= HITS_DOWN) {
+    g_ok_hits = 0;
+    if (g_fs == FRAMESIZE_QQVGA) {
+      camera_reconfigure(FRAMESIZE_QVGA, g_quality);  // volta a QVGA
+    } else if (g_quality > 14) {     // melhora compressão (imagem melhor)
+      g_quality -= 2;                // 22 -> 20 -> 18 -> 16 -> 14
+      if (g_quality < 14) g_quality = 14;
+      camera_reconfigure(g_fs, g_quality);
+    }
+  }
+}
+
+// Task de captura contínua
+void cam_task(void*){
+  const uint32_t MIN_INTERVAL_MS = 140;   // ~7 fps cap
+  g_cap_tick = now_ms();
+  while(true){
+    uint32_t t0 = now_ms();
+    camera_fb_t* fb = esp_camera_fb_get();
+
+    uint32_t took = now_ms() - t0;
+    if (took > SLOW_MS) g_fail_streak++;
+
+    if(!fb){
+      g_fail_streak++;
+      if(g_fail_streak >= 6){
+        Serial.println("CAMERA_REINIT");
+        esp_camera_deinit();
+        delay(120);
+        camera_begin(g_fs, g_quality);
+        g_fail_streak = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    g_fail_streak = 0;
+
+    // DROP duro para proteger PSRAM/rádio
+    if (fb->len > HARD_DROP_BYTES || fb->format != PIXFORMAT_JPEG || fb->len < 20) {
+      esp_camera_fb_return(fb);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    // Marcar grande/leve p/ adaptação
+    if (is_big_frame(fb->len, took)) { g_big_hits++; g_ok_hits = 0; }
+    else { g_ok_hits++; if(g_big_hits) g_big_hits--; }
+    adapt_if_needed();
+
+    // Copia para PSRAM própria (snapshot independente do fb)
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    camera_free_buffer();
+    g_jlen = fb->len;
+    g_jpeg = (uint8_t*) heap_caps_malloc(g_jlen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(g_jpeg){
+      memcpy(g_jpeg, fb->buf, g_jlen);
+      g_ts_ms = now_ms();
+    } else {
+      g_jlen = 0;
+    }
+    xSemaphoreGive(g_lock);
+
+    esp_camera_fb_return(fb);
+
+    // FPS calculado
+    g_cap_frames++;
+    uint32_t now = now_ms();
+    if(now - g_cap_tick >= 1000){
+      g_cap_fps = (float)g_cap_frames / ((now - g_cap_tick)/1000.f);
+      g_cap_frames = 0;
+      g_cap_tick = now;
+    }
+
+    // cap de taxa
+    uint32_t elapsed = now_ms() - t0;
+    if(elapsed < MIN_INTERVAL_MS) vTaskDelay(pdMS_TO_TICKS(MIN_INTERVAL_MS - elapsed));
+  }
+}
+
+// ---------- Wi-Fi ----------
+void wifi_begin_dhcp() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // potência máxima
+  uint32_t t0 = now_ms();
+  while (WiFi.status() != WL_CONNECTED && now_ms() - t0 < 20000) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(MDNS_NAME);
+    MDNS.addService("http","tcp",80);
+    Serial.println("WIFI_OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+  } else {
+    Serial.println("WIFI_FAIL");
+  }
+}
+
+// ---------- Handlers ----------
+void handle_status(){
+  sendCORS();
+  uint32_t age = g_ts_ms ? (now_ms() - g_ts_ms) : (uint32_t) -1;
+  String j = "{\"ok\":true,"
+             "\"ip\":\""+WiFi.localIP().toString()+"\","
+             "\"mode\":\"bridge+snapshot-buffer\","
+             "\"hasFrame\":" + String((g_jpeg && age < 15000) ? "true":"false") + ","
+             "\"age_ms\":" + String((int)age) + ","
+             "\"fps_cap\":" + String(g_cap_fps,1) + ","
+             "\"fs\":\"" + String(g_fs==FRAMESIZE_QVGA?"QVGA":"QQVGA") + "\","
+             "\"quality\":" + String(g_quality) +
+             "}";
+  server.send(200,"application/json",j);
+}
+
+void handle_snapshot(){
+  sendCORS();
+  xSemaphoreTake(g_lock, portMAX_DELAY);
+  bool ok = (g_jpeg && g_jlen>0);
+  if(ok){
+    server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma","no-cache");
+    server.sendHeader("Expires","0");
+    server.setContentLength(g_jlen);
+    server.send(200,"image/jpeg","");
+    WiFiClient c = server.client();
+    c.write(g_jpeg, g_jlen);
+  } else {
+    server.send(503,"text/plain","no frame\n");
+  }
+  xSemaphoreGive(g_lock);
+}
+
+static String url_uart_arg(){ return server.hasArg("line") ? urlDecode(server.arg("line")) : String(); }
+void handle_uart(){
+  sendCORS();
+  String line = url_uart_arg();
+  if(line.length()==0){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  Serial.print(line); if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump(){
+  sendCORS();
+  bool on = server.hasArg("on") && (server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE");
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on?"PUMP_ON\n":"PUMP_OFF\n");
+}
+
+void handle_joystick(){
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // Encaminha nota GET (compat)
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // Comando discreto redundante
+  float m = sqrtf(x*x+y*y);
+  if(m<0.20f){ Serial.println("CMD:STOP"); }
+  else{
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if(deg>-45&&deg<=45) dir="RIGHT";
+    else if(deg>45&&deg<=135) dir="FWD";
+    else if(deg<=-45&&deg>-135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f,m)*260.0f);
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+// ---------- setup/loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+
+  g_lock = xSemaphoreCreateMutex();
+  wifi_begin_dhcp();
+
+  // Inicializa câmera
+  if(!camera_begin(FRAMESIZE_QVGA, 16)){
+    delay(300);
+    camera_begin(FRAMESIZE_QQVGA, 18); // fallback duro se a primeira falhar
+  }
+
+  xTaskCreatePinnedToCore(cam_task, "cam_task", 4096, nullptr, 1, nullptr, 0);
+
+  server.on("/status",    HTTP_GET,     handle_status);
+  server.on("/snapshot",  HTTP_GET,     handle_snapshot);
+  server.on("/uart",      HTTP_GET,     handle_uart);
+  server.on("/pump",      HTTP_GET,     handle_pump);
+  server.on("/joystick",  HTTP_GET,     handle_joystick);
+
+  server.on("/",          HTTP_OPTIONS, handle_options);
+  server.on("/snapshot",  HTTP_OPTIONS, handle_options);
+  server.on("/uart",      HTTP_OPTIONS, handle_options);
+  server.on("/pump",      HTTP_OPTIONS, handle_options);
+  server.on("/joystick",  HTTP_OPTIONS, handle_options);
+
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+
+  server.begin();
+  Serial.println("HTTP_READY");
+}
+
+void loop() {
+  server.handleClient();
+  delay(1);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Se o vídeo “congela” quando você mexe o robô/afasta a câmera, quase sempre é link ruim (alimentação/antena/Wi-Fi) – não o código. Sem mudar sua arquitetura, faça estes ajustes mínimos + um checklist físico. Eles costumam resolver 90% desses travamentos.
 
 
