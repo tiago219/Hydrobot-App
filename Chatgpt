@@ -1,4 +1,497 @@
 
+// ====== HydroBot – Driver, Modos (APP/AUTO) com Confirmação de Fogo e Calibração por Evento ======
+#include <Arduino.h>
+
+/* ========================== CONFIGURAÇÃO GERAL ========================== */
+#define HAVE_SERVO 0
+
+/* ---------------- PINAGEM ---------------- */
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define BOMBA_PIN 13
+
+#if HAVE_SERVO
+  #include <Servo.h>
+  Servo servoMangueira;
+  #define SERVO_PIN     12
+  #define SERVO_ESQ     45
+  #define SERVO_CENTRO 100
+  #define SERVO_DIR     135
+  #define LED_VERMELHO_PIN 3
+#else
+  #define LED_VERMELHO_PIN 12
+#endif
+
+#define BOTAO 7
+#define SENSOR_FOGO_ESQ_D 4
+#define SENSOR_FOGO_MEIO_D 5
+#define SENSOR_FOGO_DIR_D 6
+
+#define SENSOR_FOGO_ESQ  A2
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_DIR  A0
+#define NIVEL_AGUA_PIN   A3
+
+/* ========================== TIPOS E ESTADOS ========================== */
+enum Modo       : uint8_t { MODO_APP = 0, MODO_AUTO = 1 };
+enum Dir        : uint8_t { DIR_STOP=0, DIR_FWD, DIR_BACK, DIR_LEFT, DIR_RIGHT };
+enum AutoState  : uint8_t { AUTO_IDLE=0, AUTO_ATTACK_FWD, AUTO_ATTACK_BACK };
+
+struct FireSample {
+  bool digE, digM, digD;     // digitais (LOW = fogo)
+  int  aE, aM, aD;           // analógicos
+  int  dE, dM, dD;           // base - atual
+  bool fogo;                 // marcou fogo nesta leitura
+  int  side;                 // -1 esq, 0 meio, +1 dir
+};
+
+struct State {
+  Modo modo = MODO_APP;
+  bool pumpOn = false;
+
+  // movimento
+  Dir currentDir = DIR_STOP;
+  bool motionActive = false;
+  unsigned long motionEndMs = 0;
+  unsigned long lastMoveCmdAt = 0;
+  uint8_t baseSpeed = 70;
+
+  // botão
+  bool ultimoEstadoBotao = HIGH;
+  unsigned long lastDebounce = 0;
+
+  // calibração (somente por evento ou ao entrar no AUTO)
+  int baseEsq = 0, baseMeio = 0, baseDir = 0;
+  bool sistemaCalibrado = false;
+
+  // auto
+  AutoState autoState = AUTO_IDLE;
+  unsigned long autoStateUntil = 0;
+
+  // água
+  uint8_t nivelAguaPct = 0;
+
+  // LED água
+  unsigned long ledToggleAt = 0;
+  bool ledBlinkState = false;
+
+  // confirmação de fogo
+  bool fogoConfirmado = false;
+  unsigned long fogoHoldUntil = 0;     // mantém “fogo” por um tempo p/ estabilidade
+  uint16_t eventosFogoConfirmados = 0; // conta para recalibrar
+} G;
+
+/* ========================== CONSTANTES ========================== */
+// Calibração
+static const uint16_t TEMPO_CALIBRACAO_MS   = 2500;
+
+// Histerese
+static const int      DIF_FOGO   = 160;  // limiar para ACIONAR
+static const int      DIF_CLEAR  = 110;  // limiar para LIMPAR (menor que DIF_FOGO)
+
+// Confirmação (anti-falso-positivo)
+static const uint8_t  CONFIRM_READS = 4; // M leituras
+static const uint8_t  CONFIRM_MIN   = 3; // precisa de K acertos
+static const uint16_t CONFIRM_SPACING_MS = 15; // espaçamento entre leituras no burst
+
+// Hold (suavidade)
+static const uint16_t FIRE_HOLD_MS = 250; // mantém fogo por este tempo após última confirmação
+
+// Recalibração por evento
+static const uint8_t  RECALIB_EVERY_CONFIRMED = 5; // recalibra a cada N eventos confirmados
+
+// Debounce botão
+static const uint16_t BTN_DEBOUNCE_MS       = 35;
+static const uint16_t MANUAL_BTN_HOLD_MS    = 40;
+
+/* ========================== PROTÓTIPOS ========================== */
+void setupHardware();
+FireSample readSensorsOnce();
+bool readSensorsBurstConfirm(FireSample &outBest);
+void updateMotors(Dir d);
+void setMotion(Dir d, uint16_t ms);
+void pumpWrite(bool on);
+uint8_t waterPercent();
+void updateWaterLED(uint8_t pct);
+void emitStatus();
+
+void handleAutoMode();
+void handleManualMode();
+void autoCalibrateInitial();
+void autoAimBySide(int side);
+
+void handleModeButtonToggle();
+void handleUARTLine(const String& s);
+
+/* ========================== IMPLEMENTAÇÃO ========================== */
+// --------- Motores ---------
+void motorsStop(){ digitalWrite(IN1,LOW);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,LOW); G.currentDir=DIR_STOP; }
+void motorsFwd(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_FWD; }
+void motorsBack(){ digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_BACK; }
+void motorsLeftTurn(){  digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_LEFT; }
+void motorsRightTurn(){ digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_RIGHT; }
+
+void updateMotors(Dir d){
+  switch(d){
+    case DIR_FWD: motorsFwd(); break;
+    case DIR_BACK: motorsBack(); break;
+    case DIR_LEFT: motorsLeftTurn(); break;
+    case DIR_RIGHT: motorsRightTurn(); break;
+    default: motorsStop(); break;
+  }
+}
+
+void setMotion(Dir d, uint16_t ms){
+  if (ms==0 || d==DIR_STOP){ motorsStop(); G.motionActive=false; return; }
+  updateMotors(d);
+  G.motionActive = true;
+  G.motionEndMs = millis() + (unsigned long)ms;
+  G.lastMoveCmdAt = millis();
+}
+
+// --------- Bomba e Água ---------
+void pumpWrite(bool on){
+  G.pumpOn = on;
+  digitalWrite(BOMBA_PIN, on?HIGH:LOW);
+}
+
+uint8_t waterPercent(){
+  int raw = analogRead(NIVEL_AGUA_PIN);
+  int pct = map(raw,0,1023,0,100);
+  pct = constrain(pct,0,100);
+  return (uint8_t)pct;
+}
+
+void updateWaterLED(uint8_t pct){
+  if (pct > 50){ digitalWrite(LED_VERMELHO_PIN, LOW); return; }
+  if (pct > 15){ digitalWrite(LED_VERMELHO_PIN, HIGH); return; }
+  if (millis() - G.ledToggleAt > 300){
+    G.ledToggleAt = millis();
+    G.ledBlinkState = !G.ledBlinkState;
+    digitalWrite(LED_VERMELHO_PIN, G.ledBlinkState ? HIGH : LOW);
+  }
+}
+
+// --------- Status ---------
+void emitStatus(){
+  int ax=analogRead(SENSOR_FOGO_ESQ), am=analogRead(SENSOR_FOGO_MEIO), ad=analogRead(SENSOR_FOGO_DIR);
+  Serial.print(F("STAT:ax="));Serial.print(ax);
+  Serial.print(F(":am="));Serial.print(am);
+  Serial.print(F(":ad="));Serial.print(ad);
+  Serial.print(F(":water="));Serial.print(G.nivelAguaPct);
+  Serial.print(F(":pump="));Serial.print(G.pumpOn?1:0);
+  Serial.print(F(":mode="));Serial.print((int)G.modo);
+  Serial.print(F(":auto="));Serial.print((int)G.autoState);
+  Serial.print(F(":fire="));Serial.println(G.fogoConfirmado?1:0);
+}
+
+/* ========================== SENSORES / CALIBRAÇÃO ========================== */
+void autoCalibrateInitial(){
+  unsigned long t0=millis(); long sE=0,sM=0,sD=0; int n=0;
+  while(millis()-t0<TEMPO_CALIBRACAO_MS){
+    sE += analogRead(SENSOR_FOGO_ESQ);
+    sM += analogRead(SENSOR_FOGO_MEIO);
+    sD += analogRead(SENSOR_FOGO_DIR);
+    n++; delay(40);
+  }
+  if (n==0) n=1;
+  G.baseEsq  = sE/n;
+  G.baseMeio = sM/n;
+  G.baseDir  = sD/n;
+  G.sistemaCalibrado = true;
+  Serial.print(F("CALIB:E="));Serial.print(G.baseEsq);
+  Serial.print(F(" M="));Serial.print(G.baseMeio);
+  Serial.print(F(" D="));Serial.println(G.baseDir);
+}
+
+static inline bool isAnalogFire(int dE,int dM,int dD){
+  return (dE > DIF_FOGO) || (dM > DIF_FOGO) || (dD > DIF_FOGO);
+}
+static inline bool isAnalogClear(int dE,int dM,int dD){
+  return (dE < DIF_CLEAR) && (dM < DIF_CLEAR) && (dD < DIF_CLEAR);
+}
+
+FireSample readSensorsOnce(){
+  FireSample s;
+  s.digE=(digitalRead(SENSOR_FOGO_ESQ_D)==LOW);
+  s.digM=(digitalRead(SENSOR_FOGO_MEIO_D)==LOW);
+  s.digD=(digitalRead(SENSOR_FOGO_DIR_D)==LOW);
+  s.aE=analogRead(SENSOR_FOGO_ESQ);
+  s.aM=analogRead(SENSOR_FOGO_MEIO);
+  s.aD=analogRead(SENSOR_FOGO_DIR);
+  s.dE=G.baseEsq - s.aE; s.dM=G.baseMeio - s.aM; s.dD=G.baseDir - s.aD;
+
+  // Critério de “fogo” por leitura única: ANALÓGICO acima do limiar OU >=2 digitais LOW
+  bool fogoAnal = isAnalogFire(s.dE,s.dM,s.dD);
+  uint8_t digCount = (s.digE?1:0)+(s.digM?1:0)+(s.digD?1:0);
+  bool fogoDig2 = (digCount >= 2);
+  s.fogo = fogoAnal || fogoDig2;
+
+  // Direção de maior delta analógico
+  int md=s.dM; s.side=0; if(s.dE>md){md=s.dE; s.side=-1;} if(s.dD>md){md=s.dD; s.side=+1;}
+  return s;
+}
+
+// Faz M leituras com pequeno intervalo e requer K confirmações
+bool readSensorsBurstConfirm(FireSample &outBest){
+  uint8_t hits = 0;
+  FireSample best; int bestDelta = -32768;
+
+  for (uint8_t i=0;i<CONFIRM_READS;i++){
+    FireSample s = readSensorsOnce();
+    int strongest = s.dM; if (s.dE>strongest) strongest=s.dE; if (s.dD>strongest) strongest=s.dD;
+    if (s.fogo) hits++;
+    if (strongest > bestDelta){ bestDelta = strongest; best = s; }
+    delay(CONFIRM_SPACING_MS);
+  }
+
+  outBest = best;
+  return (hits >= CONFIRM_MIN);
+}
+
+/* ========================== AUTO MODE ========================== */
+void autoAimBySide(int side){
+#if HAVE_SERVO
+  int tgt = (side<0?SERVO_DIR:(side>0?SERVO_ESQ:SERVO_CENTRO));
+  servoMangueira.write(tgt);
+#else
+  (void)side;
+#endif
+}
+
+void handleAutoMode(){
+  // Calibra só ao entrar no AUTO (ou por comando) e por contagem de eventos
+  if (!G.sistemaCalibrado){
+    autoCalibrateInitial();
+    return;
+  }
+
+  // Água + LED
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct < 10 && G.pumpOn) pumpWrite(false);
+
+  // Confirmação de fogo (burst)
+  FireSample best;
+  bool fireNow = readSensorsBurstConfirm(best);
+
+  // Histerese e hold
+  unsigned long now = millis();
+  if (fireNow){
+    G.fogoConfirmado = true;
+    G.fogoHoldUntil = now + FIRE_HOLD_MS;
+  } else if (G.fogoConfirmado){
+    // Só limpa se ficar abaixo do clear e passar o hold
+    if (now > G.fogoHoldUntil){
+      // Checa “clear” com uma leitura rápida
+      FireSample s = readSensorsOnce();
+      if (isAnalogClear(s.dE,s.dM,s.dD)){
+        G.fogoConfirmado = false;
+      }
+    }
+  }
+
+  // AÇÃO: somente se fogoConfirmado
+  if (G.fogoConfirmado){
+    if (G.nivelAguaPct > 10) pumpWrite(true); else pumpWrite(false);
+
+    // Direção com base no delta mais forte (best.side)
+    if (G.autoState==AUTO_IDLE || (long)(now - G.autoStateUntil) >= 0){
+      static uint8_t forwardStrikes=0;
+      if (G.autoState!=AUTO_ATTACK_BACK){
+        G.autoState = AUTO_ATTACK_FWD; G.autoStateUntil = now + 450;
+        if (best.side < 0) setMotion(DIR_LEFT,150);
+        else if (best.side > 0) setMotion(DIR_RIGHT,150);
+        else setMotion(DIR_FWD,210);
+        forwardStrikes++;
+        if (forwardStrikes>=3){
+          G.autoState=AUTO_ATTACK_BACK; G.autoStateUntil=now+550; setMotion(DIR_BACK,260); forwardStrikes=0;
+        }
+      } else {
+        G.autoState=AUTO_ATTACK_FWD; G.autoStateUntil=now+450; setMotion(DIR_FWD,210);
+      }
+    }
+
+    // Quando “nasce” um novo evento confirmado, conte para recalibrar
+    static bool lastLoopHadFire=false;
+    if (!lastLoopHadFire && G.fogoConfirmado){
+      G.eventosFogoConfirmados++;
+      if (G.eventosFogoConfirmados % RECALIB_EVERY_CONFIRMED == 0){
+        Serial.println(F("AUTO:Recalibrando por contagem de eventos..."));
+        autoCalibrateInitial();
+      }
+    }
+    lastLoopHadFire = true;
+
+  } else {
+    // Sem fogo: para tudo, não patrulha.
+    motorsStop();
+    pumpWrite(false);
+#if HAVE_SERVO
+    servoMangueira.write(SERVO_CENTRO);
+#endif
+    G.autoState = AUTO_IDLE;
+
+    // Zera marcador de “em fogo” para o contador de eventos
+    static bool lastLoopHadFire=false;
+    lastLoopHadFire = false;
+  }
+}
+
+/* ========================== MANUAL MODE (sob demanda) ========================== */
+void handleManualMode(){
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct<10 && G.pumpOn) pumpWrite(false);
+
+  static unsigned long btnPressStart = 0;
+  bool btnPressed = (digitalRead(BOTAO) == LOW);
+
+  if (btnPressed){
+    if (btnPressStart==0) btnPressStart = millis();
+    if (millis() - btnPressStart >= MANUAL_BTN_HOLD_MS){
+      // Uma leitura simples basta (manual é sob demanda)
+      FireSample s = readSensorsOnce();
+      bool fire = s.fogo;
+      if (fire){
+        if (G.nivelAguaPct>10) pumpWrite(true); else pumpWrite(false);
+        Serial.println(F("MANUAL:FOGO"));
+      } else {
+        pumpWrite(false);
+        Serial.println(F("MANUAL:SEM_FOGO"));
+      }
+    }
+  } else {
+    btnPressStart = 0;
+    pumpWrite(false);
+  }
+}
+
+/* ========================== ENTRADA (BOTÃO/MODO) ========================== */
+void handleModeButtonToggle(){
+  bool leitura = digitalRead(BOTAO);
+  if (leitura != G.ultimoEstadoBotao){
+    G.lastDebounce = millis();
+    G.ultimoEstadoBotao = leitura;
+  }
+  if ((millis()-G.lastDebounce) > BTN_DEBOUNCE_MS){
+    static bool prev = HIGH;
+    if (prev==HIGH && leitura==LOW){
+      G.modo = (G.modo==MODO_APP) ? MODO_AUTO : MODO_APP;
+
+      motorsStop(); pumpWrite(false);
+#if HAVE_SERVO
+      servoMangueira.write(SERVO_CENTRO);
+#endif
+      G.autoState = AUTO_IDLE;
+      G.fogoConfirmado = false;
+
+      // Ao entrar no AUTO: calibra uma vez
+      if (G.modo == MODO_AUTO){
+        autoCalibrateInitial();
+      }
+
+      Serial.print(F("MODE:")); Serial.println(G.modo==MODO_APP?F("APP"):F("AUTO"));
+    }
+    prev = leitura;
+  }
+}
+
+/* ========================== UART / PROTOCOLO ========================== */
+void handleMoveCmd(const String&cmd){
+  uint16_t ms=200; int pms=cmd.indexOf("ms="); if(pms>=0) ms=(uint16_t)cmd.substring(pms+3).toInt();
+  ms = constrain(ms,80,700);
+  if      (cmd.indexOf("FWD")>=0)   setMotion(DIR_FWD,ms);
+  else if (cmd.indexOf("BACK")>=0)  setMotion(DIR_BACK,ms);
+  else if (cmd.indexOf("LEFT")>=0)  setMotion(DIR_LEFT,ms);
+  else if (cmd.indexOf("RIGHT")>=0) setMotion(DIR_RIGHT,ms);
+  else if (cmd.indexOf("STOP")>=0)  setMotion(DIR_STOP,0);
+}
+
+void handleUARTLine(const String& s){
+  if (s.startsWith("REQ:STATUS")){ emitStatus(); return; }
+  if (s.startsWith("SET:SPEED:")){ int v=s.substring(10).toInt(); G.baseSpeed=(uint8_t)constrain(v,0,100); Serial.println(F("OK:SPEED")); return; }
+  if (s.startsWith("SET:LED:"))  { int v=s.substring(8).toInt(); digitalWrite(LED_VERMELHO_PIN, v>0?HIGH:LOW); Serial.println(F("OK:LED")); return; }
+
+  if (G.modo == MODO_APP){
+    if (s.indexOf("CMD:PUMP:")>=0){ bool on=s.endsWith("1"); if(on && waterPercent()<=15){ pumpWrite(false); Serial.println(F("WARN:NO_WATER")); } else { pumpWrite(on); Serial.println(on?F("OK:PUMP_ON"):F("OK:PUMP_OFF")); } return; }
+    if (s.startsWith("CMD:")){ handleMoveCmd(s); return; }
+    if (s.startsWith("CMD:CALIB")){ Serial.println(F("IGN:CALIB_MANUAL")); return; }
+  } else {
+    if (s.startsWith("CMD:CALIB")){ G.sistemaCalibrado=false; Serial.println(F("OK:CALIB_REQUEST")); return; }
+    if (s.indexOf("CMD:STOP")>=0){ setMotion(DIR_STOP,0); Serial.println(F("OK:STOP")); return; }
+    if (s.indexOf("CMD:PUMP:0")>=0){ pumpWrite(false); Serial.println(F("OK:PUMP_OFF")); return; }
+  }
+
+  Serial.println(F("ERR:UNKNOWN"));
+}
+
+/* ========================== SETUP / LOOP ========================== */
+void setupHardware(){
+  Serial.begin(115200);
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(BOMBA_PIN,OUTPUT); pumpWrite(false);
+  pinMode(LED_VERMELHO_PIN,OUTPUT); digitalWrite(LED_VERMELHO_PIN,LOW);
+
+  pinMode(BOTAO,INPUT_PULLUP);
+
+  pinMode(SENSOR_FOGO_ESQ_D,INPUT);
+  pinMode(SENSOR_FOGO_MEIO_D,INPUT);
+  pinMode(SENSOR_FOGO_DIR_D,INPUT);
+
+#if HAVE_SERVO
+  servoMangueira.attach(SERVO_PIN);
+  servoMangueira.write(SERVO_CENTRO);
+#endif
+
+  motorsStop();
+  Serial.println(F("ARDUINO_READY"));
+}
+
+void setup(){
+  setupHardware();
+  // Se desejar iniciar em AUTO por padrão, ative a linha abaixo.
+  // G.modo = MODO_AUTO;
+  if (G.modo == MODO_AUTO){
+    autoCalibrateInitial();
+  }
+}
+
+void loop(){
+  if (G.motionActive && (long)(millis()-G.motionEndMs)>=0){ motorsStop(); G.motionActive=false; }
+  if ((millis()-G.lastMoveCmdAt)>1000 && G.currentDir!=DIR_STOP){ motorsStop(); G.motionActive=false; }
+
+  handleModeButtonToggle();
+
+  while(Serial.available()){
+    static String line;
+    char c=Serial.read();
+    if(c=='\n'||c=='\r'){
+      if(line.length()>0){ String s=line; line=""; s.trim(); handleUARTLine(s); }
+    } else {
+      line += c; if(line.length()>240) line.remove(0);
+    }
+  }
+
+  if (G.modo == MODO_APP){
+    handleManualMode();
+  } else {
+    handleAutoMode();
+  }
+}
+
+
+
+
+
+
+
+
+
+
 Entendi — você quer manter a arquitetura por snapshot que já estava funcionando (server faz polling de /snapshot) e apenas alinhar os pontos que mudaram no firmware:
 
 
