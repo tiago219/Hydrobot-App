@@ -1,4 +1,269 @@
 
+/*  ESP32-CAM (AI Thinker) — Bridge HTTP<->UART + Snapshot (DHCP)
+    - Conecta ao roteador por DHCP e anuncia mDNS: http://hydrobot-esp.local
+    - Endpoints:
+        /status                 -> JSON com IP e modo
+        /snapshot               -> JPEG (Cache-Control: no-store)
+        /uart?line=...          -> envia "line\n" ao Arduino
+        /pump?on=0|1            -> envia "CMD:PUMP:0|1\n"
+        /joystick?x=&y=         -> encaminha GET e envia CMD discreto redundante
+    - Ligações:
+        ESP U0TXD (GPIO1)  -> Arduino RX (D0)
+        Arduino TX (D1) -> (divisor 5V->3V3) -> ESP U0RXD (GPIO3)
+        GND comum e fonte 5V dedicada (≥1A) para o ESP32-CAM
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+
+// --------- Wi-Fi / mDNS ---------
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+const char* MDNS_NAME  = "hydrobot-esp";   // http://hydrobot-esp.local
+
+// --------- WebServer ---------
+WebServer server(80);
+
+// --------- Pinos da câmera (AI Thinker) ---------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// --------- Helpers ---------
+static String urlDecode(const String &s) {
+  String o; o.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for(size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') o+=' ';
+    else if(c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if(h1>=0 && h2>=0){ o+=(char)((h1<<4)|h2); i+=2; }
+      else o+=c;
+    } else o+=c;
+  }
+  return o;
+}
+static void sendCORS(){
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+void handle_options(){ sendCORS(); server.send(204); }
+
+// --------- Handlers HTTP ---------
+void handle_status(){
+  sendCORS();
+  String j = "{\"ok\":true,"
+             "\"ip\":\""+WiFi.localIP().toString()+"\","
+             "\"mode\":\"bridge+snapshot\"}";
+  server.send(200,"application/json",j);
+}
+
+void handle_uart(){
+  sendCORS();
+  if(!server.hasArg("line")){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  String line = urlDecode(server.arg("line"));
+  Serial.print(line);
+  if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump(){
+  sendCORS();
+  if(!server.hasArg("on")){ server.send(400,"text/plain","missing 'on'\n"); return; }
+  bool on = server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE";
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on ? "PUMP_ON\n" : "PUMP_OFF\n");
+}
+
+void handle_joystick(){
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // Encaminha linha GET (compatível com o teu Arduino)
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // Redundância com comando discreto (anti-lag)
+  float m = sqrtf(x*x+y*y);
+  if(m<0.20f){
+    Serial.println("CMD:STOP");
+  } else {
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if(deg>-45&&deg<=45) dir="RIGHT";
+    else if(deg>45&&deg<=135) dir="FWD";
+    else if(deg<=-45&&deg>-135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f,m)*260.0f);  // 120..380ms
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+void handle_snapshot(){
+  camera_fb_t* fb = esp_camera_fb_get();
+  if(!fb || fb->format!=PIXFORMAT_JPEG){
+    if(fb) esp_camera_fb_return(fb);
+    server.send(503,"text/plain","no frame\n");
+    return;
+  }
+  sendCORS();
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.setContentLength(fb->len);
+  server.send(200,"image/jpeg","");
+  WiFiClient c = server.client();
+  c.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// --------- Inicialização da câmera (perfil estável) ---------
+bool camera_begin_low(){
+  camera_config_t cfg{};
+  cfg.ledc_channel=LEDC_CHANNEL_0; cfg.ledc_timer=LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sccb_sda=SIOD_GPIO_NUM; cfg.pin_sccb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+  cfg.xclk_freq_hz=20000000;
+  cfg.pixel_format=PIXFORMAT_JPEG;
+  cfg.frame_size=FRAMESIZE_QQVGA;   // 160x120 (comece leve; depois pode subir p/ QVGA)
+  cfg.jpeg_quality=15;              // 10~12 mais pesado; 15 é bem estável
+  cfg.fb_count=1;                   // 1 = estável (evita estouro de PSRAM)
+  cfg.fb_location=CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode=CAMERA_GRAB_LATEST;
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+
+  // ajustes finos opcionais
+  sensor_t *s = esp_camera_sensor_get();
+  if (s && s->id.PID == OV3660_PID) { s->set_vflip(s,1); s->set_brightness(s,1); s->set_saturation(s,-2); }
+  return true;
+}
+
+// --------- Wi-Fi (DHCP) ---------
+void wifi_begin_dhcp() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(MDNS_NAME);
+    MDNS.addService("http","tcp",80);
+    Serial.println("WIFI_OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WIFI_FAIL");
+  }
+}
+
+// --------- setup / loop ---------
+void setup() {
+  // UART0 para Arduino
+  Serial.begin(115200);
+  delay(50);
+
+  // Estabilidade elétrica
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout (cuidado: precisa de fonte 5V boa)
+
+  // Wi-Fi
+  wifi_begin_dhcp();
+
+  // Câmera
+  if(!camera_begin_low()){
+    Serial.println("CAMERA_INIT_FAIL");
+  } else {
+    Serial.println("CAMERA_INIT_OK");
+  }
+
+  // HTTP
+  server.on("/status",    HTTP_GET,     handle_status);
+  server.on("/snapshot",  HTTP_GET,     handle_snapshot);
+  server.on("/uart",      HTTP_GET,     handle_uart);
+  server.on("/pump",      HTTP_GET,     handle_pump);
+  server.on("/joystick",  HTTP_GET,     handle_joystick);
+
+  // CORS (preflight)
+  server.on("/",          HTTP_OPTIONS, handle_options);
+  server.on("/snapshot",  HTTP_OPTIONS, handle_options);
+  server.on("/uart",      HTTP_OPTIONS, handle_options);
+  server.on("/pump",      HTTP_OPTIONS, handle_options);
+  server.on("/joystick",  HTTP_OPTIONS, handle_options);
+
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+
+  server.begin();
+  Serial.println("HTTP_READY");
+}
+
+void loop() {
+  server.handleClient();
+  delay(1); // coopera com WDT
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Fechado! Aqui vão os dois arquivos completos já ajustados para o seu ESP32-CAM (com /snapshot, /joystick, /pump, /uart) e com correções para o caso “NO LIVE FRAME”.
 
 
