@@ -1,4 +1,240 @@
 
+Se o vídeo “congela” quando você mexe o robô/afasta a câmera, quase sempre é link ruim (alimentação/antena/Wi-Fi) – não o código. Sem mudar sua arquitetura, faça estes ajustes mínimos + um checklist físico. Eles costumam resolver 90% desses travamentos.
+
+
+
+1) Dois patches rápidos no ESP (só acrescentar estas linhas)
+
+
+(a) Potência do Wi-Fi no máximo
+
+
+Logo após WiFi.begin(...) no wifi_begin_dhcp():
+
+
+WiFi.setTxPower(WIFI_POWER_19_5dBm);   // + potência de TX
+WiFi.setSleep(false);                  // já estava, mantém
+
+
+
+(b) Antena externa (se sua placa tiver conector u.FL)
+
+
+As AI-Thinker vêm com resistor 0Ω selecionando a antena PCB. Se você usar a antena externa, mude o 0Ω para a posição EXT (perto do conector u.FL). Se ficar na PCB com a carcaça do robô perto, o RSSI cai muito e dá esses “congela”.
+
+
+
+
+Não quer mexer em hardware? Pelo menos oriente a antena para fora do chassi e teste a 1–2 m do roteador.
+
+
+
+
+
+2) Reduzir uso de rádio sem perder a imagem
+
+
+Você já limita a captura para ~7 fps no ESP. Falta reduzir o pull do app/servidor:
+
+
+(a) Server (FastAPI) — aumente tolerâncias
+
+
+No server_heuristic.py:
+
+
+READ_TIMEOUT = 15.0        # 8.0 -> 15.0 (menos timeout por Wi-Fi ruim)
+POLL_FPS_TARGET = 8.0      # 12 -> 8 (menos pressão no rádio)
+MAX_FRAME_AGE_MS = 15000   # 3000 -> 15000 (não descartar snapshot tão cedo)
+
+
+
+(b) App (CameraScreen) — baixar a taxa de snapshot
+
+
+No loop do snapshot (onde está interval = 50; // ~20 fps), troque para:
+
+
+let interval = 120;  // ~8 fps
+...
+interval = 120;
+
+
+
+Assim o ESP manda ~7 fps e o app baixa ~8 fps → sem “tempestade” de GETs quando o sinal piora.
+
+
+
+3) Estabilizar a câmera em cenas escuras (sem mudar resolução)
+
+
+No camera_begin_qvga() apenas troque esta linha:
+
+
+s->set_gainceiling(s, GAINCEILING_4X);
+
+
+
+por:
+
+
+s->set_gainceiling(s, GAINCEILING_8X);  // dá um pouco mais de folga no escuro
+
+
+
+E, se ainda oscilar, suba um ponto de compressão:
+
+
+// antes:
+cfg.jpeg_quality = 16;
+// se precisar:
+cfg.jpeg_quality = 18;  // frames menores -> menos perda no rádio
+
+
+
+(Não mexa no frame_size.)
+
+
+
+4) Checklist físico (vale ouro)
+
+
+
+
+
+
+Fonte do ESP32-CAM: 5 V dedicados e estáveis (≥1 A).
+
+– Ideal: 470–1000 µF perto da placa (entre 5V e GND).
+
+– A maioria dos “congela” é 5 V caindo para 4.6–4.7 V no pico.
+
+
+
+
+
+
+GND comum entre ESP, Arduino e driver dos motores.
+
+– Sem GND comum, o UART falha e o rádio enlouquece.
+
+
+
+
+
+
+EMI dos motores: trave bem os fios do motor longe da antena/flat cable.
+
+– Se usar ponte H barata, coloque diodos e capacitor no motor (100 nF nos terminais).
+
+
+
+
+
+
+Flat cable da câmera: desconecte e reconecte alinhado; fita para travar.
+
+– Qualquer folga gera “frame NULL” quando mexe o chassi.
+
+
+
+
+
+
+Roteador: teste perto do roteador primeiro. Se estabilizar, é 100% RF.
+
+– Mude a rede para 2.4 GHz canal 1, 6 ou 11 fixo; evite canal lotado.
+
+
+
+
+
+
+Antenna switch (AI-Thinker): se usar u.FL, mude o 0Ω para EXT.
+
+– Se ficar em PCB, mantenha a área da antena livre (sem metal/plástico grosso na frente).
+
+
+
+
+
+
+
+5) Plano de teste (rápido)
+
+
+
+
+Aplique os dois patches (TxPower + app/server FPS).
+
+
+Reinicie o ESP, veja /status → fps_cap ~6–8, hasFrame:true.
+
+
+Ande com o robô/aponte longe → verifique se /snapshot continua vindo sem travar.
+
+
+Se ainda cair, aplique gainceiling 8x e jpeg_quality 18.
+
+
+Se perto do roteador fica perfeito e longe falha, é RF: use antena externa ou reposicione antena/roteador.
+
+
+
+
+Se quiser, me diga:
+
+
+
+
+O RSSI (adicione Serial.println(WiFi.RSSI()); após conectar)
+
+
+O canal do roteador (1/6/11)
+
+Com isso eu te digo se vale mudar o canal/potência do AP.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*  ESP32-CAM (AI Thinker) — Snapshot estável (buffer em background) + Bridge HTTP<->UART
     Ajustes de estabilidade:
       - QVGA, jpeg_quality=16, fb_count=1
