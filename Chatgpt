@@ -1,4 +1,466 @@
 
+Segue o firmware ESP32-CAM completo (compatível com versões antigas da esp32-camera) já com o endpoint POST /cam para ligar/desligar preto-e-branco, ajustar qualidade e resolução sem reinicializar.
+
+
+Cole tudo num único arquivo (ex.: hydrobot.ino) e compile para AI Thinker ESP32-CAM.
+
+
+/*
+  HydroBot - ESP32-CAM (STA, roteador externo)
+  Endpoints:
+    GET  /               -> página info
+    GET  /status         -> JSON (uptime, RSSI, heap, ip, último STAT do Arduino)
+    GET  /snapshot       -> JPEG único
+    GET  /stream         -> MJPEG stream
+    POST /uart?cmd=...   -> envia linha na UART2 pro Arduino (ex: CMD:FWD:ms=400:spd=70)
+    POST /led?on=0|1     -> liga/desliga flash (GPIO 4)
+    POST /restart        -> reinicia ESP
+    POST /cam?gray=0|1[&q=10..63][&size=qqvga|qvga|vga|svga|xga|sxga|uxga]
+                          -> ajusta câmera em tempo real (P&B, qualidade, resolução)
+
+  mDNS: http://hydrobot.local
+  CORS: Access-Control-Allow-Origin: *
+  UART: Serial2 (RX=15, TX=14 por padrão). ESP envia "REQ:STATUS\n" e guarda última "STAT:..."
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+// esp32-camera
+#include "esp_camera.h"
+#include "img_converters.h"
+#include "esp_timer.h"
+#include "fb_gfx.h"
+
+// evitar brownout reset
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ====== CONFIG REDE ======
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+// (Opcional) IP fixo – comente USE_STATIC_IP para DHCP
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50);
+IPAddress gateway (192,168,0,1);
+IPAddress subnet  (255,255,255,0);
+IPAddress dns1    (8,8,8,8);
+IPAddress dns2    (1,1,1,1);
+
+// mDNS
+const char* MDNS_NAME = "hydrobot"; // http://hydrobot.local
+
+// ====== UART com Arduino ======
+#define UART_RX_PIN 15
+#define UART_TX_PIN 14
+#define UART_BAUD   115200
+#define STATUS_POLL_MS 1000
+
+// ====== Camera (AI Thinker) ======
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ====== Globals ======
+WebServer server(80);
+String lastStatusLine = "";
+static const int FLASH_PIN = 4;   // flash do módulo AI Thinker
+
+static const char* STREAM_BOUNDARY = "frame";
+static const char* STREAM_CONTENT_TYPE =
+  "multipart/x-mixed-replace;boundary=frame";
+
+unsigned long lastWiFiCheck = 0;
+unsigned long lastStatusPoll = 0;
+
+// ---------- Util / CORS ----------
+void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() {
+  addCORS();
+  server.send(204);
+}
+
+// ---------- UART ----------
+void initUART() {
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+}
+
+void pollArduinoStatus() {
+  static String rxBuf;
+  Serial2.print("REQ:STATUS\n");
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\n' || c == '\r') {
+      if (rxBuf.length() > 0) {
+        if (rxBuf.startsWith("STAT:")) lastStatusLine = rxBuf;
+        rxBuf = "";
+      }
+    } else {
+      rxBuf += c;
+    }
+  }
+}
+
+// ---------- Câmera (init) ----------
+bool initCamera() {
+  // evitar brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // Valores conservadores para estabilidade (pode mudar depois via /cam)
+  config.xclk_freq_hz = 10000000;     // 10 MHz costuma ser mais estável que 20 MHz
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;  // 320x240 (leve)
+  config.jpeg_quality = 20;              // número MAIOR = MAIS compressão (arquivo menor)
+  config.fb_count     = 1;               // 1 buffer reduz consumo RAM e travas
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip  (s, false);
+    s->set_hmirror(s, false);
+  }
+  return true;
+}
+
+// ---------- Helpers de câmera (compatíveis) ----------
+
+// map string -> framesize code (int). Retorna -1 se desconhecido.
+int framesize_from_name(const String& name) {
+  String n = name; n.toLowerCase();
+  if (n == "qqvga") return FRAMESIZE_QQVGA;   // 160x120
+  if (n == "qvga")  return FRAMESIZE_QVGA;    // 320x240
+  if (n == "vga")   return FRAMESIZE_VGA;     // 640x480
+  if (n == "svga")  return FRAMESIZE_SVGA;    // 800x600
+  if (n == "xga")   return FRAMESIZE_XGA;     // 1024x768
+  if (n == "sxga")  return FRAMESIZE_SXGA;    // 1280x1024
+  if (n == "uxga")  return FRAMESIZE_UXGA;    // 1600x1200
+  return -1;
+}
+
+// Aplica P&B/qualidade/tamanho sem reinicializar (apenas funções amplamente suportadas)
+bool applyCameraTweaks(bool gray, int quality /*10..63*/, int fs_code /*-1 = manter*/) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+
+  if (s->set_special_effect) s->set_special_effect(s, gray ? 2 : 0); // 2=grayscale
+  if (s->set_saturation)     s->set_saturation(s, gray ? -2 : 0);
+
+  // travar balanço de branco (evita “picos” em cenas muito vermelhas)
+  if (s->set_awb)            s->set_awb(s, 0);
+  if (s->set_wb_mode)        s->set_wb_mode(s, 0);
+
+  if (quality >= 10 && quality <= 63 && s->set_quality) {
+    s->set_quality(s, quality);       // número MAIOR = MAIS compressão
+  }
+  if (fs_code > 0 && s->set_framesize) {
+    s->set_framesize(s, (framesize_t)fs_code);
+  }
+  return true;
+}
+
+// ---------- HTTP Handlers ----------
+void handleRoot() {
+  addCORS();
+  String html = "<!doctype html><html><head><meta charset='utf-8'/>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+                "<title>HydroBot ESP32-CAM</title>"
+                "<style>body{font-family:system-ui;background:#0b0b0f;color:#e5e7eb;padding:16px}"
+                "a,button{background:#e6403a;color:#fff;padding:8px 12px;border:none;border-radius:8px;text-decoration:none;margin-right:8px}"
+                "code{background:#121218;padding:2px 6px;border-radius:6px}</style></head><body>";
+  html += "<h2>HydroBot ESP32-CAM (STA)</h2>";
+  html += "<p>IP: <code>" + WiFi.localIP().toString() + "</code> | RSSI: <code>" + String(WiFi.RSSI()) + " dBm</code></p>";
+  html += "<p><a href='/snapshot'>/snapshot</a> <a href='/stream'>/stream</a> <a href='/status'>/status</a></p>";
+  html += "<p>mDNS: <code>http://" + String(MDNS_NAME) + ".local</code></p>";
+  html += "<p>Último STATUS Arduino: <code>" + (lastStatusLine.length() ? lastStatusLine : "(ainda não)") + "</code></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  addCORS();
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"arduino_status\":\"" + lastStatusLine + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSnapshot() {
+  addCORS();
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "Camera capture failed"); return; }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  client.println("HTTP/1.1 200 OK");
+  client.println(String("Content-Type: ") + STREAM_CONTENT_TYPE);
+  client.println("Access-Control-Allow-Origin: *");
+  client.println();
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    client.println("--" + String(STREAM_BOUNDARY));
+    client.println("Content-Type: image/jpeg");
+    client.println("Content-Length: " + String(fb->len));
+    client.println();
+    client.write(fb->buf, fb->len);
+    client.println();
+    esp_camera_fb_return(fb);
+
+    delay(10);
+  }
+}
+
+void handleUART() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  String cmd = server.arg("cmd");
+  if (!cmd.length()) { server.send(400, "application/json", "{\"error\":\"use /uart?cmd=...\"}"); return; }
+  if (!cmd.endsWith("\n")) cmd += "\n";
+  Serial2.print(cmd);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleLED() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  int on = server.arg("on").toInt();
+  digitalWrite(FLASH_PIN, on ? HIGH : LOW);
+  server.send(200, "application/json", String("{\"on\":") + (on? "true":"false") + "}");
+}
+
+void handleRestart() {
+  addCORS();
+  server.send(200, "application/json", "{\"restarting\":true}");
+  delay(300);
+  ESP.restart();
+}
+
+// POST /cam?gray=0|1[&q=10..63][&size=...]
+void handleCam() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+
+  bool gray = server.hasArg("gray") ? (server.arg("gray").toInt() ? true : false) : false;
+  int  q    = server.hasArg("q")    ? server.arg("q").toInt() : -1;
+
+  int fs_code = -1;
+  String sizeStr = "";
+  if (server.hasArg("size")) {
+    sizeStr = server.arg("size");
+    fs_code = framesize_from_name(sizeStr);
+  }
+
+  bool ok = applyCameraTweaks(gray, q, fs_code);
+
+  String resp = String("{\"ok\":") + (ok ? "true" : "false") +
+                ",\"gray\":" + (gray ? "true" : "false") +
+                (q >= 0 ? String(",\"q\":") + q : "") +
+                (sizeStr.length() ? String(",\"size\":\"") + sizeStr + "\"" : "") +
+                "}";
+  server.send(ok ? 200 : 500, "application/json", resp);
+}
+
+// ---------- Wi-Fi ----------
+void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+void setupServer() {
+  // Rotas
+  server.on("/",        HTTP_GET,  handleRoot);
+  server.on("/status",  HTTP_GET,  handleStatus);
+  server.on("/snapshot",HTTP_GET,  handleSnapshot);
+  server.on("/stream",  HTTP_GET,  handleStream);
+  server.on("/uart",    HTTP_POST, handleUART);
+  server.on("/led",     HTTP_POST, handleLED);
+  server.on("/restart", HTTP_POST, handleRestart);
+
+  // Novo: ajustes de câmera
+  server.on("/cam",     HTTP_POST, handleCam);
+
+  // CORS / notFound
+  server.onNotFound([](){
+    addCORS();
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+  server.on("/uart",    HTTP_OPTIONS, handleOptions);
+  server.on("/led",     HTTP_OPTIONS, handleOptions);
+  server.on("/restart", HTTP_OPTIONS, handleOptions);
+  server.on("/cam",     HTTP_OPTIONS, handleOptions);
+
+  server.begin();
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+
+  initUART();
+
+  if (!initCamera()) { delay(1000); initCamera(); }
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+  }
+
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Reconnect Wi-Fi
+  if (millis() - lastWiFiCheck > 3000) {
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  }
+
+  // Poll STATUS do Arduino
+  if (millis() - lastStatusPoll > STATUS_POLL_MS) {
+    lastStatusPoll = millis();
+    pollArduinoStatus();
+  }
+}
+
+
+
+Como usar o P&B no encoder da câmera
+
+
+
+
+Ligar P&B + comprimir + reduzir resolução:
+
+POST http://hydrobot.local/cam?gray=1&q=22&size=qvga
+
+
+
+
+
+Voltar ao colorido (mantém qualidade/resolução atuais):
+
+POST http://hydrobot.local/cam?gray=0
+
+
+
+
+
+
+
+
+
+Observações:
+
+
+
+
+Na API da esp32-camera, quality maior = mais compressão (arquivo menor). Bons valores: 20–30.
+
+
+size=qvga (320×240) é muito mais estável do que VGA em redes mais fracas.
+
+
+Se ainda houver travas, teste xclk=10MHz, fb_count=1 (já estão assim) e mantenha gray=1 durante cenas críticas.
+
+
+
+
+
+
+Se quiser, te mando também um cURL ou um snippet em JS/React Native para alternar isso direto do app (mas você já tem o botão chamando /cam).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Show! Aqui vão os códigos completos já com o P&B controlado direto no ESP via POST /cam e o app com o botão que liga/desliga isso em tempo real.
 
 
