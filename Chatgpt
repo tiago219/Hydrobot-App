@@ -1,3 +1,337 @@
+
+/*
+  ESP32-CAM (AI Thinker) — MÍNIMO
+  - Conecta em Wi-Fi STA: SSID "HydroBot", senha "loud2025emibr"
+  - Único endpoint: GET /snapshot  -> retorna 1 JPEG
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "esp_timer.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===== Wi-Fi (roteador externo) =====
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50);
+IPAddress gateway(192,168,0,1);
+IPAddress subnet (255,255,255,0);
+IPAddress dns1   (8,8,8,8);
+IPAddress dns2   (1,1,1,1);
+
+// ===== Camera pinos (AI Thinker) =====
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ===== HTTP =====
+WebServer server(80);
+
+// ---------- Util ----------
+static inline void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions(){ addCORS(); server.send(204); }
+
+// ---------- Câmera ----------
+bool initCamera() {
+  // evita brownout reset
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // Mesmo perfil do seu código que "não rebootava"
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;  // 640x480
+  config.jpeg_quality = 12;             // 10..20 (10 melhor qualidade)
+  config.fb_count     = 2;
+
+  // pequenas melhorias de robustez (não alteram rota/funcionalidade)
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+
+  if (esp_camera_init(&config) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, false);
+  s->set_hmirror(s, false);
+  return true;
+}
+
+// ---------- Handler: /snapshot ----------
+void handleSnapshot() {
+  addCORS();
+
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "Camera capture failed"); return; }
+
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+}
+
+// ---------- Wi-Fi ----------
+void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);              // ajuda estabilidade
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+// ---------- HTTP ----------
+void setupServer() {
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/snapshot", HTTP_OPTIONS, handleOptions);
+
+  // Tudo o resto -> 404
+  server.onNotFound([](){
+    addCORS();
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+
+  server.begin();
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  if (!initCamera()) { delay(1000); initCamera(); }   // tenta de novo se falhar
+  connectWiFi();
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+  ESP32-CAM (AI Thinker) — MÍNIMO
+  - Conecta em Wi-Fi STA: SSID "HydroBot", senha "loud2025emibr"
+  - Único endpoint: GET /snapshot  -> retorna 1 JPEG
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
+#include "esp_timer.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ===== Wi-Fi (roteador externo) =====
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50);
+IPAddress gateway(192,168,0,1);
+IPAddress subnet (255,255,255,0);
+IPAddress dns1   (8,8,8,8);
+IPAddress dns2   (1,1,1,1);
+
+// ===== Camera pinos (AI Thinker) =====
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ===== HTTP =====
+WebServer server(80);
+
+// ---------- Util ----------
+static inline void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions(){ addCORS(); server.send(204); }
+
+// ---------- Câmera ----------
+bool initCamera() {
+  // evita brownout reset
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // Mesmo perfil do seu código que "não rebootava"
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;  // 640x480
+  config.jpeg_quality = 12;             // 10..20 (10 melhor qualidade)
+  config.fb_count     = 2;
+
+  // pequenas melhorias de robustez (não alteram rota/funcionalidade)
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+
+  if (esp_camera_init(&config) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, false);
+  s->set_hmirror(s, false);
+  return true;
+}
+
+// ---------- Handler: /snapshot ----------
+void handleSnapshot() {
+  addCORS();
+
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "Camera capture failed"); return; }
+
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+}
+
+// ---------- Wi-Fi ----------
+void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);              // ajuda estabilidade
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+// ---------- HTTP ----------
+void setupServer() {
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/snapshot", HTTP_OPTIONS, handleOptions);
+
+  // Tudo o resto -> 404
+  server.onNotFound([](){
+    addCORS();
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+
+  server.begin();
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  if (!initCamera()) { delay(1000); initCamera(); }   // tenta de novo se falhar
+  connectWiFi();
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
   HydroBot - ESP32-CAM em modo STA (roteador externo)
   - Endpoints:
