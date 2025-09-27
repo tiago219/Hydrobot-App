@@ -1,5 +1,285 @@
 
 /*
+  ESP32-CAM (AI Thinker) — STREAM MÍNIMO E ESTÁVEL
+  - Wi-Fi STA: SSID "HydroBot" / PASS "loud2025emibr"
+  - Endpoints:
+      GET /        -> HTML simples com <img src="/stream">
+      GET /stream  -> MJPEG (1 cliente por vez)
+  - Sem snapshot, sem UART, sem LED, sem status.
+  - Usa esp_http_server (IDF), mais robusto que Arduino WebServer.
+*/
+
+#include <WiFi.h>
+extern "C" {
+  #include "esp_camera.h"
+  #include "esp_http_server.h"
+  #include "esp_timer.h"
+  #include "esp_system.h"
+  #include "soc/rtc_cntl_reg.h"
+}
+
+// ===== Wi-Fi (roteador externo) =====
+static const char* WIFI_SSID = "HydroBot";
+static const char* WIFI_PASS = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50), gateway(192,168,0,1), subnet(255,255,255,0), dns1(8,8,8,8), dns2(1,1,1,1);
+
+// ===== Câmera (AI Thinker) =====
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ===== HTTPD =====
+static httpd_handle_t g_httpd = NULL;
+static volatile bool  g_stream_busy = false;
+
+// ===== Concurrency guard (mutex) =====
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t g_camLock = nullptr;
+#define CAM_LOCK_TIMEOUT_MS 150
+
+// ===== Config de stream =====
+static const char* _STREAM_BOUNDARY = "frame";
+static const char* _STREAM_PART     = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+static const size_t TCP_CHUNK       = 1460;  // ~MTU
+
+// ===================== Wi-Fi =====================
+static void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);              // reduz picos de consumo
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+// ===================== Câmera =====================
+static bool initCamera() {
+  // Desarma brownout (fontes não ideais derrubam)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t cfg{};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+
+  // Perfil estável (se quiser testar VGA depois, mude aqui)
+  cfg.xclk_freq_hz = 10000000;          // 10 MHz ajuda estabilidade
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_QVGA;    // 320x240 (diagnóstico)
+  cfg.jpeg_quality = 15;                // 10..20 (15 é nítido e leve)
+  cfg.fb_count     = 2;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, false);
+  s->set_hmirror(s, false);
+  s->set_aec2(s, true);
+  s->set_gainceiling(s, GAINCEILING_2X);
+  s->set_brightness(s, 0);
+  s->set_saturation(s, 0);
+  return true;
+}
+
+// ===================== Handlers =====================
+
+// GET /
+static esp_err_t index_handler(httpd_req_t* req) {
+  static const char PROGMEM html[] =
+    "<!doctype html><meta charset=utf-8>"
+    "<title>ESP32-CAM</title>"
+    "<body style='margin:0;background:#0b0b0f;color:#e5e7eb;font-family:system-ui'>"
+    "<div style='padding:12px'>"
+      "<h3>ESP32-CAM (mínimo)</h3>"
+      "<p><a href='/stream' style='color:#fff;background:#e6403a;padding:8px 12px;border-radius:8px;text-decoration:none'>/stream</a></p>"
+      "<hr><img src='/stream' style='max-width:100vw;height:auto'/>"
+    "</div></body>";
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+// GET /stream (1 cliente)
+static esp_err_t stream_handler(httpd_req_t* req) {
+  if (g_stream_busy) {
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    return httpd_resp_send(req, "busy", HTTPD_RESP_USE_STRLEN);
+  }
+  // lock da câmera para toda a sessão
+  if (!g_camLock || xSemaphoreTake(g_camLock, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) == pdFALSE) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, "camera busy", HTTPD_RESP_USE_STRLEN);
+  }
+
+  g_stream_busy = true;
+  esp_err_t res = ESP_OK;
+
+  char part_buf[64];
+  httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  httpd_resp_set_hdr(req, "Connection", "close");
+  // loop de stream
+  while (true) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+
+    // cabeçalho do frame
+    int hlen = snprintf(part_buf, sizeof(part_buf), "--%s\r\n" _STREAM_PART, _STREAM_BOUNDARY, fb->len);
+    if ((res = httpd_resp_send_chunk(req, part_buf, hlen)) != ESP_OK) { esp_camera_fb_return(fb); break; }
+
+    // corpo (jpeg) — podemos mandar de uma vez; o HTTPD já trata envio em partes
+    res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) break;
+
+    // CRLF final
+    if ((res = httpd_resp_send_chunk(req, "\r\n", 2)) != ESP_OK) break;
+
+    // respiro p/ Wi-Fi/CPU
+    vTaskDelay(6 / portTICK_PERIOD_MS);
+    // alimenta WDT implicitamente ao não bloquear a task
+  }
+
+  // encerra chunked
+  httpd_resp_send_chunk(req, NULL, 0);
+
+  g_stream_busy = false;
+  xSemaphoreGive(g_camLock);
+  return res;
+}
+
+// ===================== HTTPD start =====================
+static void start_server() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.lru_purge_enable = true;      // fecha conexões antigas em caso de falta de sockets
+  config.stack_size = 8192;            // mais stack para handler do stream
+  config.recv_wait_timeout = 10;
+  config.send_wait_timeout = 10;
+  config.max_open_sockets = 3;         // segura avalanche
+
+  if (httpd_start(&g_httpd, &config) == ESP_OK) {
+    httpd_uri_t uri_index  = { .uri="/",       .method=HTTP_GET, .handler=index_handler,  .user_ctx=NULL };
+    httpd_uri_t uri_stream = { .uri="/stream", .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL };
+    httpd_register_uri_handler(g_httpd, &uri_index);
+    httpd_register_uri_handler(g_httpd, &uri_stream);
+  }
+}
+
+// ===================== Arduino setup/loop =====================
+void setup() {
+  // Brownout off
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  delay(150);
+
+  if (!initCamera()) {
+    // tenta fallback ultraleve se falhar
+    esp_camera_deinit();
+    camera_config_t cfg{};
+    cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+    cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+    cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+    cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+    cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+    cfg.xclk_freq_hz=10000000; cfg.pixel_format=PIXFORMAT_JPEG; cfg.frame_size=FRAMESIZE_QQVGA; cfg.jpeg_quality=18;
+    cfg.fb_count=1; cfg.grab_mode=CAMERA_GRAB_LATEST; cfg.fb_location=CAMERA_FB_IN_PSRAM;
+    if (esp_camera_init(&cfg) != ESP_OK) { while(true){ delay(1000); } }
+  }
+
+  connectWiFi();
+  g_camLock = xSemaphoreCreateMutex();
+  start_server();
+
+  Serial.println("\nReady. Open http://<ip>/stream");
+}
+
+void loop() {
+  // nada a fazer — HTTPD roda em tasks próprias
+  delay(1000);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
   ESP32-CAM (AI Thinker) — MÍNIMO E ESTÁVEL
   - Conecta em Wi-Fi STA (roteador externo):
       SSID: HydroBot
