@@ -1,3 +1,523 @@
+
+Perfeito — vamos remover totalmente a dependência do servidor e exibir apenas o stream MJPEG direto do ESP32-CAM no app. Abaixo estão dois arquivos completos:
+
+
+
+
+Firmware ESP32-CAM (apenas /stream e /snapshot, sem falar com servidor)
+
+
+CameraScreen.tsx (React Native) usando WebView para tocar MJPEG direto
+
+
+
+
+Além disso, ajustei o firmware para evitar travamentos quando a cena tem muita informação (reduzi resolução/qualidade com segurança, “grab latest”, 2 framebuffers em PSRAM, XCLK mais baixo e backpressure no loop de stream).
+
+
+
+1) ESP32-CAM — hydrobot_cam_stream.ino
+
+
+/*
+  HydroBot - ESP32-CAM (AI Thinker) — STREAM DIRETO (sem servidor externo)
+  Endpoints:
+    GET /           -> página simples com preview <img>
+    GET /snapshot   -> JPEG único
+    GET /stream     -> MJPEG (multipart/x-mixed-replace)
+    POST/GET /led?on=0|1 -> flash (GPIO 4) opcional
+
+  Notas de robustez contra travamentos:
+    - frame_size = QVGA (320x240) por padrão (estável)
+    - jpeg_quality = 15 (mais alto = mais leve)
+    - fb_count = 2 (duplo buffer), fb_location = PSRAM, grab_mode = LATEST
+    - xclk_freq_hz = 10MHz (reduz carga e aquecimento)
+    - Headers corretos de stream e backpressure no loop
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ======= CONFIG WIFI =======
+const char* WIFI_SSID = "HydroBot";
+const char* WIFI_PASS = "loud2025emibr";
+
+// mDNS opcional: http://hydrobot.local
+const char* MDNS_NAME = "hydrobot";
+
+// ======= PINAGEM (AI Thinker) =======
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ======= WEB =======
+WebServer server(80);
+
+// ======= FLASH PIN =======
+static const int FLASH_PIN = 4;
+
+// ======= AJUSTES CÂMERA =======
+static framesize_t CAM_FRAME = FRAMESIZE_QVGA; // 320x240 (estável)
+static int CAM_JPEG_QUALITY = 15;              // 10..20 (maior número = mais leve)
+static int CAM_FB_COUNT = 2;                   // 2 buffers
+static int CAM_XCLK = 10000000;                // 10 MHz (reduz falhas)
+
+// ======= STREAM CONSTS =======
+static const char* BOUNDARY = "frame";
+static const char* CT_STREAM = "multipart/x-mixed-replace;boundary=frame";
+
+// ======= UTILS =======
+void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() {
+  addCORS();
+  server.send(204);
+}
+
+// ======= CÂMERA =======
+bool initCamera() {
+  // Desabilita brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = CAM_XCLK;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Usar PSRAM se disponível
+  config.frame_size   = CAM_FRAME;
+  config.jpeg_quality = CAM_JPEG_QUALITY;
+  config.fb_count     = CAM_FB_COUNT;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;      // evita heap interno
+  config.grab_mode    = CAMERA_GRAB_LATEST;      // pega o frame mais novo (evita fila)
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  // Pequenos ajustes (podem ficar default)
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 0);
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
+  // Denoise / Dithering costumam ser defaults OK
+
+  return true;
+}
+
+// ======= HTTP HANDLERS =======
+void handleRoot() {
+  addCORS();
+  String ip = WiFi.localIP().toString();
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'/>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+    "<title>HydroBot ESP32-CAM</title>"
+    "<style>body{background:#0b0b0f;color:#e5e7eb;font-family:system-ui;padding:16px}"
+    "img{max-width:100%;height:auto;border-radius:12px;border:1px solid #25273a}"
+    "a,button{background:#e6403a;color:#fff;padding:8px 12px;border:none;border-radius:8px;text-decoration:none;margin-right:8px}"
+    "code{background:#121218;padding:2px 6px;border-radius:6px}</style>"
+    "</head><body>"
+    "<h2>HydroBot • Stream Direto</h2>"
+    "<p>IP: <code>" + ip + "</code> — mDNS: <code>http://" + String(MDNS_NAME) + ".local</code></p>"
+    "<p><a href='/snapshot'>/snapshot</a> <a href='/stream'>/stream</a></p>"
+    "<img src='/stream'/>"
+    "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSnapshot() {
+  addCORS();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "Camera capture failed"); return; }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+
+  // Cabeçalhos do stream
+  client.printf("HTTP/1.1 200 OK\r\n");
+  client.printf("Content-Type: %s\r\n", CT_STREAM);
+  client.printf("Cache-Control: no-store, no-cache, must-revalidate\r\n");
+  client.printf("Pragma: no-cache\r\n");
+  client.printf("Access-Control-Allow-Origin: *\r\n");
+  client.printf("\r\n");
+
+  // Backpressure: se cliente travar, encerramos
+  client.setTimeout(2); // 2s
+
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    // Cabeçalho de cada frame
+    client.printf("--%s\r\n", BOUNDARY);
+    client.printf("Content-Type: image/jpeg\r\n");
+    client.printf("Content-Length: %u\r\n\r\n", fb->len);
+
+    // Envia JPEG
+    size_t toWrite = fb->len;
+    uint8_t* ptr = fb->buf;
+    while (toWrite > 0) {
+      size_t chunk = toWrite;
+      // Limita chunk p/ evitar watchdog em redes lentas
+      if (chunk > 8192) chunk = 8192;
+      size_t written = client.write(ptr, chunk);
+      if (written == 0) { // cliente não está lendo -> encerra
+        esp_camera_fb_return(fb);
+        client.flush();
+        return;
+      }
+      ptr += written;
+      toWrite -= written;
+      // yield curto — reduz risco de WDT sem perder cadence
+      delay(1);
+    }
+    client.printf("\r\n");
+    esp_camera_fb_return(fb);
+
+    // Ritmo alvo ~10–15fps dependendo da rede/cliente
+    delay(5);
+    // Se quiser ainda mais estável (cenas complexas): aumente para 10–12 ms
+  }
+}
+
+void handleLED() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  int on = server.hasArg("on") ? server.arg("on").toInt() : 0;
+  digitalWrite(FLASH_PIN, on ? HIGH : LOW);
+  server.send(200, "application/json", String("{\"on\":") + (on? "true":"false") + "}");
+}
+
+// ======= WIFI =======
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+
+  if (!initCamera()) {
+    delay(800);
+    initCamera();
+  }
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(MDNS_NAME)) {
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+
+  // Rotas
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/led", HTTP_GET, handleLED);
+  server.on("/led", HTTP_POST, handleLED);
+  server.on("/led", HTTP_OPTIONS, handleOptions);
+
+  server.onNotFound([](){
+    addCORS();
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  // Auto-reconecta Wi-Fi se cair
+  static unsigned long lastWiFi = 0;
+  if (millis() - lastWiFi > 3000) {
+    lastWiFi = millis();
+    if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  }
+}
+
+
+
+Por que isso reduz travamentos quando aponta “para longe”?
+
+
+
+
+QVGA + qualità 15 → menos bytes por frame ⇒ menos risco de fila/overflow.
+
+
+grab_mode = LATEST → sempre pega o frame mais novo, não acumula backlog.
+
+
+PSRAM + fb_count=2 → buffers fora do heap interno.
+
+
+XCLK 10MHz → reduz estresse elétrico/temperatura e picos de DMA.
+
+
+Backpressure no stream → se o cliente parar de ler, a conexão é encerrada limpo.
+
+
+
+
+Se quiser mais qualidade depois que estabilizar, suba para FRAMESIZE_VGA e jpeg_quality=12 gradualmente.
+
+
+
+2) React Native — HydroBotApp2/src/screens/CameraScreen.tsx
+
+
+
+
+Mostra somente o vídeo do ESP (sem servidor), via WebView renderizando um <img src="http://IP/stream">.
+
+O componente Image do RN não toca MJPEG; por isso usamos WebView.
+
+
+
+
+import { useMemo, useState } from "react";
+import { View, Text, TextInput, Pressable, StyleSheet, Platform } from "react-native";
+import { WebView } from "react-native-webview";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+const DEFAULT_IP = "hydrobot.local"; // mDNS do ESP
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [flash, setFlash] = useState(false);
+
+  const streamURL = useMemo(() => `http://${ip}/stream`, [ip]);
+
+  // HTML simples para tocar MJPEG com <img>. Usa 'object-fit: contain'.
+  const html = useMemo(() => `
+<!doctype html><html>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+<style>
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
+  img{max-width:100vw;max-height:100vh;object-fit:contain;background:#000}
+</style>
+<body>
+  <div id="wrap"><img id="cam" src="${streamURL}" /></div>
+</body></html>`.trim(), [streamURL]);
+
+  async function toggleFlash() {
+    try {
+      const next = !flash;
+      // tanto GET quanto POST funcionam no handler acima
+      const u = `http://${ip}/led?on=${next ? 1 : 0}`;
+      await fetch(u, { method: "GET" });
+      setFlash(next);
+    } catch { /* silencioso */ }
+  }
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.topbar}>
+        <Text style={styles.label}>ESP:</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="hydrobot.local"
+          placeholderTextColor="#8a93a5"
+          style={styles.input}
+        />
+        <Pressable onPress={toggleFlash} style={[styles.btn, flash ? styles.btnOn : styles.btnOff]}>
+          <Text style={styles.btnText}>{flash ? "LED ON" : "LED OFF"}</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.player}>
+        {/* Importante: habilitar mixedContent no Android para http */}
+        <WebView
+          originWhitelist={["*"]}
+          source={{ html }}
+          allowFileAccess
+          allowingReadAccessToURL={"*"}
+          mixedContentMode="always"
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          javaScriptEnabled
+          domStorageEnabled
+          automaticallyAdjustContentInsets
+          setSupportMultipleWindows={false}
+          overScrollMode={Platform.OS === "android" ? "never" : undefined}
+          style={{ backgroundColor: "black" }}
+        />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container:{ flex:1, backgroundColor:PALETTE.bg },
+  topbar:{ flexDirection:"row", alignItems:"center", gap:8, padding:12,
+           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  label:{ color:"#cfd3d8", fontSize:12 },
+  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
+          borderWidth:1, borderColor:PALETTE.border, minWidth:180, flexGrow:1 },
+  btn:{ paddingHorizontal:10, paddingVertical:10, borderRadius:10 },
+  btnOn:{ backgroundColor:"#17a34a" }, btnOff:{ backgroundColor:"#374151" },
+  btnText:{ color:"white", fontWeight:"600" },
+  player:{ flex:1, backgroundColor:"#000" },
+});
+
+
+
+Observações importantes no app
+
+
+
+
+Android: MJPEG por HTTP precisa de mixedContentMode="always" no WebView (já está setado).
+
+
+Sem servidor: removi qualquer chamada a /healthz, /detect, etc. É só http://IP/stream e http://IP/led.
+
+
+Se o mDNS não resolver no seu roteador, troque hydrobot.local por um IP (ex.: 192.168.0.50).
+
+
+
+
+
+Dicas de estabilidade (se ainda travar com cenas “pesadas”)
+
+
+
+
+
+
+Comece em QVGA + qualidade 15 (já está) e teste.
+
+Se ficar folgado, suba gradualmente para:
+
+
+
+
+CAM_FRAME = FRAMESIZE_VGA e CAM_JPEG_QUALITY = 12
+
+
+mantenha CAM_FB_COUNT = 2, CAM_XCLK = 10MHz.
+
+
+
+
+
+
+
+
+Uma conexão por vez ao /stream. Se abrir duas telas ao mesmo tempo, uma delas pode sofrer.
+
+
+
+
+
+
+Iluminação: pouca luz aumenta compressão difícil e ruído. Use o LED com parcimônia.
+
+
+
+
+
+
+Wi-Fi: evite canais congestionados; aproxime o roteador; 2.4 GHz com bom RSSI.
+
+
+
+
+
+
+
+Se quiser, depois a gente reintroduz o servidor só como opção, mas a base acima resolve o que você pediu agora: o app mostra o vídeo direto do ESP sem nenhuma integração extra.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
   HydroBot - ESP32-CAM em modo STA (roteador externo)
   - Endpoints:
