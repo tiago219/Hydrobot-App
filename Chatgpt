@@ -1,4 +1,274 @@
 
+Ok — vamos zerar e entregar um baseline superestável só com:
+
+
+
+
+Wi-Fi STA no seu roteador (HydroBot / loud2025emibr).
+
+
+ÚNICO endpoint: GET /snapshot (um JPEG).
+
+
+Sem mDNS, sem stream, sem UART, sem LED, sem status.
+
+
+Trocas cruciais para parar reboot:
+
+
+
+Servidor HTTP do ESP-IDF (mais robusto que WebServer).
+
+
+Frame buffer em DRAM (não usa PSRAM, que em muitos módulos causa reboot).
+
+
+QVGA + quality 15 + fb_count=1 + XCLK 10 MHz (carga leve).
+
+
+Potência de TX Wi-Fi reduzida (menos pico de corrente).
+
+
+
+
+
+
+
+
+Cole o código abaixo e grave (Placa: AI Thinker ESP32-CAM, PSRAM Enabled ok, mas este firmware não depende dela):
+
+
+/*
+  ESP32-CAM (AI Thinker) — SNAPSHOT MÍNIMO E ESTÁVEL
+  - Wi-Fi STA: SSID "HydroBot" / PASS "loud2025emibr"
+  - Único endpoint: GET /snapshot  -> retorna 1 JPEG
+  - Sem stream, sem UART, sem LED, sem mDNS.
+  - Robustez: httpd (ESP-IDF), DRAM framebuffer (sem PSRAM), TX power reduzido.
+*/
+
+#include <WiFi.h>
+extern "C" {
+  #include "esp_camera.h"
+  #include "esp_http_server.h"
+  #include "esp_timer.h"
+  #include "esp_system.h"
+  #include "esp_wifi.h"
+  #include "soc/rtc_cntl_reg.h"
+}
+
+// ===== Wi-Fi (roteador externo) =====
+static const char* WIFI_SSID = "HydroBot";
+static const char* WIFI_PASS = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50), gateway(192,168,0,1), subnet(255,255,255,0), dns1(8,8,8,8), dns2(1,1,1,1);
+
+// ===== Câmera (AI Thinker) =====
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ===== HTTPD =====
+static httpd_handle_t g_httpd = NULL;
+
+// ===== Mutex da câmera =====
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t g_camLock = nullptr;
+#define CAM_LOCK_TIMEOUT_MS 150
+
+// ---------------- Wi-Fi ----------------
+static void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);                 // reduz pico de consumo
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(250);
+
+  // Reduz potência de TX (unidade: 1/4 dBm). 52 = ~13 dBm.
+  esp_wifi_set_max_tx_power(52);
+}
+
+// --------------- Câmera ----------------
+// DRAM em vez de PSRAM para evitar reboot por PSRAM instável.
+// QVGA + q=15 + fb_count=1 + XCLK 10 MHz = carga leve e estável.
+static bool initCamera() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // desarma brownout
+
+  camera_config_t cfg{};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 10000000;           // 10 MHz (mais estável)
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_QVGA;     // 320x240
+  cfg.jpeg_quality = 15;                 // 10..20
+  cfg.fb_count     = 1;                  // 1 buffer = menos pressão de RAM
+  cfg.grab_mode    = CAMERA_GRAB_LATEST; // evita fila
+  cfg.fb_location  = CAMERA_FB_IN_DRAM;  // <<< sem PSRAM
+
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, false);
+  s->set_hmirror(s, false);
+  s->set_aec2(s, true);
+  s->set_gainceiling(s, GAINCEILING_2X);
+  s->set_brightness(s, 0);
+  s->set_saturation(s, 0);
+  return true;
+}
+
+// --------------- Handler: /snapshot ---------------
+static esp_err_t snapshot_handler(httpd_req_t* req) {
+  if (!g_camLock || xSemaphoreTake(g_camLock, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) == pdFALSE) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, "camera busy", HTTPD_RESP_USE_STRLEN);
+  }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    xSemaphoreGive(g_camLock);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_send(req, "capture failed", HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+  xSemaphoreGive(g_camLock);
+  return res;
+}
+
+// --------------- HTTPD start ---------------
+static void start_server() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.lru_purge_enable = true;
+  config.stack_size = 8192;
+  config.recv_wait_timeout = 10;
+  config.send_wait_timeout = 10;
+  config.max_open_sockets = 2;
+
+  if (httpd_start(&g_httpd, &config) == ESP_OK) {
+    httpd_uri_t uri_snap = { .uri="/snapshot", .method=HTTP_GET, .handler=snapshot_handler, .user_ctx=NULL };
+    httpd_register_uri_handler(g_httpd, &uri_snap);
+  }
+}
+
+// ---------------- Arduino ----------------
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  delay(150);
+
+  if (!initCamera()) {
+    // fallback ainda mais leve em caso de falha rara
+    esp_camera_deinit();
+    camera_config_t cfg{};
+    cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+    cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+    cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+    cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+    cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+    cfg.xclk_freq_hz=10000000; cfg.pixel_format=PIXFORMAT_JPEG; cfg.frame_size=FRAMESIZE_QQVGA; cfg.jpeg_quality=18;
+    cfg.fb_count=1; cfg.grab_mode=CAMERA_GRAB_LATEST; cfg.fb_location=CAMERA_FB_IN_DRAM;
+    if (esp_camera_init(&cfg) != ESP_OK) while(true){ delay(1000); }
+  }
+
+  connectWiFi();
+  g_camLock = xSemaphoreCreateMutex();
+  start_server();
+
+  Serial.println("\nReady. Open:  http://<IP>/snapshot");
+}
+
+void loop() {
+  delay(1000);
+}
+
+
+
+Se ainda reiniciar, verifique já:
+
+
+
+
+Alimentação: use 5 V / 2 A direto nos pinos 5V/GND (USB de notebook costuma cair em cenas “ricas”).
+
+
+Cabo/flat da câmera bem encaixado; mau contato causa panics esporádicos.
+
+
+GPIOs de boot: não force GPIO15 alto no boot (pin de strap); nada ligado em GPIO0/2/12/15.
+
+
+Placa/IDE: AI Thinker ESP32-CAM, Flash DIO 40 MHz (muito clone reinicia em QIO), PSRAM Enabled (ok, mesmo usando DRAM).
+
+
+
+
+Este baseline elimina PSRAM do caminho, reduz o pico de Wi-Fi e simplifica a pilha HTTP. A partir dele, quando estiver estável, a gente volta a acrescentar o que precisar.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
   ESP32-CAM (AI Thinker) — MÍNIMO
   - Conecta em Wi-Fi STA: SSID "HydroBot", senha "loud2025emibr"
