@@ -1,3 +1,272 @@
+
+/* ESP32-CAM (AI Thinker) — CÂMERA APENAS (robusto)
+   - Wi-Fi STA
+   - xclk 8 MHz, FRAMESIZE_QQVGA (160x120), jpeg_quality 32, fb_count 1
+   - Endpoints:
+       /snapshot  -> JPEG único (Connection: close)
+       /stream    -> MJPEG (multipart/x-mixed-replace)
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ---------- CONFIG WI-FI ----------
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+const char* MDNS_NAME  = "hydrobot-esp";
+
+// ---------- WEB ----------
+WebServer server(80);
+
+// ---------- PINAGEM AI Thinker ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---------- PERFIL DE CÂMERA ----------
+static framesize_t   CAM_SIZE   = FRAMESIZE_QQVGA; // suba p/ QVGA após estabilizar
+static int           CAM_QLTY   = 32;              // maior = mais compressão (menos bytes)
+static const size_t  MAX_JPEG   = 80 * 1024;       // descarta frames muito grandes (proteção)
+
+// ---------- CORS util ----------
+static void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+static void handle_options() { sendCORS(); server.send(204); }
+
+// ---------- INIT WI-FI ----------
+static void wifi_begin() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_13dBm); // menos EMI no barramento da câmera
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(MDNS_NAME);
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("WIFI_OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WIFI_FAIL");
+  }
+}
+
+// ---------- INIT CÂMERA ----------
+static bool camera_begin() {
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM;  cfg.pin_d1 = Y3_GPIO_NUM;  cfg.pin_d2 = Y4_GPIO_NUM;  cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM;  cfg.pin_d5 = Y7_GPIO_NUM;  cfg.pin_d6 = Y8_GPIO_NUM;  cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk = XCLK_GPIO_NUM;  cfg.pin_pclk = PCLK_GPIO_NUM;  cfg.pin_vsync = VSYNC_GPIO_NUM;  cfg.pin_href = HREF_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM;  cfg.pin_sccb_scl = SIOC_GPIO_NUM;  cfg.pin_pwdn = PWDN_GPIO_NUM;  cfg.pin_reset = RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 8000000;              // 8 MHz reduz pressão no DMA
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = CAM_SIZE;
+  cfg.jpeg_quality = CAM_QLTY;             // 10 melhor/maior; 63 pior/menor (aqui mais compressão)
+  cfg.fb_count     = 1;                    // 1 buffer evita fila estourar
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;   // dropa frames velhos
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("CAMERA_INIT_ERR 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s && s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_saturation(s, -1);
+  }
+  if (s) {
+    s->set_framesize  (s, CAM_SIZE);
+    s->set_quality    (s, CAM_QLTY);
+    s->set_exposure_ctrl(s, 1);
+    s->set_gain_ctrl    (s, 1);
+    s->set_whitebal     (s, 1);
+    s->set_awb_gain     (s, 1);
+    // aliviar ISP:
+    s->set_lenc(s, 0);
+    s->set_bpc (s, 0);
+    s->set_wpc (s, 0);
+    s->set_dcw (s, 1);
+  }
+
+  return true;
+}
+
+// ---------- /snapshot ----------
+static void handle_snapshot() {
+  sendCORS();
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.sendHeader("Connection","close");
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "no frame\n"); return; }
+
+  if (fb->format != PIXFORMAT_JPEG || fb->len < 20 || fb->len > MAX_JPEG) {
+    esp_camera_fb_return(fb);
+    server.send(503, "text/plain", "bad frame\n");
+    return;
+  }
+
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+  WiFiClient c = server.client();
+
+  size_t sent = 0;
+  while (sent < fb->len) {
+    int n = c.write(fb->buf + sent, fb->len - sent);
+    if (n <= 0) break;
+    sent += n;
+    delay(0); // yield
+  }
+
+  esp_camera_fb_return(fb);
+}
+
+// ---------- /stream (MJPEG) ----------
+static const char* BOUNDARY = "frame";
+static void handle_stream() {
+  WiFiClient client = server.client();
+  sendCORS();
+  String hdr = 
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=" + String(BOUNDARY) + "\r\n"
+    "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+    "Pragma: no-cache\r\n"
+    "Connection: close\r\n\r\n";
+  client.print(hdr);
+
+  // loop até cliente fechar
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { delay(10); continue; }
+
+    if (fb->format != PIXFORMAT_JPEG || fb->len < 20 || fb->len > MAX_JPEG) {
+      esp_camera_fb_return(fb);
+      delay(2);
+      continue;
+    }
+
+    client.print("--"); client.print(BOUNDARY); client.print("\r\n");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.print("Content-Length: "); client.print(fb->len); client.print("\r\n\r\n");
+
+    size_t sent = 0;
+    while (sent < fb->len) {
+      int n = client.write(fb->buf + sent, fb->len - sent);
+      if (n <= 0) { break; }
+      sent += n;
+      delay(0);
+    }
+    client.print("\r\n");
+
+    esp_camera_fb_return(fb);
+
+    // pequeno cap (≈4 fps) para aliviar DMA e Wi-Fi
+    delay(250);
+  }
+}
+
+// ---------- SETUP / LOOP ----------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+
+  wifi_begin();
+
+  if (!camera_begin()) {
+    delay(400);
+    // último fallback: mais compressão
+    CAM_QLTY = 36;
+    camera_begin();
+  }
+
+  server.on("/snapshot", HTTP_GET, handle_snapshot);
+  server.on("/stream",   HTTP_GET, handle_stream);
+
+  server.on("/",         HTTP_OPTIONS, handle_options);
+  server.on("/snapshot", HTTP_OPTIONS, handle_options);
+  server.on("/stream",   HTTP_OPTIONS, handle_options);
+
+  server.onNotFound([](){
+    sendCORS();
+    server.send(404, "text/plain", "NF\n");
+  });
+
+  server.begin();
+  Serial.println("HTTP_READY");
+}
+
+void loop() {
+  server.handleClient();
+  delay(1);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*  ESP32-CAM (AI Thinker) — Perfil anti-DMA overflow (rev B)
     - xclk 8 MHz
     - QQVGA (160x120) + jpeg_quality 30 (mais compressão)
