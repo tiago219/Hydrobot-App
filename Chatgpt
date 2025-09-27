@@ -1,4 +1,368 @@
 
+// ====== HydroBot – AUTO baseado no código antigo (delta analógico) + confirmação e recalibração por eventos ======
+#include <Arduino.h>
+#include <Servo.h>
+
+/* ---------------- PINOS (iguais ao seu código antigo) ---------------- */
+// Motores (ponte H)
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+
+// Servo
+#define SERVO_PIN     12
+#define SERVO_ESQ     45
+#define SERVO_CENTRO  100
+#define SERVO_DIR     135
+Servo servoMangueira;
+
+// Sensores KY-026 (digitais)
+#define SENSOR_FOGO_ESQ_D 2   // esquerdo - digital (LOW = fogo)
+#define SENSOR_FOGO_MEIO_D 4  // meio    - digital (LOW = fogo)
+#define SENSOR_FOGO_DIR_D 7   // direito - digital (LOW = fogo)
+
+// Sensores KY-026 (analógicos)
+#define SENSOR_FOGO_ESQ  A2   // esquerdo - analógico
+#define SENSOR_FOGO_MEIO A1   // meio     - analógico
+#define SENSOR_FOGO_DIR  A0   // direito  - analógico
+
+// Bomba / Nível de água / LED (mesma pinagem antiga)
+#define BOMBA_PIN     13
+#define NIVEL_AGUA_PIN A3
+#define LED_VERMELHO   3   // pode ser PWM
+
+// Botão (opcional, NÃO usar 7 pois conflita com sensor digital direito)
+#define BOTAO 6
+
+/* ---------------- PARÂMETROS ---------------- */
+// Detecção (baseado no antigo): delta = base - leitura; delta grande => fogo
+static const int DIFERENCA_FOGO = 150;   // “aciona”
+static const int DIFERENCA_CLEAR = 100;  // “limpa” (histerese)
+
+// Confirmação anti-falso-positivo (rápida e leve)
+static const uint8_t CONFIRM_READS = 3;    // 3 leituras
+static const uint8_t CONFIRM_MIN   = 2;    // precisa acertar 2
+static const uint16_t CONFIRM_SPACING_MS = 15;
+
+// Hold para suavidade (mantém “fogo” por um instante)
+static const uint16_t FIRE_HOLD_MS = 250;
+
+// Calibração
+static const uint16_t TEMPO_CALIBRACAO_MS = 3000; // 3 s ao entrar no AUTO
+static const uint8_t  RECALIB_EVERY_CONFIRMED = 5; // recalibra a cada 5 eventos confirmados
+
+// Velocidade e tempos de movimento
+static const uint8_t  VEL_PERC = 60;   // 60% (se usar PWM por software)
+static const uint16_t T_FWD_MS = 210;
+static const uint16_t T_TURN_MS = 150;
+static const uint16_t T_BACK_MS = 260;
+
+/* ---------------- ESTADO ---------------- */
+enum Modo : uint8_t { MODO_APP = 0, MODO_AUTO = 1 };
+enum Dir  : uint8_t { DIR_STOP=0, DIR_FWD, DIR_BACK, DIR_LEFT, DIR_RIGHT };
+
+struct State {
+  // modo
+  Modo modo = MODO_AUTO; // se quiser iniciar em APP, troque aqui
+
+  // calibração
+  int baseEsq=0, baseMeio=0, baseDir=0;
+  bool calibrado=false;
+
+  // água/LED/bomba
+  uint8_t nivelAguaPct=0;
+  bool bombaOn=false;
+  unsigned long ledBlinkAt=0;
+  bool ledBlink=false;
+
+  // fogo confirmado
+  bool fogoConfirmado=false;
+  unsigned long fogoHoldUntil=0;
+  uint16_t eventosConfirmados=0;
+
+  // movimento (watchdog simples)
+  Dir currentDir=DIR_STOP;
+  bool motionActive=false;
+  unsigned long motionEndMs=0;
+  unsigned long lastMoveCmdAt=0;
+
+  // servo
+  int posServo=SERVO_CENTRO;
+} G;
+
+/* ---------------- PROTÓTIPOS ---------------- */
+void motorsStop(); void motorsFwd(); void motorsBack(); void motorsLeftTurn(); void motorsRightTurn();
+void setMotion(Dir d, uint16_t ms);
+void pwmSoftware(void (*mov)(), int velPerc, int duracaoMs); // compatível com seu antigo
+
+void pumpWrite(bool on);
+uint8_t waterPercent();
+void updateWaterLED(uint8_t pct);
+
+void calibrarSensores();                  // média em 3s
+bool detectarFogoConfirmado(int &side);   // confirma em burst (2/3)
+bool isClearNow();                        // checa histerese de saída
+
+void moverServo(int novaPos);
+void ligarBomba(); void desligarBomba();
+
+void frenteBasico(); void trasBasico(); void direitaBasico(); void esquerdaBasico(); void parar();
+
+void handleAuto();    // lógica AUTO pura (sem patrulha)
+void handleManual();  // opcional
+
+/* ---------------- IMPLEMENTAÇÃO ---------------- */
+// Motores básicos
+void motorsStop(){ digitalWrite(IN1,LOW);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,LOW); G.currentDir=DIR_STOP; }
+void motorsFwd(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_FWD; }
+void motorsBack(){ digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_BACK; }
+void motorsLeftTurn(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_LEFT; }
+void motorsRightTurn(){ digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_RIGHT; }
+
+void setMotion(Dir d, uint16_t ms){
+  if (ms==0 || d==DIR_STOP){ motorsStop(); G.motionActive=false; return; }
+  switch(d){ case DIR_FWD: motorsFwd(); break; case DIR_BACK: motorsBack(); break;
+             case DIR_LEFT: motorsLeftTurn(); break; case DIR_RIGHT: motorsRightTurn(); break; default: motorsStop(); }
+  G.motionActive=true; G.motionEndMs=millis()+ms; G.lastMoveCmdAt=millis();
+}
+
+// PWM por software (compatível com seu antigo)
+void pwmSoftware(void (*movimento)(), int vel, int duracao){
+  unsigned long inicio = millis();
+  const int ciclo = 10;
+  const int onMs = (ciclo * vel) / 100;
+  const int offMs = ciclo - onMs;
+  while ((int)(millis()-inicio) < duracao){
+    movimento(); delay(onMs);
+    if (vel < 100 && offMs>0){ parar(); delay(offMs); }
+  }
+}
+
+// Água / LED / Bomba
+void pumpWrite(bool on){ G.bombaOn=on; digitalWrite(BOMBA_PIN, on?HIGH:LOW); }
+uint8_t waterPercent(){ int raw=analogRead(NIVEL_AGUA_PIN); int pct=map(raw,0,1023,0,100); return (uint8_t)constrain(pct,0,100); }
+void updateWaterLED(uint8_t pct){
+  if (pct>=60){ analogWrite(LED_VERMELHO,0); return; }
+  if (pct>=40){ analogWrite(LED_VERMELHO,120); return; }
+  if (pct>=20){
+    if (millis()-G.ledBlinkAt>800){ G.ledBlinkAt=millis(); G.ledBlink=!G.ledBlink; }
+    analogWrite(LED_VERMELHO, G.ledBlink?200:0);
+    return;
+  }
+  if (millis()-G.ledBlinkAt>250){ G.ledBlinkAt=millis(); G.ledBlink=!G.ledBlink; }
+  analogWrite(LED_VERMELHO, G.ledBlink?255:0);
+}
+
+// Calibração
+void calibrarSensores(){
+  unsigned long t0=millis();
+  long sE=0,sM=0,sD=0; int n=0;
+  while (millis()-t0 < TEMPO_CALIBRACAO_MS){
+    sE+=analogRead(SENSOR_FOGO_ESQ);
+    sM+=analogRead(SENSOR_FOGO_MEIO);
+    sD+=analogRead(SENSOR_FOGO_DIR);
+    n++; delay(100);
+  }
+  if (n==0) n=1;
+  G.baseEsq = sE/n; G.baseMeio = sM/n; G.baseDir = sD/n;
+  G.calibrado=true;
+  Serial.print(F("CALIB bases -> E:"));Serial.print(G.baseEsq);
+  Serial.print(F(" M:"));Serial.print(G.baseMeio);
+  Serial.print(F(" D:"));Serial.println(G.baseDir);
+}
+
+// Leitura única e delta
+static inline void leituraDelta(int &dE,int &dM,int &dD, int &side){
+  int aE=analogRead(SENSOR_FOGO_ESQ);
+  int aM=analogRead(SENSOR_FOGO_MEIO);
+  int aD=analogRead(SENSOR_FOGO_DIR);
+  dE = G.baseEsq - aE; dM = G.baseMeio - aM; dD = G.baseDir - aD;
+  // lado do maior delta:
+  int md=dM; side=0; if (dE>md){ md=dE; side=-1; } if (dD>md){ md=dD; side=+1; }
+}
+
+// Filtro rápido: 2 de 3 leituras com delta acima do limiar
+bool detectarFogoConfirmado(int &sideOut){
+  uint8_t hits=0;
+  int bestDelta=-32768; int sideBest=0;
+  for (uint8_t i=0;i<CONFIRM_READS;i++){
+    int dE,dM,dD,side; leituraDelta(dE,dM,dD,side);
+    bool fogo = (dE>DIFERENCA_FOGO) || (dM>DIFERENCA_FOGO) || (dD>DIFERENCA_FOGO);
+    if (fogo) hits++;
+    int strongest = dM; if (dE>strongest) strongest=dE; if (dD>strongest) strongest=dD;
+    if (strongest>bestDelta){ bestDelta=strongest; sideBest=side; }
+    delay(CONFIRM_SPACING_MS);
+  }
+  sideOut = sideBest;
+  return (hits>=CONFIRM_MIN);
+}
+
+// Clear com histerese
+bool isClearNow(){
+  int dE,dM,dD,sideDummy; leituraDelta(dE,dM,dD,sideDummy);
+  return (dE<DIFERENCA_CLEAR) && (dM<DIFERENCA_CLEAR) && (dD<DIFERENCA_CLEAR);
+}
+
+// Servo/Bomba helpers
+void moverServo(int nova){
+  if (nova==G.posServo) return;
+  int passo = (nova > G.posServo) ? 2 : -2;
+  while (abs(G.posServo-nova)>2){ G.posServo+=passo; servoMangueira.write(G.posServo); delay(15); }
+  G.posServo=nova; servoMangueira.write(G.posServo);
+}
+void ligarBomba(){ if (!G.bombaOn && G.nivelAguaPct>10){ pumpWrite(true); } }
+void desligarBomba(){ if (G.bombaOn){ pumpWrite(false); } }
+
+// Básicos (compatíveis com seu antigo para pwmSoftware)
+void frenteBasico(){  digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);  digitalWrite(IN3,HIGH);  digitalWrite(IN4,LOW);  }
+void trasBasico(){    digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); digitalWrite(IN3,LOW);   digitalWrite(IN4,HIGH); }
+void direitaBasico(){ digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); digitalWrite(IN3,HIGH);  digitalWrite(IN4,LOW);  }
+void esquerdaBasico(){digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);  digitalWrite(IN3,LOW);   digitalWrite(IN4,HIGH); }
+void parar(){         motorsStop(); }
+
+// ===================== LÓGICA AUTO (SEM PATRULHA) =====================
+void handleAuto(){
+  if (!G.calibrado){ calibrarSensores(); G.posServo=SERVO_CENTRO; servoMangueira.write(G.posServo); return; }
+
+  // água/LED
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct<=10) desligarBomba();
+
+  // confirma fogo via burst
+  int side=0;
+  bool fireNow = detectarFogoConfirmado(side);
+
+  unsigned long now=millis();
+  if (fireNow){
+    G.fogoConfirmado = true;
+    G.fogoHoldUntil = now + FIRE_HOLD_MS;
+
+    // ação: direciona e faz passos curtos
+    if (G.nivelAguaPct>10) ligarBomba(); else desligarBomba();
+
+    if (side<0){ // mais forte à esquerda do robô -> gira para ESQUERDA (servo aponta para direita física)
+      moverServo(SERVO_DIR); // seu mapeamento antigo
+      // giro leve e avanço curto
+      pwmSoftware(esquerdaBasico, VEL_PERC, T_TURN_MS);
+      pwmSoftware(frenteBasico,  VEL_PERC, T_FWD_MS);
+    } else if (side>0){
+      moverServo(SERVO_ESQ);
+      pwmSoftware(direitaBasico, VEL_PERC, T_TURN_MS);
+      pwmSoftware(frenteBasico,  VEL_PERC, T_FWD_MS);
+    } else {
+      moverServo(SERVO_CENTRO);
+      pwmSoftware(frenteBasico,  VEL_PERC, T_FWD_MS);
+    }
+
+    // contar eventos para recalibração periódica
+    static bool lastHadFire=false;
+    if (!lastHadFire && G.fogoConfirmado){
+      G.eventosConfirmados++;
+      if (G.eventosConfirmados % RECALIB_EVERY_CONFIRMED == 0){
+        Serial.println(F("AUTO: Recalibrando por contagem de eventos..."));
+        calibrarSensores();
+      }
+    }
+    lastHadFire = true;
+  } else {
+    // limpar com histerese e hold
+    if (G.fogoConfirmado && now > G.fogoHoldUntil){
+      if (isClearNow()){ G.fogoConfirmado=false; }
+    }
+
+    // Sem fogo confirmado => NÃO se move, bomba OFF, servo centro
+    if (!G.fogoConfirmado){
+      desligarBomba();
+      moverServo(SERVO_CENTRO);
+      motorsStop();
+    }
+  }
+}
+
+// ===================== (Opcional) MODO MANUAL =====================
+void handleManual(){
+  // Se não usa, deixe vazio. Mantido para compatibilidade com seu app.
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (digitalRead(BOTAO)==LOW){
+    // exemplo: segurar botão liga bomba (se houver água)
+    if (G.nivelAguaPct>10) ligarBomba();
+  } else {
+    desligarBomba();
+  }
+}
+
+/* ===================== SETUP / LOOP ===================== */
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(BOMBA_PIN,OUTPUT); pumpWrite(false);
+  pinMode(LED_VERMELHO,OUTPUT); analogWrite(LED_VERMELHO,0);
+
+  pinMode(SENSOR_FOGO_ESQ_D,INPUT);
+  pinMode(SENSOR_FOGO_MEIO_D,INPUT);
+  pinMode(SENSOR_FOGO_DIR_D,INPUT);
+  pinMode(BOTAO,INPUT_PULLUP);
+
+  servoMangueira.attach(SERVO_PIN);
+  servoMangueira.write(SERVO_CENTRO);
+  G.posServo = SERVO_CENTRO;
+
+  motorsStop();
+  Serial.println(F("HydroBot pronto (AUTO sem patrulha). Calibrando ao entrar..."));
+  // Inicia em AUTO: já calibra no primeiro handleAuto()
+  G.modo = MODO_AUTO;
+}
+
+void loop(){
+  // watchdog de movimento
+  if (G.motionActive && (long)(millis()-G.motionEndMs)>=0){ motorsStop(); G.motionActive=false; }
+  if ((millis()-G.lastMoveCmdAt)>1000 && G.currentDir!=DIR_STOP){ motorsStop(); G.motionActive=false; }
+
+  if (G.modo==MODO_AUTO) handleAuto();
+  else handleManual();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ====== HydroBot – Driver, Modos (APP/AUTO) com Confirmação de Fogo e Calibração por Evento ======
 #include <Arduino.h>
 
