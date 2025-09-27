@@ -1,4 +1,484 @@
 
+Perfeito — vamos consertar o /snapshot no ESP.
+
+O problema é que o handler atual tenta pegar o frame “na hora” (esp_camera_fb_get() dentro do request). Em muitas placas (AI Thinker), isso dá timeout/NULL intermitente, e o servidor fica em hasFrame=false.
+
+
+A solução robusta é capturar frames continuamente em uma tarefa (FreeRTOS) e guardar o último JPEG em memória. O endpoint /snapshot apenas devolve o último frame pronto, então nunca bloqueia esperando a câmera.
+
+
+Abaixo está o firmware completo do ESP32-CAM (AI Thinker) com:
+
+
+
+
+Wi-Fi DHCP + mDNS (http://hydrobot-esp.local)
+
+
+Task de captura contínua (cam_task) com retries e auto-reinit da câmera
+
+
+Buffer PSRAM para o último JPEG (sempre atualizado)
+
+
+Endpoints: /status, /snapshot, /uart, /pump, /joystick (iguais ao app/servidor)
+
+
+CORS habilitado
+
+
+Config de câmera estável: QVGA, jpeg_quality=12, fb_count=2, GRAB_LATEST
+
+
+
+
+
+
+No Arduino IDE: Board AI Thinker ESP32-CAM, PSRAM Enabled.
+
+Fontes: ESP com 5V estável ≥1A. Ligue GND comum com o Arduino.
+
+
+
+
+
+ESP32-CAM – código completo (substitua tudo)
+
+
+/*  ESP32-CAM (AI Thinker) — Snapshot estável (buffer em background) + Bridge HTTP<->UART
+    - Wi-Fi DHCP + mDNS: http://hydrobot-esp.local
+    - Endpoints:
+        /status                 -> JSON (hasFrame, age_ms, fps_cap)
+        /snapshot               -> último JPEG em buffer (no-store)
+        /uart?line=...          -> Serial.println(line)
+        /pump?on=0|1            -> "CMD:PUMP:0|1"
+        /joystick?x=&y=         -> redundância com CMD discreto
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// ---------- Wi-Fi ----------
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+const char* MDNS_NAME  = "hydrobot-esp";
+
+// ---------- Web ----------
+WebServer server(80);
+
+// ---------- Pinos câmera (AI Thinker) ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ---------- Buffer do último frame ----------
+static uint8_t* g_jpeg = nullptr;
+static size_t   g_jlen = 0;
+static volatile uint32_t g_ts_ms = 0;
+static SemaphoreHandle_t g_lock;
+
+static float g_cap_fps = 0.f;
+static uint32_t g_cap_frames = 0;
+static uint32_t g_cap_tick = 0;
+
+static uint32_t g_fail_streak = 0;
+
+// ---------- Utils ----------
+static String urlDecode(const String &s) {
+  String o; o.reserve(s.length());
+  auto hx=[](char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='A'&&c<='F')return 10+(c-'A');
+    if(c>='a'&&c<='f')return 10+(c-'a');
+    return -1;
+  };
+  for(size_t i=0;i<s.length();++i){
+    char c=s[i];
+    if(c=='+') o+=' ';
+    else if(c=='%' && i+2<s.length()){
+      int h1=hx(s[i+1]), h2=hx(s[i+2]);
+      if(h1>=0 && h2>=0){ o+=(char)((h1<<4)|h2); i+=2; }
+      else o+=c;
+    } else o+=c;
+  }
+  return o;
+}
+static void sendCORS(){
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+void handle_options(){ sendCORS(); server.send(204); }
+
+static uint32_t now_ms(){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
+
+// ---------- Câmera ----------
+static bool camera_begin_qvga() {
+  camera_config_t cfg{};
+  cfg.ledc_channel=LEDC_CHANNEL_0; cfg.ledc_timer=LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM; cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sccb_sda=SIOD_GPIO_NUM; cfg.pin_sccb_scl=SIOC_GPIO_NUM; cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_QVGA;    // 320x240
+  cfg.jpeg_quality = 12;                // 10..15 (menor = melhor)
+  cfg.fb_count     = psramFound() ? 2 : 1;
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) { Serial.printf("CAMERA_INIT_ERR 0x%x\n", err); return false; }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s && s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
+  }
+  // garante QVGA/qualidade após init
+  if (s) { s->set_framesize(s, FRAMESIZE_QVGA); s->set_quality(s, 12); }
+  return true;
+}
+
+static void camera_free_buffer(){
+  if(g_jpeg){ heap_caps_free(g_jpeg); g_jpeg=nullptr; g_jlen=0; }
+}
+
+// Task de captura contínua
+void cam_task(void*){
+  const uint32_t MIN_INTERVAL_MS = 80;  // ~12.5 fps cap
+  g_cap_tick = now_ms();
+  while(true){
+    uint32_t t0 = now_ms();
+    camera_fb_t* fb = esp_camera_fb_get();
+    if(!fb){
+      g_fail_streak++;
+      if(g_fail_streak>=10){
+        Serial.println("CAMERA_REINIT");
+        esp_camera_deinit();
+        delay(50);
+        camera_begin_qvga();
+        g_fail_streak=0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    g_fail_streak=0;
+
+    // Garante JPEG
+    if(fb->format != PIXFORMAT_JPEG || fb->len<20){
+      esp_camera_fb_return(fb);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    // Copia para PSRAM própria (snapshot independente do fb)
+    xSemaphoreTake(g_lock, portMAX_DELAY);
+    camera_free_buffer();
+    g_jlen = fb->len;
+    g_jpeg = (uint8_t*) heap_caps_malloc(g_jlen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(g_jpeg){
+      memcpy(g_jpeg, fb->buf, g_jlen);
+      g_ts_ms = now_ms();
+    } else {
+      g_jlen = 0;
+    }
+    xSemaphoreGive(g_lock);
+
+    esp_camera_fb_return(fb);
+
+    // FPS calculado
+    g_cap_frames++;
+    uint32_t now = now_ms();
+    if(now - g_cap_tick >= 1000){
+      g_cap_fps = (float)g_cap_frames / ((now - g_cap_tick)/1000.f);
+      g_cap_frames = 0;
+      g_cap_tick = now;
+    }
+
+    // cap de taxa
+    uint32_t elapsed = now_ms() - t0;
+    if(elapsed < MIN_INTERVAL_MS) vTaskDelay(pdMS_TO_TICKS(MIN_INTERVAL_MS - elapsed));
+  }
+}
+
+// ---------- Wi-Fi ----------
+void wifi_begin_dhcp() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = now_ms();
+  while (WiFi.status() != WL_CONNECTED && now_ms() - t0 < 20000) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(MDNS_NAME);
+    MDNS.addService("http","tcp",80);
+    Serial.println("WIFI_OK");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WIFI_FAIL");
+  }
+}
+
+// ---------- Handlers ----------
+void handle_status(){
+  sendCORS();
+  uint32_t age = g_ts_ms ? (now_ms() - g_ts_ms) : (uint32_t) -1;
+  String j = "{\"ok\":true,"
+             "\"ip\":\""+WiFi.localIP().toString()+"\","
+             "\"mode\":\"bridge+snapshot-buffer\","
+             "\"hasFrame\":" + String((g_jpeg && age < 12000) ? "true":"false") + ","
+             "\"age_ms\":" + String((int)age) + ","
+             "\"fps_cap\":" + String(g_cap_fps,1) +
+             "}";
+  server.send(200,"application/json",j);
+}
+
+void handle_snapshot(){
+  sendCORS();
+  xSemaphoreTake(g_lock, portMAX_DELAY);
+  bool ok = (g_jpeg && g_jlen>0);
+  if(ok){
+    server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma","no-cache");
+    server.sendHeader("Expires","0");
+    server.setContentLength(g_jlen);
+    server.send(200,"image/jpeg","");
+    WiFiClient c = server.client();
+    c.write(g_jpeg, g_jlen);
+  } else {
+    server.send(503,"text/plain","no frame\n");
+  }
+  xSemaphoreGive(g_lock);
+}
+
+static String url_uart_arg(){ return server.hasArg("line") ? urlDecode(server.arg("line")) : String(); }
+void handle_uart(){
+  sendCORS();
+  String line = url_uart_arg();
+  if(line.length()==0){ server.send(400,"text/plain","missing 'line'\n"); return; }
+  Serial.print(line); if(!line.endsWith("\n")) Serial.print("\n");
+  server.send(200,"text/plain","OK\n");
+}
+
+void handle_pump(){
+  sendCORS();
+  bool on = server.hasArg("on") && (server.arg("on")=="1" || server.arg("on")=="true" || server.arg("on")=="TRUE");
+  Serial.printf("CMD:PUMP:%d\n", on?1:0);
+  server.send(200,"text/plain", on?"PUMP_ON\n":"PUMP_OFF\n");
+}
+
+void handle_joystick(){
+  sendCORS();
+  float x = server.hasArg("x") ? server.arg("x").toFloat() : 0.f;
+  float y = server.hasArg("y") ? server.arg("y").toFloat() : 0.f;
+
+  // Encaminha nota GET (compat)
+  String raw = "GET /joystick?x="+String(x,3)+"&y="+String(y,3)+" HTTP/1.1";
+  Serial.println(raw);
+
+  // Comando discreto redundante
+  float m = sqrtf(x*x+y*y);
+  if(m<0.20f){ Serial.println("CMD:STOP"); }
+  else{
+    float deg = atan2f(y,x)*57.29578f;
+    const char* dir="LEFT";
+    if(deg>-45&&deg<=45) dir="RIGHT";
+    else if(deg>45&&deg<=135) dir="FWD";
+    else if(deg<=-45&&deg>-135) dir="BACK";
+    uint16_t ms = 120 + (uint16_t)(min(1.0f,m)*260.0f);
+    Serial.printf("CMD:%s:ms=%u:spd=70\n", dir, ms);
+  }
+  server.send(200,"text/plain","JOY\n");
+}
+
+// ---------- setup/loop ----------
+void setup() {
+  // UART0 p/ Arduino
+  Serial.begin(115200);
+  delay(50);
+
+  // Estabilidade
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // desativa brownout
+
+  // Sincronização buffer
+  g_lock = xSemaphoreCreateMutex();
+
+  // Wi-Fi
+  wifi_begin_dhcp();
+
+  // Câmera
+  if(!camera_begin_qvga()){
+    // tenta mais uma vez após 300ms
+    delay(300);
+    camera_begin_qvga();
+  }
+
+  // Task de captura contínua
+  xTaskCreatePinnedToCore(cam_task, "cam_task", 4096, nullptr, 1, nullptr, 0);
+
+  // HTTP
+  server.on("/status",    HTTP_GET,     handle_status);
+  server.on("/snapshot",  HTTP_GET,     handle_snapshot);
+  server.on("/uart",      HTTP_GET,     handle_uart);
+  server.on("/pump",      HTTP_GET,     handle_pump);
+  server.on("/joystick",  HTTP_GET,     handle_joystick);
+
+  // CORS preflight
+  server.on("/",          HTTP_OPTIONS, handle_options);
+  server.on("/snapshot",  HTTP_OPTIONS, handle_options);
+  server.on("/uart",      HTTP_OPTIONS, handle_options);
+  server.on("/pump",      HTTP_OPTIONS, handle_options);
+  server.on("/joystick",  HTTP_OPTIONS, handle_options);
+
+  server.onNotFound([](){ sendCORS(); server.send(404,"text/plain","NF\n"); });
+
+  server.begin();
+  Serial.println("HTTP_READY");
+}
+
+void loop() {
+  server.handleClient();
+  delay(1);
+}
+
+
+
+
+Como validar (rápido)
+
+
+
+
+Abra o Serial Monitor → confirme WIFI_OK e IP: 192.168.3.3 (ou o que o roteador der).
+
+
+No navegador:
+
+
+
+http://<IP_DO_ESP>/status → espere hasFrame:true e age_ms baixo.
+
+
+http://<IP_DO_ESP>/snapshot → deve abrir imagem.
+
+
+
+
+
+
+Depois disso, o servidor (/healthz) deve passar a hasFrame:true e o app passa a exibir vídeo.
+
+
+
+
+
+
+Se ainda aparecer hasFrame:false em /status, verifique:
+
+
+
+
+Flat cable da câmera bem encaixado (lado dos contatos para baixo).
+
+
+Fonte 5V suficiente (≥1A).
+
+
+No “Tools” do IDE, PSRAM: Enabled.
+
+
+Teste reduzir para QQVGA: mude FRAMESIZE_QVGA → FRAMESIZE_QQVGA (e deixe jpeg_quality=15).
+
+
+
+
+
+
+Esse desenho, com buffer em background + reinit automático, elimina o “NO LIVE FRAME” causado por timeouts do sensor e estabiliza o proxy do servidor.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*  ESP32-CAM (AI Thinker) — Bridge HTTP<->UART + Snapshot (DHCP)
     - Conecta ao roteador por DHCP e anuncia mDNS: http://hydrobot-esp.local
     - Endpoints:
