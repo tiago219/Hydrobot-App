@@ -1,3 +1,606 @@
+
+Perfeito — o travamento “quando aponta pra longe” é clássico de estouro/pressão de JPEG + PSRAM/DMA no ESP32-CAM: cenas com muito detalhe geram JPEGs grandes, o capture demora mais, a fila de buffers enche e a câmera “agarra”.
+
+A correção abaixo faz controle adaptativo de taxa (ABR) direto no firmware, reduzindo qualidade/tamanho quando o frame pesa demais/atrasar, e volta a subir quando estabiliza. Também ajusta modos do driver para evitar overflow.
+
+
+Aqui vão só os trechos que precisam ser trocados (já deixei o resto igual ao que você mandou). Se preferir, pode substituir o arquivo todo pelo “COMPLETO” mais abaixo.
+
+
+
+ESP32-CAM (substituir pelos trechos abaixo)
+
+
+1) initCamera() — habilitar PSRAM, GRAB_LATEST e parâmetros mais resilientes
+
+
+bool initCamera() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // RELIABILITY: use 20 MHz (estável), mas pegue o "LATEST" para evitar backpressure
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Comece menor para estabilizar e o ABR sobe depois se couber
+  config.frame_size   = FRAMESIZE_QVGA;   // 320x240 (inicia leve)
+  config.jpeg_quality = 14;               // 10..20 (14 = equilibrado)
+  config.fb_count     = 2;                // duplo buffer
+  config.grab_mode    = CAMERA_GRAB_LATEST;      // evita fila travar
+  config.fb_location  = CAMERA_FB_IN_PSRAM;      // usa PSRAM
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) return false;
+
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_vflip(s, STREAM_VFLIP);
+  s->set_hmirror(s, STREAM_HFLIP);
+
+  // Pequenos ajustes ajudam estabilidade/exposição sem inflar JPEG
+  s->set_aec2(s, true);
+  s->set_gainceiling(s, GAINCEILING_2X);
+  s->set_brightness(s, 0);
+  s->set_saturation(s, 0);
+
+  return true;
+}
+
+
+
+2) Controle adaptativo (ABR) usado por /snapshot e /stream
+
+
+Coloque isso acima dos handlers HTTP:
+
+
+// ---- ABR (Adaptive Bitrate) ----
+static volatile uint8_t g_cur_quality = 14; // acompanha quality atual
+static volatile framesize_t g_cur_framesize = FRAMESIZE_QVGA;
+
+struct AbrState {
+  uint8_t  q      = 14;           // 10..20
+  framesize_t fs  = FRAMESIZE_QVGA;
+  uint32_t  badStreak = 0;        // frames pesados seguidos
+  uint32_t  goodStreak= 0;        // frames leves seguidos
+} g_abr;
+
+static inline void abr_on_frame(size_t jpeg_len, uint32_t capture_ms) {
+  // Alvos empíricos para ESP32-CAM estável via Wi-Fi
+  const size_t HEAVY  = 60 * 1024;  // >60 KB = pesado
+  const size_t LIGHT  = 35 * 1024;  // <35 KB = leve
+  const uint32_t SLOW = 150;        // >150 ms para capturar = lento
+
+  bool heavy = (jpeg_len >= HEAVY) || (capture_ms >= SLOW);
+  bool light = (jpeg_len <= LIGHT) && (capture_ms < SLOW);
+
+  if (heavy) { g_abr.badStreak++; g_abr.goodStreak = 0; }
+  else if (light) { g_abr.goodStreak++; g_abr.badStreak = 0; }
+  else { g_abr.badStreak = 0; g_abr.goodStreak = 0; }
+
+  // DOWNGRADE agressivo quando pesado repetido
+  if (g_abr.badStreak >= 2) {
+    if (g_abr.q < 18) { g_abr.q += 2; }
+    else if (g_abr.fs < FRAMESIZE_VGA) {
+      // já em baixa qualidade: reduz resolução (QVGA -> CIF -> VGA se já estava maior)
+      g_abr.fs = (g_abr.fs == FRAMESIZE_QVGA) ? FRAMESIZE_QQVGA : FRAMESIZE_QVGA;
+      g_abr.q  = 15; // reseta para qualidade melhor ao reduzir resolução
+    }
+    sensor_t* s = esp_camera_sensor_get();
+    s->set_quality(s, g_abr.q);
+    s->set_framesize(s, g_abr.fs);
+    g_cur_quality = g_abr.q; g_cur_framesize = g_abr.fs;
+    g_abr.badStreak = 0;
+  }
+
+  // UPGRADE lento quando está tudo leve e estável
+  if (g_abr.goodStreak >= 18) { // ~3s em 6 fps
+    if (g_abr.q > 12) g_abr.q -= 1;
+    else if (g_abr.fs < FRAMESIZE_VGA) g_abr.fs = FRAMESIZE_QVGA;
+    sensor_t* s = esp_camera_sensor_get();
+    s->set_quality(s, g_abr.q);
+    s->set_framesize(s, g_abr.fs);
+    g_cur_quality = g_abr.q; g_cur_framesize = g_abr.fs;
+    g_abr.goodStreak = 0;
+  }
+}
+
+
+
+3) /snapshot — envolver medição de tempo e chamar o ABR
+
+
+Troque seu handleSnapshot() por este:
+
+
+void handleSnapshot() {
+  addCORS();
+
+  uint32_t t0 = millis();
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) { server.send(503, "text/plain", "Camera capture failed"); return; }
+  uint32_t cap_ms = millis() - t0;
+
+  abr_on_frame(fb->len, cap_ms);
+
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+
+
+4) /stream — idem, com envio chunk-a-chunk (reduz pico de RAM/TCP)
+
+
+Troque seu handleStream() por este:
+
+
+void handleStream() {
+  WiFiClient client = server.client();
+  client.println("HTTP/1.1 200 OK");
+  client.println(String("Content-Type: ") + STREAM_CONTENT_TYPE);
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.println("Access-Control-Allow-Origin: *");
+  client.println();
+
+  while (client.connected()) {
+    uint32_t t0 = millis();
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    uint32_t cap_ms = millis() - t0;
+    abr_on_frame(fb->len, cap_ms);
+
+    client.print("--"); client.println(STREAM_BOUNDARY);
+    client.println("Content-Type: image/jpeg");
+    client.print("Content-Length: "); client.println(fb->len);
+    client.println();
+
+    // envia em pedaços menores para evitar estourar o buffer TCP
+    size_t toWrite = fb->len;
+    const uint8_t* p = fb->buf;
+    while (toWrite > 0) {
+      size_t n = toWrite > 1460 ? 1460 : toWrite; // MTU-ish
+      size_t w = client.write(p, n);
+      if (w == 0) { break; }
+      p += w; toWrite -= w;
+      delay(1); // cede CPU p/ WiFi
+    }
+    client.println();
+    esp_camera_fb_return(fb);
+
+    // pequeno respiro controlado — evitar fila crescer
+    delay(8);
+  }
+}
+
+
+
+
+Pequenos ajustes no servidor (Python) – OPCIONAL mas recomendável
+
+
+No seu server_heuristic.py, apenas deixe o alvo de FPS um pouco mais baixo e o timeout um pouco maior (isso dá folga quando o ABR reduz qualidade/resolução e a rede oscila):
+
+
+POLL_FPS_TARGET = 6.0       # antes 8.0
+READ_TIMEOUT = 20.0         # antes 15.0
+
+
+
+Mais nada muda no servidor ou no app. Seu app já alterna entre /snapshot do servidor e fallback direto no ESP; com o ABR ativo, as imagens deixam de travar quando a cena é “rica”.
+
+
+
+Firmware COMPLETO (ESP32-CAM) — com ABR incorporado
+
+
+
+
+Se preferir copiar/colar inteiro, aqui está seu arquivo já com as mudanças integradas (nome, rotas, CORS, UART — tudo igual ao seu, só com ABR + stream robusto + init ajustado):
+
+
+
+
+/*  HydroBot - ESP32-CAM em modo STA (roteador externo)  [COM ABR ANTITRAVA]
+    Endpoints: /  /status  /snapshot  /stream  /uart  /led  /restart
+    mDNS: http://hydrobot.local
+*/
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "esp_camera.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ====== CONFIG ======
+const char* WIFI_SSID   = "HydroBot";
+const char* WIFI_PASS   = "loud2025emibr";
+
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50);
+IPAddress gateway(192,168,0,1);
+IPAddress subnet(255,255,255,0);
+IPAddress dns1(8,8,8,8);
+IPAddress dns2(1,1,1,1);
+
+const char* MDNS_NAME = "hydrobot";
+
+#define UART_RX_PIN 15
+#define UART_TX_PIN 14
+#define UART_BAUD   115200
+#define STATUS_POLL_MS  1000
+
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+WebServer server(80);
+String lastStatusLine = "";
+static const int FLASH_PIN = 4;
+
+static const char* STREAM_BOUNDARY = "frame";
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+
+static const bool STREAM_HFLIP = false;
+static const bool STREAM_VFLIP = false;
+
+unsigned long lastWiFiCheck = 0;
+unsigned long lastStatusPoll = 0;
+
+// ---------- Util ----------
+void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS"); server.sendHeader("Access-Control-Allow-Headers","Content-Type"); }
+void handleOptions(){ addCORS(); server.send(204); }
+
+// ---------- UART ----------
+void initUART(){ Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN); }
+void pollArduinoStatus(){
+  static String rxBuf;
+  Serial2.print("REQ:STATUS\n");
+  while (Serial2.available()){
+    char c=(char)Serial2.read();
+    if(c=='\n'||c=='\r'){ if(rxBuf.length()>0){ if(rxBuf.startsWith("STAT:")) lastStatusLine=rxBuf; rxBuf=""; } }
+    else rxBuf+=c;
+  }
+}
+
+// ---- ABR (Adaptive Bitrate) ----
+static volatile uint8_t g_cur_quality = 14;
+static volatile framesize_t g_cur_framesize = FRAMESIZE_QVGA;
+
+struct AbrState { uint8_t q=14; framesize_t fs=FRAMESIZE_QVGA; uint32_t badStreak=0; uint32_t goodStreak=0; } g_abr;
+
+static inline void abr_on_frame(size_t jpeg_len, uint32_t capture_ms){
+  const size_t HEAVY=60*1024; const size_t LIGHT=35*1024; const uint32_t SLOW=150;
+  bool heavy=(jpeg_len>=HEAVY)||(capture_ms>=SLOW);
+  bool light=(jpeg_len<=LIGHT)&&(capture_ms<SLOW);
+
+  if(heavy){ g_abr.badStreak++; g_abr.goodStreak=0; }
+  else if(light){ g_abr.goodStreak++; g_abr.badStreak=0; }
+  else { g_abr.badStreak=0; g_abr.goodStreak=0; }
+
+  if(g_abr.badStreak>=2){
+    if(g_abr.q<18){ g_abr.q+=2; }
+    else if(g_abr.fs<FRAMESIZE_VGA){
+      g_abr.fs = (g_abr.fs==FRAMESIZE_QVGA)? FRAMESIZE_QQVGA : FRAMESIZE_QVGA;
+      g_abr.q  = 15;
+    }
+    sensor_t* s=esp_camera_sensor_get();
+    s->set_quality(s,g_abr.q);
+    s->set_framesize(s,g_abr.fs);
+    g_cur_quality=g_abr.q; g_cur_framesize=g_abr.fs;
+    g_abr.badStreak=0;
+  }
+  if(g_abr.goodStreak>=18){
+    if(g_abr.q>12) g_abr.q-=1;
+    else if(g_abr.fs<FRAMESIZE_VGA) g_abr.fs=FRAMESIZE_QVGA;
+    sensor_t* s=esp_camera_sensor_get();
+    s->set_quality(s,g_abr.q);
+    s->set_framesize(s,g_abr.fs);
+    g_cur_quality=g_abr.q; g_cur_framesize=g_abr.fs;
+    g_abr.goodStreak=0;
+  }
+}
+
+// ---------- Câmera ----------
+bool initCamera(){
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG,0);
+
+  camera_config_t config;
+  config.ledc_channel=LEDC_CHANNEL_0; config.ledc_timer=LEDC_TIMER_0;
+  config.pin_d0=Y2_GPIO_NUM; config.pin_d1=Y3_GPIO_NUM; config.pin_d2=Y4_GPIO_NUM; config.pin_d3=Y5_GPIO_NUM;
+  config.pin_d4=Y6_GPIO_NUM; config.pin_d5=Y7_GPIO_NUM; config.pin_d6=Y8_GPIO_NUM; config.pin_d7=Y9_GPIO_NUM;
+  config.pin_xclk=XCLK_GPIO_NUM; config.pin_pclk=PCLK_GPIO_NUM; config.pin_vsync=VSYNC_GPIO_NUM; config.pin_href=HREF_GPIO_NUM;
+  config.pin_sscb_sda=SIOD_GPIO_NUM; config.pin_sscb_scl=SIOC_GPIO_NUM;
+  config.pin_pwdn=PWDN_GPIO_NUM; config.pin_reset=RESET_GPIO_NUM;
+
+  config.xclk_freq_hz=20000000;
+  config.pixel_format=PIXFORMAT_JPEG;
+
+  config.frame_size  = FRAMESIZE_QVGA;
+  config.jpeg_quality= 14;
+  config.fb_count    = 2;
+  config.grab_mode   = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  if(esp_camera_init(&config)!=ESP_OK) return false;
+
+  sensor_t* s=esp_camera_sensor_get();
+  s->set_vflip(s,STREAM_VFLIP); s->set_hmirror(s,STREAM_HFLIP);
+  s->set_aec2(s,true); s->set_gainceiling(s,GAINCEILING_2X);
+  s->set_brightness(s,0); s->set_saturation(s,0);
+  return true;
+}
+
+// ---------- Handlers ----------
+void handleRoot(){
+  addCORS();
+  String html="<!doctype html><html><head><meta charset='utf-8'/>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+              "<title>HydroBot ESP32-CAM</title>"
+              "<style>body{font-family:system-ui;background:#0b0b0f;color:#e5e7eb;padding:16px}"
+              "a,button{background:#e6403a;color:#fff;padding:8px 12px;border:none;border-radius:8px;text-decoration:none;margin-right:8px}"
+              "code{background:#121218;padding:2px 6px;border-radius:6px}</style></head><body>";
+  html += "<h2>HydroBot ESP32-CAM (STA)</h2>";
+  html += "<p>IP: <code>"+WiFi.localIP().toString()+"</code> | RSSI: <code>"+String(WiFi.RSSI())+" dBm</code></p>";
+  html += "<p><a href='/snapshot'>/snapshot</a> <a href='/stream'>/stream</a> <a href='/status'>/status</a></p>";
+  html += "<p>mDNS: <code>http://"+String(MDNS_NAME)+".local</code></p>";
+  html += "<p>Último STATUS Arduino: <code>"+(lastStatusLine.length()?lastStatusLine:"(ainda não)")+"</code></p>";
+  html += "<p>ABR: quality="+String(g_cur_quality)+" framesize="+String((int)g_cur_framesize)+"</p>";
+  html += "</body></html>";
+  server.send(200,"text/html",html);
+}
+
+void handleStatus(){
+  addCORS();
+  String json="{";
+  json += "\"ip\":\""+WiFi.localIP().toString()+"\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"quality\":" + String(g_cur_quality) + ",";
+  json += "\"framesize\":" + String((int)g_cur_framesize) + ",";
+  json += "\"arduino_status\":\"" + lastStatusLine + "\"";
+  json += "}";
+  server.send(200,"application/json",json);
+}
+
+void handleSnapshot(){
+  addCORS();
+  uint32_t t0=millis();
+  camera_fb_t * fb = esp_camera_fb_get();
+  if(!fb){ server.send(503,"text/plain","Camera capture failed"); return; }
+  uint32_t cap_ms=millis()-t0;
+
+  abr_on_frame(fb->len, cap_ms);
+
+  server.sendHeader("Content-Type","image/jpeg");
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate, max-age=0");
+  server.send_P(200,"image/jpeg",(const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleStream(){
+  WiFiClient client=server.client();
+  client.println("HTTP/1.1 200 OK");
+  client.println(String("Content-Type: ")+STREAM_CONTENT_TYPE);
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.println("Access-Control-Allow-Origin: *");
+  client.println();
+
+  while(client.connected()){
+    uint32_t t0=millis();
+    camera_fb_t * fb = esp_camera_fb_get();
+    if(!fb) break;
+    uint32_t cap_ms=millis()-t0;
+    abr_on_frame(fb->len, cap_ms);
+
+    client.print("--"); client.println(STREAM_BOUNDARY);
+    client.println("Content-Type: image/jpeg");
+    client.print("Content-Length: "); client.println(fb->len);
+    client.println();
+
+    size_t toWrite=fb->len; const uint8_t* p=fb->buf;
+    while(toWrite>0){
+      size_t n = toWrite>1460 ? 1460 : toWrite;
+      size_t w = client.write(p,n);
+      if(w==0){ break; }
+      p+=w; toWrite-=w; delay(1);
+    }
+    client.println();
+    esp_camera_fb_return(fb);
+    delay(8);
+  }
+}
+
+void handleUART(){
+  addCORS();
+  if(server.method()==HTTP_OPTIONS){ handleOptions(); return; }
+  String cmd=server.arg("cmd");
+  if(!cmd.length()){ server.send(400,"application/json","{\"error\":\"use /uart?cmd=...\"}"); return; }
+  if(!cmd.endsWith("\n")) cmd+="\n";
+  Serial2.print(cmd);
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleLED(){
+  addCORS();
+  if(server.method()==HTTP_OPTIONS){ handleOptions(); return; }
+  int on=server.arg("on").toInt();
+  digitalWrite(FLASH_PIN, on?HIGH:LOW);
+  server.send(200,"application/json", String("{\"on\":")+(on?"true":"false")+"}");
+}
+
+void handleRestart(){
+  addCORS(); server.send(200,"application/json","{\"restarting\":true}"); delay(300); ESP.restart();
+}
+
+// ---------- Wi-Fi ----------
+void connectWiFi(){
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP,gateway,subnet,dns1,dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000) { delay(250); }
+}
+
+void setupServer(){
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/uart", HTTP_POST, handleUART);
+  server.on("/led", HTTP_POST, handleLED);
+  server.on("/restart", HTTP_POST, handleRestart);
+  server.onNotFound([](){ addCORS(); server.send(404,"application/json","{\"error\":\"not found\"}"); });
+  server.on("/uart", HTTP_OPTIONS, handleOptions);
+  server.on("/led", HTTP_OPTIONS, handleOptions);
+  server.on("/restart", HTTP_OPTIONS, handleOptions);
+  server.begin();
+}
+
+void setup(){
+  Serial.begin(115200); delay(200);
+  pinMode(FLASH_PIN, OUTPUT); digitalWrite(FLASH_PIN, LOW);
+  initUART();
+
+  if(!initCamera()){ delay(1000); initCamera(); }
+
+  connectWiFi();
+  if(WiFi.status()==WL_CONNECTED){ if(MDNS.begin(MDNS_NAME)){ MDNS.addService("http","tcp",80); } }
+  setupServer();
+}
+
+void loop(){
+  server.handleClient();
+  if(millis()-lastWiFiCheck>3000){ lastWiFiCheck=millis(); if(WiFi.status()!=WL_CONNECTED) connectWiFi(); }
+  if(millis()-lastStatusPoll>STATUS_POLL_MS){ lastStatusPoll=millis(); pollArduinoStatus(); }
+}
+
+
+
+
+Por que isso resolve o seu caso
+
+
+
+
+CAMERA_GRAB_LATEST impede que a fila cresça quando a leitura do cliente atrasa — em cenas “ricas”, o encode demora mais; em vez de acumular, você sempre pega o frame mais recente.
+
+
+ABR reduz qualidade e até resolução quando o JPEG passa de ~60 KB ou a captura passa de 150 ms. Quando estabiliza (frames leves <35 KB), volta a subir devagar.
+
+
+Envio em chunks (1460 B) no /stream evita estourar o buffer TCP de uma vez só.
+
+
+PSRAM + fb_count=2 ajuda o DMA a sempre ter onde escrever.
+
+
+Servidor com alvo de 6 fps e timeout maior encaixa com o ABR em redes mais ruidosas.
+
+
+
+
+Teste rápido:
+
+
+
+
+Flashe o firmware acima.
+
+
+Abra http://hydrobot.local/ e confira ABR: quality=.. framesize=.. mudando conforme aponta a câmera.
+
+
+No app, deixe o Server como o seu FastAPI e o ESP como hydrobot.local.
+
+
+Aponte para cena distante/detalhada: o vídeo deve reduzir um pouco a nitidez, mas não travar.
+
+
+
+
+Se ainda notar travas específicas do seu roteador, posso incluir:
+
+
+
+
+limite de Content-Length (cortar frames gigantes),
+
+
+“panic” reinit da câmera após N erros,
+
+
+opção para fixar FRAMESIZE_QQVGA em ambientes extremamente barulhentos.
+
+
+
+
+Quer que eu já deixe uma rota /config no ESP para fixar quality/framesize pelo app (sem reflashear)?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
   HydroBot - ESP32-CAM em modo STA (roteador externo)
   - Endpoints:
