@@ -1,4 +1,491 @@
 
+// ====== HydroBot – Driver, Modos (APP/AUTO) e Calibração Inteligente (versão refatorada) ======
+#include <Arduino.h>
+
+/* ========================== CONFIGURAÇÃO GERAL ========================== */
+// Ative 1 se for usar o servo. Se 1, o LED será deslocado para não conflitar com o pino do servo.
+#define HAVE_SERVO 0
+
+/* ---------------- PINAGEM ---------------- */
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define BOMBA_PIN 13
+
+#if HAVE_SERVO
+  #include <Servo.h>
+  Servo servoMangueira;
+  #define SERVO_PIN     12
+  #define SERVO_ESQ     45
+  #define SERVO_CENTRO 100
+  #define SERVO_DIR     135
+  #define LED_VERMELHO_PIN 3   // evita conflito com SERVO_PIN
+#else
+  #define LED_VERMELHO_PIN 12
+#endif
+
+#define BOTAO 7
+#define SENSOR_FOGO_ESQ_D 4
+#define SENSOR_FOGO_MEIO_D 5
+#define SENSOR_FOGO_DIR_D 6
+
+#define SENSOR_FOGO_ESQ  A2
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_DIR  A0
+#define NIVEL_AGUA_PIN   A3
+
+/* ========================== TIPOS E ESTADOS ========================== */
+enum Modo       : uint8_t { MODO_APP = 0, MODO_AUTO = 1 };
+enum Dir        : uint8_t { DIR_STOP=0, DIR_FWD, DIR_BACK, DIR_LEFT, DIR_RIGHT };
+enum AutoState  : uint8_t { AUTO_IDLE=0, AUTO_ATTACK_FWD, AUTO_ATTACK_BACK, AUTO_PATROL };
+
+struct FireSample {
+  bool digE, digM, digD;     // sensores digitais (LOW = fogo)
+  int  aE, aM, aD;           // analógicos
+  int  dE, dM, dD;           // base - atual (delta)
+  bool fogo;                 // houve fogo?
+  int  side;                 // -1 esq, 0 meio, +1 dir
+};
+
+struct State {
+  Modo modo = MODO_APP;
+  bool pumpOn = false;
+
+  // movimento
+  Dir currentDir = DIR_STOP;
+  bool motionActive = false;
+  unsigned long motionEndMs = 0;
+  unsigned long lastMoveCmdAt = 0;
+  uint8_t baseSpeed = 70;
+
+  // botão (manual sob demanda + troca de modo)
+  bool ultimoEstadoBotao = HIGH;
+  unsigned long lastDebounce = 0;
+
+  // calibração e EMA (somente no AUTO)
+  int baseEsq = 0, baseMeio = 0, baseDir = 0;
+  bool sistemaCalibrado = false;
+  unsigned long ultimaRecalibracao = 0;
+
+  // auto
+  AutoState autoState = AUTO_IDLE;
+  unsigned long autoStateUntil = 0;
+  int patrolPhase = 0;
+
+  // água
+  uint8_t nivelAguaPct = 0;
+
+  // LED água (digital/blink)
+  unsigned long ledToggleAt = 0;
+  bool ledBlinkState = false;
+} G;
+
+/* ========================== CONSTANTES ========================== */
+static const uint16_t TEMPO_CALIBRACAO_MS   = 3000;
+static const int      DIF_FOGO              = 150;
+static const int      SALTO_LUZ_RECALIB     = 200;
+static const uint32_t PER_RECALIB_MS        = 30000;
+static const uint8_t  EMA_ALPHA_NUM         = 1;
+static const uint8_t  EMA_ALPHA_DEN         = 16;
+
+static const uint16_t BTN_DEBOUNCE_MS       = 35;
+static const uint16_t MANUAL_BTN_HOLD_MS    = 40;   // leitura sob demanda enquanto segurado
+
+/* ========================== PROTÓTIPOS ========================== */
+void setupHardware();
+FireSample readSensors();
+void updateMotors(Dir d);
+void setMotion(Dir d, uint16_t ms);
+void pumpWrite(bool on);
+uint8_t waterPercent();
+void updateWaterLED(uint8_t pct);
+void emitStatus();
+
+void handleAutoMode();
+void handleManualMode();
+void autoCalibrateInitial();
+void emaBasesSemFogo(int aE, int aM, int aD);
+bool precisaRecalibrarPorLuz(int aE, int aM, int aD);
+void autoAimBySide(int side);
+void autoPatrolStep();
+
+void handleModeButtonToggle();
+void handleUARTLine(const String& s);
+
+/* ========================== IMPLEMENTAÇÃO ========================== */
+// --------- Motores ---------
+void motorsStop(){ digitalWrite(IN1,LOW);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,LOW); G.currentDir=DIR_STOP; }
+void motorsFwd(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_FWD; }
+void motorsBack(){ digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_BACK; }
+void motorsLeftTurn(){  digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); G.currentDir=DIR_LEFT; }
+void motorsRightTurn(){ digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH); G.currentDir=DIR_RIGHT; }
+
+void updateMotors(Dir d){
+  switch(d){
+    case DIR_FWD: motorsFwd(); break;
+    case DIR_BACK: motorsBack(); break;
+    case DIR_LEFT: motorsLeftTurn(); break;
+    case DIR_RIGHT: motorsRightTurn(); break;
+    default: motorsStop(); break;
+  }
+}
+
+void setMotion(Dir d, uint16_t ms){
+  if (ms==0 || d==DIR_STOP){ motorsStop(); G.motionActive=false; return; }
+  updateMotors(d);
+  G.motionActive = true;
+  G.motionEndMs = millis() + (unsigned long)ms;
+  G.lastMoveCmdAt = millis();
+}
+
+// --------- Bomba e Água ---------
+void pumpWrite(bool on){
+  G.pumpOn = on;
+  digitalWrite(BOMBA_PIN, on?HIGH:LOW);
+}
+
+uint8_t waterPercent(){
+  int raw = analogRead(NIVEL_AGUA_PIN);
+  int pct = map(raw,0,1023,0,100);
+  pct = constrain(pct,0,100);
+  return (uint8_t)pct;
+}
+
+// LED de água – DIGITAL (OFF/ON/BLINK)
+void updateWaterLED(uint8_t pct){
+  if (pct > 50){
+    digitalWrite(LED_VERMELHO_PIN, LOW); // apagado
+    return;
+  }
+  if (pct > 15){
+    digitalWrite(LED_VERMELHO_PIN, HIGH); // ligado fixo
+    return;
+  }
+  // < 15%: pisca rápido
+  if (millis() - G.ledToggleAt > 300){
+    G.ledToggleAt = millis();
+    G.ledBlinkState = !G.ledBlinkState;
+    digitalWrite(LED_VERMELHO_PIN, G.ledBlinkState ? HIGH : LOW);
+  }
+}
+
+// --------- Status ---------
+void emitStatus(){
+  int ax=analogRead(SENSOR_FOGO_ESQ), am=analogRead(SENSOR_FOGO_MEIO), ad=analogRead(SENSOR_FOGO_DIR);
+  Serial.print(F("STAT:ax="));Serial.print(ax);
+  Serial.print(F(":am="));Serial.print(am);
+  Serial.print(F(":ad="));Serial.print(ad);
+  Serial.print(F(":water="));Serial.print(G.nivelAguaPct);
+  Serial.print(F(":pump="));Serial.print(G.pumpOn?1:0);
+  Serial.print(F(":mode="));Serial.print((int)G.modo);
+  Serial.print(F(":auto="));Serial.println((int)G.autoState);
+}
+
+/* ========================== SENSORES E CALIBRAÇÃO ========================== */
+void autoCalibrateInitial(){
+  unsigned long t0=millis(); long sE=0,sM=0,sD=0; int n=0;
+  while(millis()-t0<TEMPO_CALIBRACAO_MS){
+    sE += analogRead(SENSOR_FOGO_ESQ);
+    sM += analogRead(SENSOR_FOGO_MEIO);
+    sD += analogRead(SENSOR_FOGO_DIR);
+    n++; delay(50);
+  }
+  if (n==0) n=1;
+  G.baseEsq  = sE/n;
+  G.baseMeio = sM/n;
+  G.baseDir  = sD/n;
+  G.sistemaCalibrado = true;
+  Serial.print(F("CALIB:E="));Serial.print(G.baseEsq);
+  Serial.print(F(" M="));Serial.print(G.baseMeio);
+  Serial.print(F(" D="));Serial.println(G.baseDir);
+}
+
+void emaBasesSemFogo(int aE,int aM,int aD){
+  G.baseEsq  = ((EMA_ALPHA_DEN-EMA_ALPHA_NUM)*G.baseEsq  + EMA_ALPHA_NUM*aE)/EMA_ALPHA_DEN;
+  G.baseMeio = ((EMA_ALPHA_DEN-EMA_ALPHA_NUM)*G.baseMeio + EMA_ALPHA_NUM*aM)/EMA_ALPHA_DEN;
+  G.baseDir  = ((EMA_ALPHA_DEN-EMA_ALPHA_NUM)*G.baseDir  + EMA_ALPHA_NUM*aD)/EMA_ALPHA_DEN;
+}
+
+bool precisaRecalibrarPorLuz(int aE,int aM,int aD){
+  return (abs(aE-G.baseEsq)>SALTO_LUZ_RECALIB) ||
+         (abs(aM-G.baseMeio)>SALTO_LUZ_RECALIB) ||
+         (abs(aD-G.baseDir)>SALTO_LUZ_RECALIB);
+}
+
+FireSample readSensors(){
+  FireSample s;
+  s.digE=(digitalRead(SENSOR_FOGO_ESQ_D)==LOW);
+  s.digM=(digitalRead(SENSOR_FOGO_MEIO_D)==LOW);
+  s.digD=(digitalRead(SENSOR_FOGO_DIR_D)==LOW);
+  s.aE=analogRead(SENSOR_FOGO_ESQ);
+  s.aM=analogRead(SENSOR_FOGO_MEIO);
+  s.aD=analogRead(SENSOR_FOGO_DIR);
+  s.dE=G.baseEsq - s.aE; s.dM=G.baseMeio - s.aM; s.dD=G.baseDir - s.aD;
+  bool fogoAnal=(s.dE>DIF_FOGO)||(s.dM>DIF_FOGO)||(s.dD>DIF_FOGO);
+  bool fogoDig =(s.digE||s.digM||s.digD);
+  s.fogo = fogoAnal || fogoDig;
+  int md=s.dM; s.side=0; if(s.dE>md){md=s.dE; s.side=-1;} if(s.dD>md){md=s.dD; s.side=+1;}
+  return s;
+}
+
+/* ========================== AUTO MODE ========================== */
+void autoAimBySide(int side){
+#if HAVE_SERVO
+  int tgt = (side<0?SERVO_DIR:(side>0?SERVO_ESQ:SERVO_CENTRO));
+  servoMangueira.write(tgt);
+#else
+  (void)side;
+#endif
+}
+
+void autoPatrolStep(){
+  switch(G.patrolPhase % 4){
+    case 0: setMotion(DIR_FWD,250);  break;
+    case 1: setMotion(DIR_LEFT,220); break;
+    case 2: setMotion(DIR_FWD,250);  break;
+    case 3: setMotion(DIR_RIGHT,220);break;
+  }
+  G.patrolPhase++;
+}
+
+void handleAutoMode(){
+  // calibração inicial e periódica apenas no AUTO
+  if (!G.sistemaCalibrado){ autoCalibrateInitial(); G.ultimaRecalibracao=millis(); return; }
+
+  FireSample s = readSensors();
+
+  // água + LED
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct<10 && G.pumpOn) pumpWrite(false);
+
+  // recalibra por salto de luz ou período
+  if ((millis()-G.ultimaRecalibracao>PER_RECALIB_MS) || precisaRecalibrarPorLuz(s.aE,s.aM,s.aD)){
+    Serial.println(F("AUTO:Recalibrando..."));
+    autoCalibrateInitial(); G.ultimaRecalibracao=millis(); return;
+  }
+
+  if (!s.fogo){
+    if (G.pumpOn) pumpWrite(false);
+#if HAVE_SERVO
+    servoMangueira.write(SERVO_CENTRO);
+#endif
+    if ((long)(millis()-G.autoStateUntil)>=0){
+      G.autoState = AUTO_PATROL; G.autoStateUntil=millis()+400; autoPatrolStep();
+    }
+    // EMA só sem fogo
+    emaBasesSemFogo(s.aE,s.aM,s.aD);
+    return;
+  }
+
+  // Combate
+  autoAimBySide(s.side);
+  if (G.nivelAguaPct>10) pumpWrite(true); else pumpWrite(false);
+
+  if (G.autoState==AUTO_IDLE || G.autoState==AUTO_PATROL || (long)(millis()-G.autoStateUntil)>=0){
+    static uint8_t forwardStrikes=0;
+    if (G.autoState!=AUTO_ATTACK_BACK){
+      G.autoState=AUTO_ATTACK_FWD; G.autoStateUntil=millis()+500;
+      if (s.side<0) setMotion(DIR_LEFT,160);
+      else if (s.side>0) setMotion(DIR_RIGHT,160);
+      else setMotion(DIR_FWD,220);
+      forwardStrikes++;
+      if (forwardStrikes>=3){
+        G.autoState=AUTO_ATTACK_BACK; G.autoStateUntil=millis()+600; setMotion(DIR_BACK,280); forwardStrikes=0;
+      }
+    } else {
+      G.autoState=AUTO_ATTACK_FWD; G.autoStateUntil=millis()+500; setMotion(DIR_FWD,220);
+    }
+  }
+}
+
+/* ========================== MANUAL MODE (sob demanda) ========================== */
+void handleManualMode(){
+  // Em manual, **nada automático**: sem calibração, sem EMA, sem servo automático.
+  // LED de água ainda informa nível (útil sempre).
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct<10 && G.pumpOn) pumpWrite(false);
+
+  // Leitura sob demanda: enquanto o botão estiver pressionado
+  static unsigned long btnPressStart = 0;
+  bool btnPressed = (digitalRead(BOTAO) == LOW);
+
+  if (btnPressed){
+    if (btnPressStart==0) btnPressStart = millis();
+    if (millis() - btnPressStart >= MANUAL_BTN_HOLD_MS){
+      FireSample s = readSensors(); // usa bases atuais (não recalibra aqui)
+      if (s.fogo){
+        if (G.nivelAguaPct>10) pumpWrite(true); else pumpWrite(false);
+        Serial.println(F("MANUAL:FOGO"));
+      } else {
+        pumpWrite(false);
+        Serial.println(F("MANUAL:SEM_FOGO"));
+      }
+    }
+  } else {
+    btnPressStart = 0;
+    // Soltou → bomba desliga (previsível)
+    pumpWrite(false);
+  }
+}
+
+/* ========================== ENTRADA (BOTÃO/MODO) ========================== */
+void handleModeButtonToggle(){
+  bool leitura = digitalRead(BOTAO);
+  if (leitura != G.ultimoEstadoBotao){
+    G.lastDebounce = millis();
+    G.ultimoEstadoBotao = leitura;
+  }
+  if ((millis()-G.lastDebounce) > BTN_DEBOUNCE_MS){
+    static bool prev = HIGH;
+    // Toggle no flanco de descida
+    if (prev==HIGH && leitura==LOW){
+      G.modo = (G.modo==MODO_APP) ? MODO_AUTO : MODO_APP;
+
+      // Ao trocar modo: zera estados para previsibilidade
+      motorsStop(); pumpWrite(false);
+#if HAVE_SERVO
+      servoMangueira.write(SERVO_CENTRO);
+#endif
+      G.autoState = AUTO_IDLE;
+
+      Serial.print(F("MODE:")); Serial.println(G.modo==MODO_APP?F("APP"):F("AUTO"));
+    }
+    prev = leitura;
+  }
+}
+
+/* ========================== UART / PROTOCOLO ========================== */
+void handleMoveCmd(const String&cmd){
+  uint16_t ms=200; int pms=cmd.indexOf("ms="); if(pms>=0) ms=(uint16_t)cmd.substring(pms+3).toInt();
+  ms = constrain(ms,80,700);
+  if      (cmd.indexOf("FWD")>=0)   setMotion(DIR_FWD,ms);
+  else if (cmd.indexOf("BACK")>=0)  setMotion(DIR_BACK,ms);
+  else if (cmd.indexOf("LEFT")>=0)  setMotion(DIR_LEFT,ms);
+  else if (cmd.indexOf("RIGHT")>=0) setMotion(DIR_RIGHT,ms);
+  else if (cmd.indexOf("STOP")>=0)  setMotion(DIR_STOP,0);
+}
+
+void handleUARTLine(const String& s){
+  // Sempre disponíveis:
+  if (s.startsWith("REQ:STATUS")){ emitStatus(); return; }
+  if (s.startsWith("SET:SPEED:")){ int v=s.substring(10).toInt(); G.baseSpeed=(uint8_t)constrain(v,0,100); Serial.println(F("OK:SPEED")); return; }
+  if (s.startsWith("SET:LED:"))  { int v=s.substring(8).toInt(); digitalWrite(LED_VERMELHO_PIN, v>0?HIGH:LOW); Serial.println(F("OK:LED")); return; }
+
+  // Manual: aceita comandos de direção e bomba
+  if (G.modo == MODO_APP){
+    if (s.indexOf("CMD:PUMP:")>=0){ bool on=s.endsWith("1"); if(on && waterPercent()<=15){ pumpWrite(false); Serial.println(F("WARN:NO_WATER")); } else { pumpWrite(on); Serial.println(on?F("OK:PUMP_ON"):F("OK:PUMP_OFF")); } return; }
+    if (s.startsWith("CMD:")){ handleMoveCmd(s); return; }
+    if (s.startsWith("CMD:CALIB")){ Serial.println(F("IGN:CALIB_MANUAL")); return; } // sem calib automática no manual
+  } else {
+    // No AUTO, permitir solicitar calibração explicitamente
+    if (s.startsWith("CMD:CALIB")){ G.sistemaCalibrado=false; Serial.println(F("OK:CALIB_REQUEST")); return; }
+    // Evita comandos de movimento ditando o AUTO; ainda assim STOP é permitido para segurança
+    if (s.indexOf("CMD:STOP")>=0){ setMotion(DIR_STOP,0); Serial.println(F("OK:STOP")); return; }
+    if (s.indexOf("CMD:PUMP:0")>=0){ pumpWrite(false); Serial.println(F("OK:PUMP_OFF")); return; }
+  }
+
+  Serial.println(F("ERR:UNKNOWN"));
+}
+
+/* ========================== SETUP / LOOP ========================== */
+void setupHardware(){
+  Serial.begin(115200);
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(BOMBA_PIN,OUTPUT); pumpWrite(false);
+  pinMode(LED_VERMELHO_PIN,OUTPUT); digitalWrite(LED_VERMELHO_PIN,LOW);
+
+  pinMode(BOTAO,INPUT_PULLUP);
+
+  pinMode(SENSOR_FOGO_ESQ_D,INPUT);
+  pinMode(SENSOR_FOGO_MEIO_D,INPUT);
+  pinMode(SENSOR_FOGO_DIR_D,INPUT);
+
+#if HAVE_SERVO
+  servoMangueira.attach(SERVO_PIN);
+  servoMangueira.write(SERVO_CENTRO);
+#endif
+
+  motorsStop();
+  Serial.println(F("ARDUINO_READY"));
+}
+
+void setup(){
+  setupHardware();
+  // Calibração inicial somente se iniciar já em AUTO.
+  if (G.modo == MODO_AUTO){
+    autoCalibrateInitial();
+    G.ultimaRecalibracao = millis();
+  }
+}
+
+void loop(){
+  // watchdog de movimento
+  if (G.motionActive && (long)(millis()-G.motionEndMs)>=0){ motorsStop(); G.motionActive=false; }
+  if ((millis()-G.lastMoveCmdAt)>1000 && G.currentDir!=DIR_STOP){ motorsStop(); G.motionActive=false; }
+
+  // troca de modo por botão (flanco)
+  handleModeButtonToggle();
+
+  // processar UART
+  while(Serial.available()){
+    static String line;
+    char c=Serial.read();
+    if(c=='\n'||c=='\r'){
+      if(line.length()>0){ String s=line; line=""; s.trim(); handleUARTLine(s); }
+    } else {
+      line += c; if(line.length()>240) line.remove(0);
+    }
+  }
+
+  // modos
+  if (G.modo == MODO_APP){
+    handleManualMode();     // somente leitura sob demanda (botão)
+  } else {
+    handleAutoMode();       // toda lógica automática e calib/EMA vivem aqui
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito—vou adaptar apenas o necessário para casar com o seu firmware atual (STA, endpoints /status, /snapshot, /stream, POST /uart|/led|/restart, mDNS hydrobot.local). Abaixo vão dois arquivos completos:
 
 
