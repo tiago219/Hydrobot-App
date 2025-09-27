@@ -1,3 +1,178 @@
+
+Beleza — hasFrame:false no /healthz significa que o servidor ainda não conseguiu ler o /stream do ESP. O mais comum é:
+
+
+
+
+o servidor está tentando hydrobot.local (mDNS) e não resolve;
+
+
+o ESP não está acessível pelo IP certo;
+
+
+o stream /stream não está abrindo (rede/sub-rede diferentes ou firewall).
+
+
+
+
+Faça isso, na ordem, e não precisa mudar código:
+
+
+1) Confirme o IP real do ESP
+
+
+
+
+No Serial Monitor do Arduino IDE aparece o IP ao conectar (“WiFi: 192.168.x.y”).
+
+
+Ou entre em http://hydrobot.local/ pelo celular/PC — se abrir a página do ESP, copie o IP exibido.
+
+
+
+
+2) Diga ao servidor qual IP usar
+
+
+Abra o Swagger do FastAPI no PC onde o servidor roda:
+
+http://SEU_SERVIDOR:8000/docs
+
+
+
+
+Clique em POST /config → Try it out → em camera_ip coloque o IP do ESP, por ex.:
+
+{ "camera_ip": "192.168.3.3" }
+
+
+
+
+
+Execute → deve retornar {ok:true, camera_ip:"192.168.3.3"}.
+
+
+
+
+
+
+Alternativas se preferir linha de comando:
+
+curl -X POST http://SEU_SERVIDOR:8000/config -H "Content-Type: application/json" -d '{"camera_ip":"192.168.3.3"}'
+
+
+
+
+3) Teste direto no ESP
+
+
+No mesmo PC do servidor, abra:
+
+
+
+
+http://192.168.3.3/snapshot → deve baixar uma foto.
+
+
+http://192.168.3.3/stream → deve abrir o MJPEG (página “quebrando” com imagens trocando).
+
+
+
+
+Se isso não abrir, o problema é rede (sub-redes diferentes, firewall do PC/roteador, ESP não conectado ao mesmo Wi-Fi).
+
+
+4) Volte ao /healthz
+
+
+Abra http://SEU_SERVIDOR:8000/healthz. Se tudo ok, verá algo como:
+
+
+{"ok":true,"camera_ip":"192.168.3.3","ip":"192.168.3.3","hasFrame":true,"age_ms":...,"fps_in":...,"last_err":null}
+
+
+
+
+Se ainda ficar hasFrame:false
+
+
+Cheque estes pontos rápidos:
+
+
+
+
+mDNS não funciona no seu PC/roteador → use IP numérico e sempre faça o POST /config.
+
+
+Firewall do servidor: permita saída HTTP (porta 80) e entrada na porta 8000 (se o app acessa de outro dispositivo).
+
+
+Sub-rede: PC (servidor) e ESP precisam estar na mesma (ex.: 192.168.3.*).
+
+
+ESP: confirme /stream está respondendo; se cair, baixe a pressão:
+
+
+
+no .ino, deixe FRAMESIZE_QVGA e JPEG_QUALITY 30;
+
+
+aumente STREAM_MIN_DELAY_MS para 90–110 ms;
+
+
+mantenha WiFi.setSleep(false);
+
+
+fonte 5 V robusta.
+
+
+
+
+
+
+
+
+Se quiser, me diga o IP do ESP e o IP do servidor (e se /snapshot abre direto no browser). Com isso eu te digo exatamente onde está o gargalo.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito. Abaixo estão os três códigos completos já ajustados para eliminar os crashes:
 
 
