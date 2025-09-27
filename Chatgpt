@@ -1,4 +1,1006 @@
 
+Show! Aqui vão os códigos completos já com o P&B controlado direto no ESP via POST /cam e o app com o botão que liga/desliga isso em tempo real.
+
+
+
+1) ESP32-CAM (firmware completo, com /cam)
+
+
+
+
+Baseado no seu sketch anterior, adicionei: helpers de câmera, handleCam(), e o registro das rotas. Mantive seus endpoints originais e a lógica de STA, UART, snapshot/stream, etc.
+
+
+
+
+/*
+  HydroBot - ESP32-CAM em modo STA (roteador externo)
+  - Endpoints:
+      GET  /              -> página info rápida
+      GET  /status        -> JSON (uptime, RSSI, heap, ip, último STATUS do Arduino)
+      GET  /snapshot      -> JPEG único
+      GET  /stream        -> MJPEG stream
+      POST /uart?cmd=...  -> envia comando na UART para o Arduino (ex: CMD:FWD:ms=400:spd=70)
+      POST /led?on=0|1    -> liga/desliga flash (GPIO 4)
+      POST /restart       -> reinicia ESP
+      POST /cam?gray=0|1[&q=10..63][&size=qqvga|qvga|vga|svga|xga|sxga|uxga]
+                          -> ajusta câmera em tempo real (P&B, qualidade, resolução)
+  - mDNS: http://hydrobot.local
+  - CORS: Access-Control-Allow-Origin: *
+  - UART: Serial2 (pinos configuráveis abaixo). ESP requisita "REQ:STATUS\n" periodicamente e armazena última linha "STAT:...".
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "esp_camera.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ====== CONFIG ======
+const char* WIFI_SSID   = "HydroBot";
+const char* WIFI_PASS   = "loud2025emibr";
+
+// (Opcional) IP fixo – deixe comentado se preferir DHCP
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50);
+IPAddress gateway(192,168,0,1);
+IPAddress subnet(255,255,255,0);
+IPAddress dns1(8,8,8,8);
+IPAddress dns2(1,1,1,1);
+
+// mDNS
+const char* MDNS_NAME = "hydrobot"; // http://hydrobot.local
+
+// UART com Arduino (ajuste conforme seu fio)
+// Recomenda-se ESP32-CAM: RX=15, TX=14 (costuma estar disponível nesse módulo)
+#define UART_RX_PIN 15
+#define UART_TX_PIN 14
+#define UART_BAUD   115200
+
+// Requisição periódica ao Arduino
+#define STATUS_POLL_MS  1000
+
+// Camera: selecione pinos do modelo AI Thinker
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// ====== FIM CONFIG ======
+
+// Servidor HTTP
+WebServer server(80);
+
+// Buffer do último STATUS do Arduino
+String lastStatusLine = "";
+
+// Controle de LED do flash (AI Thinker usa GPIO 4 pra lâmpada)
+static const int FLASH_PIN = 4;
+
+// Controle de stream
+static const char* STREAM_BOUNDARY = "frame";
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" "frame";
+static const int STREAM_QUALITY = 12;   // 10..20 (mais baixo = melhor qualidade, porém mais pesado)
+static const bool STREAM_HFLIP = false; // espelhar horizontal
+static const bool STREAM_VFLIP = false; // espelhar vertical
+
+// Watchdog / reconexão
+unsigned long lastWiFiCheck = 0;
+unsigned long lastStatusPoll = 0;
+
+// ---------- Util ----------
+void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() {
+  addCORS();
+  server.send(204);
+}
+
+// ---------- UART ----------
+void initUART() {
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+}
+void pollArduinoStatus() {
+  static String rxBuf;
+  // Solicita status
+  Serial2.print("REQ:STATUS\n");
+  // Lê o que chegou desde a última chamada
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\n' || c == '\r') {
+      if (rxBuf.length() > 0) {
+        // Guarda última linha completa
+        if (rxBuf.startsWith("STAT:")) {
+          lastStatusLine = rxBuf;
+        }
+        rxBuf = "";
+      }
+    } else {
+      rxBuf += c;
+    }
+  }
+}
+
+// ---------- Câmera ----------
+bool initCamera() {
+  // Evitar brownout reset
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // >>> Recomendações p/ estabilidade (pode manter seus valores, mas estes ajudam):
+  config.xclk_freq_hz = 10000000;   // 10 MHz deixa PSRAM/encoder mais estável (pode usar 20 MHz se quiser)
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;   // você usava VGA; pode mudar em runtime via /cam
+  config.jpeg_quality = 12;              // 10..20 (10 melhor). Também ajustável via /cam (q=10..63 na API do driver)
+  config.fb_count     = 2;               // pode reduzir pra 1 se ainda houver travas
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    return false;
+  }
+
+  // Efeitos básicos
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_vflip(s, STREAM_VFLIP);
+  s->set_hmirror(s, STREAM_HFLIP);
+
+  return true;
+}
+
+// ---- Ajustes dinâmicos de câmera (sem reinicializar) ----
+bool applyCameraTweaks(bool gray, int quality /*10..63*/, framesize_t fs /*ou 0 p/ manter*/) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+
+  // P&B direto no sensor (efeito leve e eficiente)
+  s->set_special_effect(s, gray ? 2 : 0);     // 2 = GRAYSCALE
+  // Reduz saturação no colorido também (ajuda em cenas "vermelho forte")
+  s->set_saturation(s, gray ? -2 : 0);
+
+  // Estabiliza exposição/balanço para evitar "picos" de bytes
+  s->set_awb(s, 0);           // trava AWB (mais previsível)
+  s->set_wb_mode(s, 0);       // modo "auto" como base
+  s->set_aec2(s, 0);
+  s->set_ae_level(s, -1);     // leve underexposure reduz ruído/bytes
+
+  if (quality >= 10 && quality <= 63) {
+    // ATENÇÃO: na API do driver, 'quality' MAIOR = MAIS compressão = arquivo MENOR
+    s->set_quality(s, quality);
+  }
+  if (fs != 0) {
+    s->set_framesize(s, fs);
+  }
+  return true;
+}
+
+// Converte string "qqvga|qvga|vga|svga|xga|sxga|uxga" em framesize_t
+framesize_t parse_framesize(const String& name) {
+  String n = name; n.toLowerCase();
+  if (n == "qqvga") return FRAMESIZE_QQVGA;   // 160x120
+  if (n == "qvga")  return FRAMESIZE_QVGA;    // 320x240
+  if (n == "vga")   return FRAMESIZE_VGA;     // 640x480
+  if (n == "svga")  return FRAMESIZE_SVGA;
+  if (n == "xga")   return FRAMESIZE_XGA;
+  if (n == "sxga")  return FRAMESIZE_SXGA;
+  if (n == "uxga")  return FRAMESIZE_UXGA;
+  return (framesize_t)0;
+}
+
+// ---------- Handlers HTTP ----------
+void handleRoot() {
+  addCORS();
+  String html = "<!doctype html><html><head><meta charset='utf-8'/>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+                "<title>HydroBot ESP32-CAM</title>"
+                "<style>body{font-family:system-ui;background:#0b0b0f;color:#e5e7eb;padding:16px}"
+                "a,button{background:#e6403a;color:#fff;padding:8px 12px;border:none;border-radius:8px;text-decoration:none;margin-right:8px}"
+                "code{background:#121218;padding:2px 6px;border-radius:6px}</style></head><body>";
+  html += "<h2>HydroBot ESP32-CAM (STA)</h2>";
+  html += "<p>IP: <code>" + WiFi.localIP().toString() + "</code> | RSSI: <code>" + String(WiFi.RSSI()) + " dBm</code></p>";
+  html += "<p><a href='/snapshot'>/snapshot</a> <a href='/stream'>/stream</a> <a href='/status'>/status</a></p>";
+  html += "<p>mDNS: <code>http://" + String(MDNS_NAME) + ".local</code></p>";
+  html += "<p>Último STATUS Arduino: <code>" + (lastStatusLine.length() ? lastStatusLine : "(ainda não)") + "</code></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  addCORS();
+  // Monta JSON simples
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  // Se quiser, parse do lastStatusLine -> chave:valor
+  json += "\"arduino_status\":\"" + lastStatusLine + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSnapshot() {
+  addCORS();
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(503, "text/plain", "Camera capture failed");
+    return;
+  }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  // Cabeçalhos do stream
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: " + String(STREAM_CONTENT_TYPE));
+  client.println("Access-Control-Allow-Origin: *");
+  client.println();
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    client.println("--" + String(STREAM_BOUNDARY));
+    client.println("Content-Type: image/jpeg");
+    client.println("Content-Length: " + String(fb->len));
+    client.println();
+    client.write(fb->buf, fb->len);
+    client.println();
+    esp_camera_fb_return(fb);
+
+    // Pequena folga
+    delay(10);
+  }
+}
+
+void handleUART() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  String cmd = server.arg("cmd");
+  if (!cmd.length()) {
+    server.send(400, "application/json", "{\"error\":\"use /uart?cmd=...\"}");
+    return;
+  }
+  // Garante terminador de linha
+  if (!cmd.endsWith("\n")) cmd += "\n";
+  Serial2.print(cmd);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleLED() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  int on = server.arg("on").toInt();
+  digitalWrite(FLASH_PIN, on ? HIGH : LOW);
+  server.send(200, "application/json", String("{\"on\":") + (on? "true":"false") + "}");
+}
+
+void handleRestart() {
+  addCORS();
+  server.send(200, "application/json", "{\"restarting\":true}");
+  delay(300);
+  ESP.restart();
+}
+
+// Novo: POST /cam -> ajusta P&B, qualidade, e resolução em runtime
+void handleCam() {
+  addCORS();
+  if (server.method() == HTTP_OPTIONS) { handleOptions(); return; }
+  bool gray = server.hasArg("gray") ? (server.arg("gray").toInt() ? true:false) : false;
+  int  q    = server.hasArg("q")    ? server.arg("q").toInt() : -1;
+  framesize_t fs = 0;
+  if (server.hasArg("size")) {
+    fs = parse_framesize(server.arg("size"));
+  }
+
+  bool ok = applyCameraTweaks(gray, q, fs);
+  String resp = String("{\"ok\":") + (ok ? "true" : "false") +
+                ",\"gray\":" + (gray?"true":"false") +
+                (q>=0 ? String(",\"q\":")+q : "") +
+                (server.hasArg("size") ? String(",\"size\":\"")+server.arg("size")+"\"" : "") +
+                "}";
+  server.send(ok?200:500, "application/json", resp);
+}
+
+// ---------- Wi-Fi ----------
+void connectWiFi() {
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+  }
+}
+
+void setupServer() {
+  // Rotas
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/uart", HTTP_POST, handleUART);
+  server.on("/led", HTTP_POST, handleLED);
+  server.on("/restart", HTTP_POST, handleRestart);
+
+  // Novo endpoint de câmera
+  server.on("/cam", HTTP_POST, handleCam);
+
+  // CORS preflight
+  server.onNotFound([](){
+    addCORS();
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+  server.on("/uart", HTTP_OPTIONS, handleOptions);
+  server.on("/led", HTTP_OPTIONS, handleOptions);
+  server.on("/restart", HTTP_OPTIONS, handleOptions);
+  server.on("/cam", HTTP_OPTIONS, handleOptions);
+
+  server.begin();
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  // Logs seriais (opcional). Evite compartilhar TX0/RX0 com Arduino se usar USB.
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(FLASH_PIN, LOW);
+
+  // UART secundária com Arduino
+  initUART();
+
+  // Câmera
+  if (!initCamera()) {
+    // Tente outra vez
+    delay(1000);
+    initCamera();
+  }
+
+  // Wi-Fi
+  connectWiFi();
+
+  // mDNS
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(MDNS_NAME)) {
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+
+  // HTTP
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Watch Wi-Fi & reconectar
+  if (millis() - lastWiFiCheck > 3000) {
+    lastWiFiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      connectWiFi();
+    }
+  }
+
+  // Poll do STATUS no Arduino
+  if (millis() - lastStatusPoll > STATUS_POLL_MS) {
+    lastStatusPoll = millis();
+    pollArduinoStatus();
+  }
+}
+
+
+
+
+2) CameraScreen.tsx (com botão P&B que chama /cam)
+
+
+
+
+É a sua tela com watchdog anti-congelamento, joystick por UART, LED, bomba via UART, e agora toggle P&B que aciona o endpoint do ESP. (Mantive o vídeo por snapshot do servidor com fallbacks.)
+
+
+
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet,
+  PanResponder, GestureResponderEvent, PanResponderGestureState,
+  Image, Animated, LayoutChangeEvent,
+} from "react-native";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+
+const textsByLang = {
+  pt: { heroSubtitle:"Monitoramento e Controle", espIp:"ESP:", pumpOn:"BOMBA ON", pumpOff:"BOMBA OFF",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Aguardando servidor…", statusFail:"Falha ao conectar. Confira o Wi-Fi/IP.",
+        noVideo:"Sem vídeo (snapshot). Verifique o servidor.", fireOn:(s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sem fogo • score ${s.toFixed(2)}`, synced:"Server sincronizado",
+        placeholderIp:"hydrobot.local", placeholderServer:"http://192.168.0.100:8000",
+        ledOn:"LED ON", ledOff:"LED OFF", bwOn:"P&B ON", bwOff:"P&B OFF" },
+  en: { heroSubtitle:"Monitoring & Control", espIp:"ESP:", pumpOn:"PUMP ON", pumpOff:"PUMP OFF",
+        server:"Server:", detecting:"Detecting…", waiting:"Waiting for server…", statusFail:"Failed to connect. Check Wi-Fi/IP.",
+        noVideo:"No video (snapshot). Check server.", fireOn:(s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`No fire • score ${s.toFixed(2)}`, synced:"Server sync OK",
+        placeholderIp:"hydrobot.local", placeholderServer:"http://192.168.0.100:8000",
+        ledOn:"LED ON", ledOff:"LED OFF", bwOn:"B/W ON", bwOff:"B/W OFF" },
+  es: { heroSubtitle:"Monitoreo y Control", espIp:"ESP:", pumpOn:"BOMBA ENC.", pumpOff:"BOMBA APAG.",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Esperando servidor…", statusFail:"Error de conexión. Revisa Wi-Fi/IP.",
+        noVideo:"Sin vídeo (snapshot). Revisa el servidor.", fireOn:(s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sin fuego • score ${s.toFixed(2)}`, synced:"Sincronizado con servidor",
+        placeholderIp:"hydrobot.local", placeholderServer:"http://192.168.0.100:8000",
+        ledOn:"LED ON", ledOff:"LED OFF", bwOn:"BN ON", bwOff:"BN OFF" },
+};
+
+const DEFAULT_IP = "hydrobot.local";
+const DEFAULT_SERVER = "http://192.168.0.100:8000";
+const DEFAULT_FRAME_WH = { w: 320, h: 240 };
+
+const LOAD_TIMEOUT_MS = 900;   // watchdog por frame
+const GLOBAL_STALL_MS  = 2500; // sem sucesso por esse tempo => força fallback
+
+const appLogo = require("../../assets/logo.png");
+
+/* ---------- UI ---------- */
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+function CrossfadeImage({
+  currentUri, nextUri, onNextLoadStart, onNextShown,
+}: { currentUri: string; nextUri: string; onNextLoadStart: () => void; onNextShown: (ok: boolean) => void; }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  const clearWatchdog = () => { if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; } };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            key={nextUri}
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={() => {
+              onNextLoadStart();
+              clearWatchdog();
+              watchdogRef.current = setTimeout(() => { onNextShown(false); clearWatchdog(); }, LOAD_TIMEOUT_MS);
+            }}
+            onError={() => { clearWatchdog(); onNextShown(false); fade.setValue(0); setShowNext(false); }}
+            onLoadEnd={() => {
+              clearWatchdog();
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown(true); fade.setValue(0); setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+type SrcBox = { x:number; y:number; w:number; h:number; type:"fire" };
+function BoxesOverlay({ frameWH, containerWH, boxes }:{
+  frameWH:{w:number;h:number}|null; containerWH:{w:number;h:number}|null; boxes:SrcBox[];
+}) {
+  const f = frameWH && frameWH.w>0 && frameWH.h>0 ? frameWH : DEFAULT_FRAME_WH;
+  if (!containerWH || containerWH.w<=0 || containerWH.h<=0) return null;
+  const scale = Math.min(containerWH.w / f.w, containerWH.h / f.h);
+  const dispW = f.w * scale, dispH = f.h * scale;
+  const offsetX = (containerWH.w - dispW)/2, offsetY = (containerWH.h - dispH)/2;
+  return (
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+      <View style={{ position:"absolute", left:offsetX, top:offsetY, width:dispW, height:dispH }}>
+        {boxes.map((b,i)=>{
+          const left=b.x*scale, top=b.y*scale, width=b.w*scale, height=b.h*scale;
+          return (
+            <View key={i} style={{ position:"absolute", left, top, width, height, borderWidth:3, borderColor:"#ff3b30", borderRadius:6 }}>
+              <View style={{ position:"absolute", left:0, top:-18, paddingHorizontal:6, paddingVertical:2, borderRadius:4, backgroundColor:"#ff3b30" }}>
+                <Text style={{ color:"#000", fontWeight:"800", fontSize:10 }}>FOGO</Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+/* ---------- SCREEN ---------- */
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  const [ip, setIp] = useState(DEFAULT_IP);
+  const [server, setServer] = useState(DEFAULT_SERVER);
+
+  const [statusText, setStatusText] = useState(T.waiting);
+  const [pumpOn, setPumpOn] = useState(false);
+  const [isFire, setIsFire] = useState(false);
+  const [fireScore, setFireScore] = useState(0);
+  const [overlayBoxes, setOverlayBoxes] = useState<SrcBox[]>([]);
+  const [frameWH, setFrameWH] = useState<{w:number;h:number}|null>(null);
+  const [videoContainerWH, setVideoContainerWH] = useState<{w:number;h:number}|null>(null);
+
+  const [currentFrameUri, setCurrentFrameUri] = useState("");
+  const [nextFrameUri, setNextFrameUri] = useState("");
+  const loadingNextRef = useRef(false);
+
+  const [useDirectSnapshot, setUseDirectSnapshot] = useState(false);
+  const failCountRef = useRef(0);
+  const lastFrameOkTsRef = useRef<number>(Date.now());
+
+  // Toggle P&B no ESP (controla encoder da câmera)
+  const [bw, setBw] = useState<boolean>(false);
+
+  const [joy, setJoy] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  const clean = (s:string)=>s.replace(/\/+$/,"");
+
+  // Server endpoints
+  const healthUrl     = useMemo(()=>`${clean(server)}/healthz`,[server]);
+  const detectUrl     = useMemo(()=>`${clean(server)}/detect`,[server]);
+  const snapshotSrv   = useMemo(()=>`${clean(server)}/snapshot`,[server]);
+  const snapshotSrvAlt= useMemo(()=>`${clean(server)}/frame.jpg`,[server]);
+  const configUrl     = useMemo(()=>`${clean(server)}/config`,[server]);
+
+  // ESP endpoints
+  const snapshotEsp   = useMemo(()=> `http://${ip}/snapshot`, [ip]);
+  const uartPost      = useMemo(()=> (cmd:string)=>`http://${ip}/uart?cmd=${encodeURIComponent(cmd)}`, [ip]);
+  const ledPost       = useMemo(()=> (on:boolean)=>`http://${ip}/led?on=${on?1:0}`, [ip]);
+  const camPost       = useMemo(()=> (params:string)=>`http://${ip}/cam${params?("?"+params):""}`, [ip]);
+
+  // Liga/desliga P&B no ESP (ajusta também qualidade e tamanho recomendados)
+  async function setCameraGray(on:boolean) {
+    try {
+      // Dica: q=20 (mais compressão) + size=qvga derrubam bastante os bytes por frame
+      const params = on ? "gray=1&q=20&size=qvga" : "gray=0";
+      const res = await fetch(camPost(params), { method: "POST" });
+      return res.ok;
+    } catch { return false; }
+  }
+
+  // Sincroniza IP da câmera no server
+  useEffect(()=>{
+    let aborted=false;
+    (async()=>{
+      try{
+        const r=await fetch(configUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_ip:ip})});
+        const j=await r.json();
+        if(!aborted && j?.ok) setStatusText(`${T.synced} (${j.camera_ip})`);
+      }catch{ if(!aborted) setStatusText(T.statusFail); }
+    })();
+    return()=>{aborted=true};
+  },[ip, configUrl, T]);
+
+  // Health do servidor
+  useEffect(()=>{
+    let stop=false, backoff=500;
+    const poll=async()=>{
+      if(stop) return;
+      try{
+        const r=await fetch(healthUrl); const j=await r.json();
+        if(j?.ok){ setStatusText(`Server OK • fps_in:${j.fps_in} • hasFrame:${j.hasFrame}`); return; }
+      }catch{}
+      setStatusText(T.waiting);
+      setTimeout(poll, backoff); backoff=Math.min(backoff*1.6, 5000);
+    };
+    poll(); return()=>{stop=true};
+  },[healthUrl, T]);
+
+  // SNAPSHOT loop com fallback (server -> alt -> direto ESP)
+  useEffect(()=>{
+    let stop=false, interval=160;
+
+    const pickBase = ()=>{
+      if (useDirectSnapshot) return snapshotEsp;
+      return failCountRef.current >= 2 ? snapshotSrvAlt : snapshotSrv;
+    };
+
+    setCurrentFrameUri(`${pickBase()}?ts=${Date.now()}`);
+    const tick=()=>{
+      if(stop) return;
+      try{
+        if(!loadingNextRef.current){
+          const base = pickBase();
+          setNextFrameUri(`${base}?ts=${Date.now()}&n=${Math.random().toString(36).slice(2,7)}`);
+        }
+        interval=160;
+      }catch{
+        interval=Math.min(interval*1.7, 1200);
+      }
+      setTimeout(tick, interval);
+    };
+    tick();
+    return()=>{stop=true};
+  },[snapshotSrv, snapshotSrvAlt, snapshotEsp, useDirectSnapshot]);
+
+  const onNextLoadStart = ()=>{ loadingNextRef.current=true; };
+  const onNextShown = (ok:boolean)=>{
+    if(ok){
+      failCountRef.current = 0;
+      lastFrameOkTsRef.current = Date.now();
+      if(useDirectSnapshot){ /* mantém se necessário */ }
+      if(nextFrameUri) setCurrentFrameUri(nextFrameUri);
+    }else{
+      failCountRef.current += 1;
+      if(!useDirectSnapshot && failCountRef.current >= 3){
+        setUseDirectSnapshot(true);  // cai pro snapshot direto do ESP
+        failCountRef.current = 0;
+      }
+    }
+    loadingNextRef.current=false;
+  };
+
+  // Descongelador global
+  useEffect(()=>{
+    let stop=false;
+    const guard=()=>{
+      if(stop) return;
+      const idle = Date.now() - lastFrameOkTsRef.current;
+      if(idle > GLOBAL_STALL_MS){
+        setUseDirectSnapshot(true); // último recurso
+        failCountRef.current = 0;
+        lastFrameOkTsRef.current = Date.now();
+      }
+      setTimeout(guard, 400);
+    };
+    guard();
+    return()=>{stop=true};
+  },[]);
+
+  // DETECT loop (servidor)
+  useEffect(()=>{
+    let stop=false, interval=250;
+    const loop=async()=>{
+      if(stop) return;
+      try{
+        const r=await fetch(detectUrl); const j=await r.json();
+        if(j && j.ok!==false){
+          setIsFire(!!j.isFire); setFireScore(Number(j.score||0));
+          const wh = Array.isArray(j.frame_wh)&&j.frame_wh.length===2
+                     ? {w:Number(j.frame_wh[0])||0, h:Number(j.frame_wh[1])||0}:null;
+          if(wh && wh.w>0 && wh.h>0) setFrameWH(wh);
+          const boxes:SrcBox[]=[];
+          if(j.isFire && Array.isArray(j.boxes)){
+            for(const b of j.boxes){
+              if(Array.isArray(b)&&b.length>=4){
+                const [x,y,w,h]=b.map((n:any)=>Number(n)||0);
+                boxes.push({x,y,w,h,type:"fire"});
+              }
+            }
+          }
+          setOverlayBoxes(boxes); interval=250;
+        }
+      }catch{
+        setIsFire(false); setFireScore(0); setOverlayBoxes([]);
+        interval=Math.min(interval*1.5,1500);
+      }finally{ setTimeout(loop, interval); }
+    };
+    loop(); return()=>{stop=true};
+  },[detectUrl]);
+
+  // ------- COMANDOS (UART + LED) -------
+  async function sendUART(cmd: string) {
+    try {
+      const res = await fetch(uartPost(cmd), { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return true;
+    } catch {
+      setStatusText(T.statusFail);
+      return false;
+    }
+  }
+  async function togglePump(){
+    const target = !pumpOn;
+    const ok = await sendUART(`CMD:PUMP:${target ? "1" : "0"}`);
+    if (ok) setPumpOn(target);
+  }
+  async function led(on:boolean){
+    try{
+      const res = await fetch(ledPost(on), { method: "POST" });
+      const txt = await res.text();
+      setStatusText(`${on?T.ledOn:T.ledOff} • ${res.status} ${txt||""}`);
+    }catch{
+      setStatusText(T.statusFail);
+    }
+  }
+
+  // Joystick -> pulsos discretos via UART
+  const RADIUS=64;
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder:()=>true,
+      onMoveShouldSetPanResponder:()=>true,
+      onPanResponderGrant:()=>{ setDragging(true); },
+      onPanResponderMove:(_e:GestureResponderEvent,g:PanResponderGestureState)=>{
+        let nx=g.dx/RADIUS, ny=g.dy/RADIUS;
+        const len=Math.hypot(nx,ny); if(len>1){ nx/=len; ny/=len; }
+        setJoy({x:nx, y:-ny});
+      },
+      onPanResponderRelease:()=>{ setJoy({x:0,y:0}); setDragging(false); },
+      onPanResponderTerminate:()=>{ setJoy({x:0,y:0}); setDragging(false); },
+    })
+  ).current;
+
+  const lastSendRef = useRef(0);
+  const lastDirRef  = useRef<string>("STOP");
+  const vecToDir=(x:number,y:number):"FWD"|"BACK"|"LEFT"|"RIGHT"|"STOP"=>{
+    const mag=Math.hypot(x,y); if(mag<0.2) return "STOP";
+    const deg=(Math.atan2(y,x)*180)/Math.PI;
+    if(deg>-45&&deg<=45) return "RIGHT";
+    if(deg>45&&deg<=135) return "FWD";
+    if(deg<=-45&&deg>-135) return "BACK";
+    return "LEFT";
+  };
+
+  useEffect(()=>{
+    let cancelled=false;
+    const tick=async()=>{
+      if(cancelled) return;
+      const now=Date.now();
+      if(now-lastSendRef.current<120){ setTimeout(tick,20); return; }
+      lastSendRef.current=now;
+
+      const {x,y}=joy; const mag=Math.hypot(x,y); const dir=vecToDir(x,y);
+      if(dir!==lastDirRef.current){
+        if(dir==="STOP"){ await sendUART("CMD:STOP"); }
+        else{
+          const ms=140+Math.round(260*Math.min(1,mag));
+          const spd=50+Math.round(50*Math.min(1,mag));
+          await sendUART(`CMD:${dir}:ms=${ms}:spd=${spd}`);
+        }
+        lastDirRef.current=dir;
+      }else if(dir!=="STOP"){
+        const ms=120+Math.round(200*Math.min(1,mag));
+        const spd=50+Math.round(50*Math.min(1,mag));
+        await sendUART(`CMD:${dir}:ms=${ms}:spd=${spd}`);
+      }
+      setTimeout(tick,120);
+    };
+    tick(); return()=>{cancelled=true};
+  },[joy, ip]);
+
+  function onVideoLayout(e:LayoutChangeEvent){
+    const {width,height}=e.nativeEvent.layout; setVideoContainerWH({w:width,h:height});
+  }
+
+  return (
+    <View style={styles.container}>
+      <AppHero subtitle={T.heroSubtitle} />
+
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput value={ip} onChangeText={setIp} placeholder={T.placeholderIp} placeholderTextColor="#8a93a5"
+                   autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        <Text style={styles.label}>{T.server}</Text>
+        <TextInput value={server} onChangeText={setServer} placeholder={T.placeholderServer} placeholderTextColor="#8a93a5"
+                   autoCapitalize="none" autoCorrect={false} style={[styles.input,{minWidth:220}]} />
+
+        <Pressable onPress={togglePump} style={[styles.btn, pumpOn?styles.btnOn:styles.btnOff]}>
+          <Text style={styles.btnText}>{pumpOn?T.pumpOn:T.pumpOff}</Text>
+        </Pressable>
+        <Pressable onPress={()=>led(true)} style={[styles.btn, {backgroundColor:"#2563eb"}]}>
+          <Text style={styles.btnText}>{T.ledOn}</Text>
+        </Pressable>
+        <Pressable onPress={()=>led(false)} style={[styles.btn, {backgroundColor:"#374151"}]}>
+          <Text style={styles.btnText}>{T.ledOff}</Text>
+        </Pressable>
+
+        {/* Botão P&B: aciona /cam no ESP */}
+        <Pressable
+          onPress={async ()=>{
+            const next = !bw;
+            const ok = await setCameraGray(next);
+            if (ok) setBw(next);
+          }}
+          style={[styles.btn, bw ? { backgroundColor:"#111827", borderWidth:1, borderColor:"#6b7280" } : { backgroundColor:"#d1d5db" }]}
+        >
+          <Text style={[styles.btnText, { color: bw ? "#e5e7eb" : "#111827" }]}>{bw ? T.bwOn : T.bwOff}</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.statusRow,{paddingTop:4,paddingBottom:8}]}>
+        <Text numberOfLines={2} style={styles.status}>
+          {statusText} {useDirectSnapshot ? "• (snapshot direto)" : ""}
+        </Text>
+        <View style={[styles.badge,{backgroundColor: "#065f46"}]}>
+          <Text style={{ color:"#fff", fontWeight:"800" }}>{isFire ? T.detecting : T.waiting}</Text>
+        </View>
+      </View>
+
+      <View style={[styles.fireBanner, isFire?styles.fireOn:styles.fireOff]}>
+        <Text style={styles.fireText}>{isFire ? T.fireOn(fireScore) : T.fireOff(fireScore)}</Text>
+      </View>
+
+      <View style={{ flex:1 }} onLayout={onVideoLayout}>
+        <CrossfadeImage currentUri={currentFrameUri} nextUri={nextFrameUri}
+                        onNextLoadStart={()=> (loadingNextRef.current=true)}
+                        onNextShown={onNextShown}/>
+        {overlayBoxes.length>0 && (
+          <BoxesOverlay frameWH={frameWH} containerWH={videoContainerWH} boxes={overlayBoxes} />
+        )}
+      </View>
+
+      {/* Joystick */}
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        <View style={[styles.joyWrap,{width:64*2+24,height:64*2+24}]}
+              {...(pan.panHandlers as any)}>
+          <View style={[styles.joyBase,{width:64*2,height:64*2,borderRadius:64}]} />
+          <View style={[styles.joyKnob,{width:22*2,height:22*2,borderRadius:22,
+                        transform:[{translateX:joy.x*64},{translateY:-joy.y*64}], opacity: dragging?1:0.9}]} />
+          <Text style={styles.joyText}>x: {joy.x.toFixed(2)} y: {joy.y.toFixed(2)}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container:{ flex:1, backgroundColor:PALETTE.bg },
+  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
+  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
+  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
+  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
+
+  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
+           paddingHorizontal:12, paddingVertical:10, gap:8,
+           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  label:{ color:"#cfd3d8", fontSize:12 },
+  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
+          borderWidth:1, borderColor:PALETTE.border, minWidth:120 },
+  btn:{ backgroundColor:PALETTE.accent, paddingHorizontal:10, paddingVertical:10, borderRadius:10 },
+  btnOn:{ backgroundColor:"#17a34a" }, btnOff:{ backgroundColor:"#374151" },
+  btnText:{ color:"white", fontWeight:"600" },
+
+  statusRow:{ flexDirection:"row", alignItems:"center", paddingHorizontal:12, paddingVertical:8, gap:8,
+              backgroundColor:"#0f1322", borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  badge:{ paddingHorizontal:10, paddingVertical:6, borderRadius:8, borderWidth:1, borderColor:PALETTE.border },
+  status:{ color:"#cbd5ff", flex:1, fontSize:12 },
+
+  fireBanner:{ alignItems:"center", justifyContent:"center", paddingVertical:6 },
+  fireOn:{ backgroundColor:"#8b0000" }, fireOff:{ backgroundColor:"#223" },
+  fireText:{ color:"white", fontWeight:"800" },
+
+  joyWrap:{ position:"absolute", bottom:24, left:24, alignItems:"center", justifyContent:"center" },
+  joyBase:{ position:"absolute", backgroundColor:"rgba(255,255,255,0.08)", borderWidth:2, borderColor:"rgba(255,255,255,0.14)" },
+  joyKnob:{ position:"absolute", backgroundColor:"rgba(230,64,58,0.9)", borderWidth:2, borderColor:"rgba(255,255,255,0.85)" },
+  joyText:{ position:"absolute", bottom:-22, color:"#cbd5ff", fontSize:12 },
+});
+
+
+
+
+Dicas finais
+
+
+
+
+Teste o botão P&B: ao ligar, o app chama POST http://hydrobot.local/cam?gray=1&q=20&size=qvga.
+
+Você pode ajustar esses valores no setCameraGray() conforme a sua rede (ex.: q=22 ainda menor).
+
+
+Se ainda tiver algum “surto” em cenas muito vermelhas, experimente no setup inicial colocar fb_count=1 e xclk_freq_hz=10000000 (já deixei comentado/recomendado no firmware). Isso tende a eliminar travas persistentes em alguns módulos AI Thinker.
+
+
+
+
+Se quiser, também mando a versão do server com re-encode P&B/resize (sob demanda) para quando você desligar o P&B no ESP mas quiser economizar banda no cliente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Bora! Vou colocar um toggle P&B no app e, para funcionar de verdade, vou estender o server para reencodar o último frame em preto-e-branco (e opcionalmente reduzir largura/qualidade). Assim você liga/desliga na hora, sem mexer no firmware.
 
 
