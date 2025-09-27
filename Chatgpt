@@ -1,4 +1,98 @@
 
+Instruções: Cartilha de Segurança da Informação em Redes
+Visão geral
+Nesta tarefa, você trabalhará de forma colaborativa para criar uma breve cartilha de segurança da informação que se concentre especificamente em redes. Esta cartilha servirá como um recurso valioso para entender a importância da segurança de rede e as práticas recomendadas para proteger as informações em um ambiente de rede(escola, empresa, comércio e etc...).
+
+ 
+
+Temas:
+
+1- Comercio- Mercado
+
+2- Escola- Ex: ETEC
+
+3- Empresa- Ex: Paschoalotto
+
+4- Hospital
+
+Etapas para concluir a tarefa
+1. Pesquise segurança de rede
+Reúna informações: Pesquise cartilhas semelhantes simples, até 20 páginas, não precisa ser longa.
+2. Organize seu conteúdo
+Esboce: Crie um esboço para sua cartilha. Isso ajudará você a organizar seus pensamentos e garantir que você cubra todos os tópicos necessários. Considere a seguinte estrutura:
+Introdução: Explique brevemente o que é segurança de rede e por que ela é importante.
+Ameaças comuns: Liste e descreva várias ameaças à segurança da rede.
+Melhores práticas: Forneça dicas e estratégias acionáveis para proteger as redes.
+Conclusão: Resuma os pontos-chave e enfatize a importância da vigilância contínua na segurança da rede.
+Atribuir seções: Se você estiver trabalhando em grupo, atribua diferentes seções da cartilha a cada membro. Isso permitirá que todos contribuam com seus pontos fortes e conhecimentos.
+3. Projetar a cartilha
+Escolha um formato: Decida o formato da sua cartilha. Você pode criar um livreto digital usando software como Microsoft Word, Google Docs ou ferramentas de design como o Canva. Como alternativa, você pode criar um livreto físico usando papel e materiais de arte.
+Elementos visuais: Incorpore elementos visuais como imagens, gráficos e diagramas para melhorar a legibilidade e o envolvimento do seu livreto. Certifique-se de que esses recursos visuais sejam relevantes para o conteúdo e ajudem a ilustrar seus pontos.
+Estilo consistente: Mantenha um estilo consistente em todo o livreto. Use a mesma fonte, esquema de cores e layout para cada página para criar uma aparência coesa.
+4. Escreva e edite
+Esboce seu conteúdo: Comece a escrever o conteúdo de cada seção com base em seu esboço. Busque clareza e concisão. Use marcadores ou listas numeradas quando apropriado para facilitar a digestão das informações.
+Revisão por pares: Depois de ter um rascunho, compartilhe-o com os membros do seu grupo para obter feedback. Considere suas sugestões e faça as revisões necessárias para melhorar o conteúdo.
+Revisar: Revise cuidadosamente seu livreto em busca de erros de ortografia, gramática e pontuação. Um produto final polido reflete profissionalismo e atenção aos detalhes.
+5. Finalizar e enviar
+Compile o livreto: Se você trabalhou em grupo, compile todas as seções em um único documento. Certifique-se de que as transições entre as seções sejam suaves e que o livreto flua logicamente.
+Formato para envio: Certifique-se de que seu livreto atenda a todos os requisitos de formatação específicos fornecidos pelo seu instrutor (por exemplo, tamanho da página, tamanho da fonte, margens).
+Envie seu trabalho: Envie seu livreto preenchido dentro do prazo. Se você estiver enviando digitalmente, certifique-se de que o arquivo esteja nomeado adequadamente e esteja no formato correto (por exemplo, PDF, DOCX).
+Critérios de avaliação
+Seu livreto será avaliado com base nos seguintes critérios:
+
+Qualidade do conteúdo: profundidade da pesquisa e precisão das informações apresentadas.
+Organização: Clareza e fluxo lógico do conteúdo.
+Design: Apelo visual e uso eficaz de gráficos.
+Qualidade da escrita: Gramática, ortografia e profissionalismo geral.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — vamos remover totalmente a dependência do servidor e exibir apenas o stream MJPEG direto do ESP32-CAM no app. Abaixo estão dois arquivos completos:
 
 
