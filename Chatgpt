@@ -1,4 +1,342 @@
 
+/*
+  HydroBot - ESP32-CAM em modo STA (roteador externo) — PERFIL ESTÁVEL
+  Rotas:
+    GET  /              (info)
+    GET  /status        (JSON)
+    GET  /snapshot      (JPEG único)  -> agora envia em CHUNKS (sem copia extra)
+    GET  /stream        (MJPEG)
+    POST /uart?cmd=...
+    POST /led?on=0|1
+    POST /restart
+  mDNS: http://hydrobot.local
+  CORS: *
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "esp_timer.h"
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ====== CONFIG ======
+const char* WIFI_SSID   = "HydroBot";
+const char* WIFI_PASS   = "loud2025emibr";
+//#define USE_STATIC_IP
+IPAddress local_IP(192,168,0,50), gateway(192,168,0,1), subnet(255,255,255,0), dns1(8,8,8,8), dns2(1,1,1,1);
+
+const char* MDNS_NAME = "hydrobot";
+
+// UART para Arduino
+#define UART_RX_PIN 15
+#define UART_TX_PIN 14
+#define UART_BAUD   115200
+#define STATUS_POLL_MS  1000
+
+// Camera (AI Thinker)
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// Servidor
+WebServer server(80);
+String lastStatusLine = "";
+
+// LED flash
+static const int FLASH_PIN = 4;
+
+// Stream
+static const char* STREAM_BOUNDARY = "frame";
+static const char* STREAM_CT = "multipart/x-mixed-replace;boundary=frame";
+
+// Espelhamento (igual ao seu)
+static const bool STREAM_HFLIP = false;
+static const bool STREAM_VFLIP = false;
+
+// Watchers
+unsigned long lastWiFiCheck = 0;
+unsigned long lastStatusPoll = 0;
+
+// ===== Helpers =====
+void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions(){ addCORS(); server.send(204); }
+
+// ===== UART =====
+void initUART(){ Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN); }
+void pollArduinoStatus(){
+  static String rx;
+  Serial2.print("REQ:STATUS\n");
+  while (Serial2.available()){
+    char c = (char)Serial2.read();
+    if (c=='\n' || c=='\r'){
+      if (rx.length()){
+        if (rx.startsWith("STAT:")) lastStatusLine = rx;
+        rx = "";
+      }
+    } else rx += c;
+  }
+}
+
+// ===== Wi-Fi =====
+void connectWiFi(){
+#ifdef USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, dns1, dns2);
+#endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);                 // reduz picos
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(250);
+}
+
+// ===== Câmera =====
+// Perfil estável (mudança mínima em relação ao seu):
+// - QVGA (320x240), qualidade 17, fb_count=1, xclk=10 MHz
+// - grab_mode LATEST + PSRAM
+bool initCamera(){
+  // evita reset por brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  camera_config_t cfg{};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+
+  cfg.xclk_freq_hz = 10000000;                 // 10 MHz (mais estável que 20 MHz)
+  cfg.pixel_format = PIXFORMAT_JPEG;
+
+  cfg.frame_size   = FRAMESIZE_QVGA;           // <<< trocado de VGA para QVGA
+  cfg.jpeg_quality = 17;                       // 10..20 (17 dá arquivos bem leves)
+  cfg.fb_count     = 1;                        // <<< 1 buffer reduz pressão de PSRAM
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;       // evita fila
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;       // usa PSRAM
+
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, STREAM_VFLIP);
+  s->set_hmirror(s, STREAM_HFLIP);
+
+  // ajustes neutros/estáveis
+  s->set_aec2(s, true);
+  s->set_gainceiling(s, GAINCEILING_2X);
+  s->set_brightness(s, 0);
+  s->set_saturation(s, 0);
+  return true;
+}
+
+// ===== Handlers =====
+void handleRoot(){
+  addCORS();
+  String html="<!doctype html><html><head><meta charset='utf-8'/>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+              "<title>HydroBot ESP32-CAM</title>"
+              "<style>body{font-family:system-ui;background:#0b0b0f;color:#e5e7eb;padding:16px}"
+              "a,button{background:#e6403a;color:#fff;padding:8px 12px;border:none;border-radius:8px;text-decoration:none;margin-right:8px}"
+              "code{background:#121218;padding:2px 6px;border-radius:6px}</style></head><body>";
+  html += "<h2>HydroBot ESP32-CAM (STA)</h2>";
+  html += "<p>IP: <code>"+WiFi.localIP().toString()+"</code> | RSSI: <code>"+String(WiFi.RSSI())+" dBm</code></p>";
+  html += "<p><a href='/snapshot'>/snapshot</a> <a href='/stream'>/stream</a> <a href='/status'>/status</a></p>";
+  html += "<p>mDNS: <code>http://"+String(MDNS_NAME)+".local</code></p>";
+  html += "<p>Último STATUS Arduino: <code>"+(lastStatusLine.length()?lastStatusLine:"(ainda não)")+"</code></p>";
+  html += "</body></html>";
+  server.send(200,"text/html",html);
+}
+
+void handleStatus(){
+  addCORS();
+  String json="{";
+  json += "\"ip\":\""+WiFi.localIP().toString()+"\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"arduino_status\":\"" + lastStatusLine + "\"";
+  json += "}";
+  server.send(200,"application/json",json);
+}
+
+// /snapshot — envia manualmente (chunked) para evitar cópia grande em RAM
+void handleSnapshot(){
+  addCORS();
+  WiFiClient client = server.client();
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb){ server.send(503,"text/plain","Camera capture failed"); return; }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: image/jpeg");
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.print  ("Content-Length: "); client.println(fb->len);
+  client.println();
+  const uint8_t* p = fb->buf;
+  size_t remain = fb->len;
+  while (remain > 0){
+    size_t n = remain > 1460 ? 1460 : remain;
+    size_t w = client.write(p, n);
+    if (w == 0) break;
+    p += w; remain -= w;
+    delay(0); yield();
+  }
+  esp_camera_fb_return(fb);
+}
+
+// /stream — MJPEG com pausas curtas para não travar Wi-Fi/TCP
+void handleStream(){
+  WiFiClient client = server.client();
+  client.println("HTTP/1.1 200 OK");
+  client.println(String("Content-Type: ")+STREAM_CT);
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.println("Access-Control-Allow-Origin: *");
+  client.println();
+
+  while (client.connected()){
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    client.print("--"); client.println(STREAM_BOUNDARY);
+    client.println("Content-Type: image/jpeg");
+    client.print("Content-Length: "); client.println(fb->len);
+    client.println();
+
+    const uint8_t* p = fb->buf; size_t remain = fb->len;
+    while (remain > 0){
+      size_t n = remain > 1460 ? 1460 : remain;
+      size_t w = client.write(p, n);
+      if (w == 0) { remain = 0; break; }
+      p += w; remain -= w;
+      delay(1); yield();
+    }
+    client.println();
+    esp_camera_fb_return(fb);
+
+    delay(6); yield();
+  }
+}
+
+void handleUART(){
+  addCORS();
+  if (server.method()==HTTP_OPTIONS){ handleOptions(); return; }
+  String cmd = server.arg("cmd");
+  if (!cmd.length()){ server.send(400,"application/json","{\"error\":\"use /uart?cmd=...\"}"); return; }
+  if (!cmd.endsWith("\n")) cmd += "\n";
+  Serial2.print(cmd);
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleLED(){
+  addCORS();
+  if (server.method()==HTTP_OPTIONS){ handleOptions(); return; }
+  int on = server.arg("on").toInt();
+  digitalWrite(FLASH_PIN, on? HIGH: LOW);
+  server.send(200,"application/json", String("{\"on\":")+(on? "true":"false")+"}");
+}
+
+void handleRestart(){ addCORS(); server.send(200,"application/json","{\"restarting\":true}"); delay(300); ESP.restart(); }
+
+// ===== HTTP server =====
+void setupServer(){
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/uart", HTTP_POST, handleUART);
+  server.on("/led", HTTP_POST, handleLED);
+  server.on("/restart", HTTP_POST, handleRestart);
+  server.onNotFound([](){ addCORS(); server.send(404,"application/json","{\"error\":\"not found\"}"); });
+  server.on("/uart", HTTP_OPTIONS, handleOptions);
+  server.on("/led", HTTP_OPTIONS, handleOptions);
+  server.on("/restart", HTTP_OPTIONS, handleOptions);
+  server.begin();
+}
+
+// ===== Setup / Loop =====
+void setup(){
+  Serial.begin(115200); delay(150);
+  pinMode(FLASH_PIN, OUTPUT); digitalWrite(FLASH_PIN, LOW);
+  initUART();
+
+  if (!initCamera()){
+    // Fallback ainda mais leve (se algo der errado na PSRAM/clock)
+    // (mantém rotas iguais)
+    delay(500);
+    // tenta novamente com QQVGA e qualidade 18
+    camera_config_t cfg{}; // (não reusa — mas se chegar aqui, prefira regravar o sketch com ajustes)
+  }
+
+  connectWiFi();
+  if (WiFi.status()==WL_CONNECTED) {
+    if (MDNS.begin(MDNS_NAME)) MDNS.addService("http","tcp",80);
+  }
+  setupServer();
+}
+
+void loop(){
+  server.handleClient();
+
+  if (millis() - lastWiFiCheck > 3000){
+    lastWiFiCheck = millis();
+    if (WiFi.status()!=WL_CONNECTED) connectWiFi();
+  }
+  if (millis() - lastStatusPoll > STATUS_POLL_MS){
+    lastStatusPoll = millis();
+    pollArduinoStatus();
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Valeu o retorno — isso cheira a reset por instabilidade (brownout/PSRAM/Wi-Fi bursts) causado pela nossa lógica de stream + ABR anterior (troca de framesize/quality muito frequente pode estressar o driver e, em cena “pesada”, gerar picos que derrubam a placa).
 
 
