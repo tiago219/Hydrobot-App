@@ -404,10 +404,6 @@ const styles = StyleSheet.create({
 
 
 
-
-
-
-
 # FastAPI proxy + heurística de fogo SIMPLES para ESP32-CAM
 
 import time
@@ -742,7 +738,7 @@ def detect():
         is_fire = score >= FIRE_THRESHOLD
         
         return {
-            "ok": True,
+            "ok": True,a
             "isFire": is_fire,
             "score": round(score, 3),
             "score_raw": round(score, 3),
@@ -761,6 +757,7 @@ if __name__ == "__main__":
     print(f"FPS alvo: {POLL_FPS_TARGET}")
     print(f"Fire threshold: {FIRE_THRESHOLD}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
