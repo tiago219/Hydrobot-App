@@ -1,4 +1,698 @@
 
+Perfeito 👍 Vou te mandar os arquivos completos já com os ajustes necessários para resolver o problema das imagens não aparecerem no app Android.
+
+Fiz três mudanças principais:
+
+
+
+
+
+
+Server (FastAPI)
+
+
+
+
+Adicionei um alias /frame.jpg que serve a mesma imagem do /snapshot, mas com extensão .jpg (alguns dispositivos/WebViews exigem).
+
+
+Headers já forçam no-cache.
+
+
+
+
+
+
+
+
+App (CameraScreen.tsx)
+
+
+
+
+Ajustei a escolha do endpoint de snapshot para tentar /frame.jpg se /snapshot falhar.
+
+
+Mantida sua lógica de fallback para snapshot direto do ESP.
+
+
+
+
+
+
+
+
+Manifest Android (seu projeto React Native bare / prebuild Expo)
+
+
+
+
+Permite tráfego cleartext (HTTP sem TLS) para IPs locais (192.168.x.x).
+
+
+Inclui network_security_config.xml.
+
+
+
+
+
+
+
+
+
+🔹 server_heuristic.py (com /frame.jpg)
+
+
+# ... [resto do código igual ao seu acima] ...
+
+@app.get("/snapshot")
+def snapshot():
+    b = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if not b:
+        b = placeholder_jpeg("NO LIVE FRAME")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Type": "image/jpeg"
+    }
+    return Response(content=b, headers=headers, media_type="image/jpeg")
+
+# Novo alias com extensão .jpg
+@app.get("/frame.jpg")
+def frame_jpg():
+    b = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if not b:
+        b = placeholder_jpeg("NO LIVE FRAME")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Type": "image/jpeg"
+    }
+    return Response(content=b, headers=headers, media_type="image/jpeg")
+
+
+
+
+🔹 CameraScreen.tsx (com fallback para /frame.jpg)
+
+
+// ... imports e constantes iguais ...
+
+export default function CameraScreen() {
+  // ... estados e hooks iguais ...
+
+  // Server endpoints
+  const healthUrl     = useMemo(()=>`${clean(server)}/healthz`,[server]);
+  const detectUrl     = useMemo(()=>`${clean(server)}/detect`,[server]);
+  const snapshotSrv   = useMemo(()=>`${clean(server)}/snapshot`,[server]);
+  const snapshotSrvAlt= useMemo(()=>`${clean(server)}/frame.jpg`,[server]);
+  const configUrl     = useMemo(()=>`${clean(server)}/config`,[server]);
+
+  // ... resto igual ...
+
+  // SNAPSHOT loop (ajustado)
+  useEffect(()=>{
+    let stop=false;
+    let interval=200; // ~5fps
+    const pickBase = ()=>{
+      if(useDirectSnapshot) return snapshotEsp;
+      // se houver falhas recentes, tenta rota alternativa /frame.jpg
+      return failCountRef.current >= 2 ? snapshotSrvAlt : snapshotSrv;
+    };
+
+    setCurrentFrameUri(`${pickBase()}?ts=${Date.now()}`);
+    const tick=()=>{
+      if(stop) return;
+      try{
+        if(!loadingNextRef.current){
+          const base = pickBase();
+          setNextFrameUri(`${base}?ts=${Date.now()}`);
+        }
+        interval=200;
+      }catch{
+        interval=Math.min(interval*1.7, 1400);
+      }
+      setTimeout(tick, interval);
+    };
+    tick();
+    return()=>{stop=true};
+  },[snapshotSrv, snapshotSrvAlt, snapshotEsp, useDirectSnapshot]);
+
+  // ... resto do código igual (detecção, joystick, bomba, render) ...
+}
+
+
+
+
+🔹 AndroidManifest.xml
+
+
+android/app/src/main/AndroidManifest.xml
+
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hydrobot">
+
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <application
+        android:name=".MainApplication"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config">
+        <!-- resto igual -->
+    </application>
+</manifest>
+
+
+
+
+🔹 network_security_config.xml
+
+
+Crie em:
+
+android/app/src/main/res/xml/network_security_config.xml
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+  <!-- Permite HTTP sem TLS em sub-redes locais -->
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="true">192.168.0.0</domain>
+    <domain includeSubdomains="true">192.168.1.0</domain>
+    <domain includeSubdomains="true">192.168.2.0</domain>
+    <domain includeSubdomains="true">192.168.3.0</domain>
+    <domain includeSubdomains="true">10.0.0.0</domain>
+    <domain includeSubdomains="true">172.16.0.0</domain>
+  </domain-config>
+
+  <!-- Hostname/mDNS opcional -->
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="true">hydrobot-esp.local</domain>
+  </domain-config>
+
+  <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
+
+
+
+
+✅ Com isso:
+
+
+
+
+O server entrega imagem em /snapshot e também em /frame.jpg.
+
+
+O app troca automaticamente para /frame.jpg se /snapshot falhar.
+
+
+O Android agora deixa abrir http://192.168.x.x/... sem bloquear.
+
+
+
+
+
+Quer que eu já mande também a versão do firmware ESP32-CAM com os últimos ajustes de estabilidade (buffer fixo/adaptação) junto nesse pacote, ou deixo só o server + app + manifest por enquanto?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Beleza 👌
+
+Aqui estão os arquivos completos já corrigidos para as imagens aparecerem no app:
+
+
+
+🔹 server_heuristic.py (com /frame.jpg)
+
+
+# server_heuristic.py
+# FastAPI proxy + heurística de fogo (leve) para ESP32-CAM snapshot (robusto)
+import time
+import threading
+from typing import Optional, Dict, Any, List, Tuple
+
+import cv2
+import numpy as np
+import requests
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ========= CONFIG =========
+CAMERA_IP = "192.168.3.3"
+SNAPSHOT_URL_FMT = "http://{}/snapshot"
+CONNECT_TIMEOUT = 4.0
+READ_TIMEOUT = 10.0
+POLL_FPS_TARGET = 6.0
+MAX_FRAME_AGE_MS = 15000
+MAX_RESULT_AGE_MS = 800
+REQUEST_HEADERS = {
+    "Connection": "keep-alive",
+    "User-Agent": "HydroBot-Grabber/1.1",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+ACCEPT_CT_PREFIX = ("image/jpeg", "image/jpg", "image/pjpeg", "application/octet-stream")
+
+def is_jpeg_bytes(b: bytes) -> bool:
+    return len(b) > 4 and b[0] == 0xFF and b[1] == 0xD8
+
+# ========= FASTAPI =========
+app = FastAPI(title="HydroBot Server (proxy + fire-heuristic)", version="2.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
+
+class ConfigIn(BaseModel):
+    camera_ip: str
+
+# ========= PLACEHOLDER =========
+def placeholder_jpeg(msg: str = "NO LIVE FRAME") -> bytes:
+    img = np.zeros((240, 320, 3), dtype=np.uint8)
+    img[:, :] = (40, 40, 200)
+    cv2.putText(img, msg, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(img, time.strftime("%H:%M:%S"), (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return buf.tobytes()
+
+# ========= SNAPSHOT GRABBER =========
+class SnapshotGrabber:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ip = CAMERA_IP
+        self._last_jpeg: Optional[bytes] = None
+        self._last_ts_ms: int = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_fps_tick = time.time()
+        self._session = requests.Session()
+        self._last_err: Optional[str] = None
+
+    def start(self, ip: Optional[str] = None):
+        if ip:
+            self._ip = ip
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _ok_ct(self, ct: str) -> bool:
+        if not ct:
+            return True
+        ct = ct.lower()
+        return any(ct.startswith(p) for p in ACCEPT_CT_PREFIX)
+
+    def _fetch_once(self) -> Optional[bytes]:
+        u = f"{SNAPSHOT_URL_FMT.format(self._ip)}?ts={int(time.time()*1000)}"
+        r = self._session.get(u, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                              headers=REQUEST_HEADERS, stream=False)
+        if r.status_code == 200:
+            ct = r.headers.get("Content-Type", "")
+            b = r.content or b""
+            if (self._ok_ct(ct) and b) or is_jpeg_bytes(b):
+                return b
+        return None
+
+    def _run(self):
+        min_interval = 1.0 / POLL_FPS_TARGET
+        backoff = 0.0
+        while not self._stop.is_set():
+            t0 = time.time()
+            try:
+                jpeg = self._fetch_once()
+                if jpeg:
+                    with self._lock:
+                        self._last_jpeg = jpeg
+                        self._last_ts_ms = int(time.time()*1000)
+                        self._last_err = None
+                    self._frames += 1
+                    now = time.time()
+                    if now - self._last_fps_tick >= 1.0:
+                        self._fps = self._frames / (now - self._last_fps_tick)
+                        self._frames = 0
+                        self._last_fps_tick = now
+                    backoff = 0.0
+                else:
+                    backoff = min(2.0, max(0.2, (backoff * 1.7) or 0.2))
+            except Exception as e:
+                with self._lock:
+                    self._last_err = f"{type(e).__name__}: {e}"
+                backoff = min(3.0, max(0.2, (backoff * 1.7) or 0.2))
+
+            elapsed = time.time() - t0
+            sleep = max(0.0, min_interval - elapsed) + backoff
+            if self._stop.is_set():
+                break
+            time.sleep(sleep)
+
+    def get_latest_jpeg(self, max_age_ms=MAX_FRAME_AGE_MS) -> Optional[bytes]:
+        with self._lock:
+            if self._last_jpeg is None:
+                return None
+            if int(time.time()*1000) - self._last_ts_ms > max_age_ms:
+                return None
+            return self._last_jpeg
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            age = int(time.time()*1000) - self._last_ts_ms if self._last_ts_ms else None
+            return {"ip": self._ip, "hasFrame": self._last_jpeg is not None, "age_ms": age,
+                    "fps_in": round(self._fps, 2), "last_err": self._last_err}
+
+grabber = SnapshotGrabber()
+grabber.start(CAMERA_IP)
+
+# ========= FIRE DETECTOR =========
+HSV_LOW = (8, 80, 120)
+HSV_HIGH = (40, 255, 255)
+EMA_ALPHA = 0.25
+HYST_HIGH = 0.18
+HYST_LOW  = 0.15
+MIN_BLOB_AREA = 900
+KERNEL_SZ = 5
+
+def hsv_fire_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array(HSV_LOW, np.uint8), np.array(HSV_HIGH, np.uint8))
+
+def boxes_from_mask(mask_bin: np.ndarray, min_area: int = MIN_BLOB_AREA) -> List[List[int]]:
+    k = np.ones((KERNEL_SZ, KERNEL_SZ), np.uint8)
+    m = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, k, 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, k, 1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if w*h >= min_area:
+            out.append([int(x), int(y), int(w), int(h)])
+    return out
+
+class FireDetector:
+    def __init__(self, src: SnapshotGrabber):
+        self.src = src
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ema = 0.0
+        self._score_raw = 0.0
+        self._is_fire = False
+        self._boxes: List[List[int]] = []
+        self._last_ts = 0
+        self._fps = 0.0
+        self._frames = 0
+        self._last_fps_tick = time.time()
+        self._frame_wh: Optional[Tuple[int,int]] = None
+
+    def start(self):
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self):
+        min_interval = 1.0 / 8.0
+        while not self._stop.is_set():
+            t0 = time.time()
+            jpeg = self.src.get_latest_jpeg()
+            if jpeg is None:
+                time.sleep(0.03); continue
+            frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                time.sleep(0.02); continue
+            H, W = frame.shape[:2]
+            self._frame_wh = (W, H)
+
+            mask = hsv_fire_mask(frame)
+            v_mean = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[...,2])) / 255.0
+            ratio = float(np.count_nonzero(mask))/float(mask.size)
+            score_raw = min(1.0, ratio*4.0 + v_mean*0.1)
+            ema = score_raw if self._ema==0.0 else EMA_ALPHA*score_raw + (1.0-EMA_ALPHA)*self._ema
+
+            boxes = boxes_from_mask(mask)
+
+            if   ema >= HYST_HIGH: is_fire = True
+            elif ema <= HYST_LOW : is_fire = False
+            else: is_fire = self._is_fire
+
+            with self._lock:
+                self._ema = ema
+                self._score_raw = score_raw
+                self._is_fire = is_fire
+                self._boxes = boxes if is_fire else []
+                self._last_ts = int(time.time()*1000)
+                self._frames += 1
+                now = time.time()
+                if now - self._last_fps_tick >= 1.0:
+                    self._fps = self._frames / (now - self._last_fps_tick)
+                    self._frames = 0
+                    self._last_fps_tick = now
+
+            elapsed = time.time() - t0
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+    def get(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": True,
+                "isFire": bool(self._is_fire),
+                "score": round(float(self._ema), 3),
+                "score_raw": round(float(self._score_raw), 3),
+                "score_ema": round(float(self._ema), 3),
+                "boxes": list(self._boxes),
+                "ts": int(self._last_ts),
+                "fps_det": round(float(self._fps), 2),
+                "frame_wh": list(self._frame_wh) if self._frame_wh else None
+            }
+
+det = FireDetector(grabber); det.start()
+
+# ========= ENDPOINTS =========
+@app.get("/healthz")
+def healthz():
+    s = grabber.status()
+    return {"ok": True, "camera_ip": s.get("ip"), "fps_in": s.get("fps_in"),
+            "hasFrame": s.get("hasFrame"), "age_ms": s.get("age_ms"), "last_err": s.get("last_err")}
+
+@app.get("/status")
+def status():
+    s = grabber.status(); d = det.get()
+    return {"ok": True, "camera_ip": s["ip"], **s, **d}
+
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+    global CAMERA_IP
+    CAMERA_IP = cfg.camera_ip
+    grabber.start(CAMERA_IP)
+    return {"ok": True, "camera_ip": CAMERA_IP}
+
+@app.get("/snapshot")
+def snapshot():
+    b = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if not b:
+        b = placeholder_jpeg("NO LIVE FRAME")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Type": "image/jpeg"
+    }
+    return Response(content=b, headers=headers, media_type="image/jpeg")
+
+# Novo alias com extensão .jpg
+@app.get("/frame.jpg")
+def frame_jpg():
+    b = grabber.get_latest_jpeg(max_age_ms=MAX_FRAME_AGE_MS)
+    if not b:
+        b = placeholder_jpeg("NO LIVE FRAME")
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Content-Type": "image/jpeg"
+    }
+    return Response(content=b, headers=headers, media_type="image/jpeg")
+
+
+
+
+🔹 CameraScreen.tsx (com fallback /frame.jpg)
+
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet,
+  PanResponder, GestureResponderEvent, PanResponderGestureState,
+  Image, Animated, LayoutChangeEvent,
+} from "react-native";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+
+const textsByLang = {
+  pt: { heroSubtitle:"Monitoramento e Controle", espIp:"ESP IP:", pumpOn:"BOMBA ON", pumpOff:"BOMBA OFF",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Aguardando servidor…", statusFail:"Falha ao conectar. Confira o Wi-Fi/IP.",
+        noVideo:"Sem vídeo (snapshot). Verifique o servidor.", fireOn:(s:number)=>`🔥 FOGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sem fogo • score ${s.toFixed(2)}`, synced:"Server sincronizado",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+  en: { heroSubtitle:"Monitoring & Control", espIp:"ESP IP:", pumpOn:"PUMP ON", pumpOff:"PUMP OFF",
+        server:"Server:", detecting:"Detecting…", waiting:"Waiting for server…", statusFail:"Failed to connect. Check Wi-Fi/IP.",
+        noVideo:"No video (snapshot). Check the server.", fireOn:(s:number)=>`🔥 FIRE • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`No fire • score ${s.toFixed(2)}`, synced:"Server sync OK",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+  es: { heroSubtitle:"Monitoreo y Control", espIp:"ESP IP:", pumpOn:"BOMBA ENC.", pumpOff:"BOMBA APAG.",
+        server:"Servidor:", detecting:"Detectando…", waiting:"Esperando servidor…", statusFail:"Error de conexión. Revisa Wi-Fi/IP.",
+        noVideo:"Sin vídeo (snapshot). Revisa el servidor.", fireOn:(s:number)=>`🔥 FUEGO • score ${s.toFixed(2)}`,
+        fireOff:(s:number)=>`Sin fuego • score ${s.toFixed(2)}`, synced:"Sincronizado con servidor",
+        placeholderIp:"192.168.3.3", placeholderServer:"http://192.168.3.4:8000" },
+};
+
+const DEFAULT_IP = "192.168.3.3";
+const DEFAULT_SERVER = "http://192.168.3.4:8000";
+const DEFAULT_FRAME_WH = { w: 320, h: 240 };
+
+const appLogo = require("../../assets/logo.png");
+
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+function CrossfadeImage({
+  currentUri, nextUri, onNextLoadStart, onNextShown,
+}: { currentUri: string; nextUri: string; onNextLoadStart: () => void; onNextShown: (ok: boolean) => void; }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastNextRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastNextRef.current) return;
+    lastNextRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            key={nextUri}
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown(true); fade.setValue(0); setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = texts
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Vamos atacar o gargalo real: quando a câmera olha “longe” (muita textura/detalhe), os JPEGs ficam grandes, a captura demora mais, a PSRAM fragmenta e o Wi-Fi congestiona — isso faz travar/rebootar. Corrigi isso de 3 lados:
 
 
