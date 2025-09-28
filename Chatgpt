@@ -1,3 +1,269 @@
+
+Isso é “arquivo não encontrado” — o App.tsx está importando coisas que ainda não existem. Vamos criar os arquivos mínimos (stubs) para tudo compilar agora.
+
+
+1) Estrutura de pastas
+
+
+Crie estas pastas/arquivos:
+
+
+src/
+  screens/
+    HomeScreen.tsx
+    CameraScreen.tsx        // (já tem o seu; se não, use o stub abaixo)
+    DashboardScreen.tsx
+    SettingsScreen.tsx
+  context/
+    LanguageContext.tsx
+  theme/
+    tokens.ts
+
+
+
+2) src/theme/tokens.ts
+
+
+export const tokens = {
+  color: {
+    bg: "#0b0b0f",
+    card: "#121218",
+    border: "#25273a",
+    text: "#e5e7eb",
+    sub: "#9ca3af",
+    accent: "#e6403a",
+    success: "#10b981",
+    danger: "#ef4444",
+  },
+  radius: { xs: 8, sm: 10, md: 12, lg: 16, xl: 20, pill: 999 },
+  space: { xs: 6, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32 },
+  font: { regular: "System", medium: "System", bold: "System" },
+  shadow: {
+    card: { elevation: 3, shadowOpacity: 0.15, shadowRadius: 6, shadowOffset: { width: 0, height: 3 } },
+  },
+};
+export type Tokens = typeof tokens;
+
+
+
+3) src/context/LanguageContext.tsx
+
+
+import React, { createContext, useContext, useMemo, useState } from "react";
+
+type Lang = "pt" | "en" | "es";
+type Ctx = { lang: Lang; setLang: (l: Lang) => void };
+const LanguageCtx = createContext<Ctx | undefined>(undefined);
+
+export function LanguageProvider({ children }: { children: React.ReactNode }) {
+  const [lang, setLang] = useState<Lang>("pt");
+  const value = useMemo(() => ({ lang, setLang }), [lang]);
+  return <LanguageCtx.Provider value={value}>{children}</LanguageCtx.Provider>;
+}
+
+export function useLanguage() {
+  const ctx = useContext(LanguageCtx);
+  if (!ctx) throw new Error("useLanguage must be used inside LanguageProvider");
+  return ctx;
+}
+
+
+
+4) Stubs das telas
+
+
+src/screens/HomeScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet } from "react-native";
+import { tokens as t } from "../theme/tokens";
+
+export default function HomeScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Home</Text>
+      <Text style={styles.sub}>Tela inicial (placeholder)</Text>
+    </View>
+  );
+}
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: t.color.bg, padding: 16 },
+  title: { color: t.color.text, fontSize: 22, fontWeight: "700", marginBottom: 6 },
+  sub: { color: t.color.sub },
+});
+
+
+
+src/screens/CameraScreen.tsx (se você já tem, mantenha o seu)
+
+
+import React from "react";
+import { View, Text, StyleSheet } from "react-native";
+import { tokens as t } from "../theme/tokens";
+
+export default function CameraScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Camera</Text>
+      <Text style={styles.sub}>Substitua por sua tela da câmera que já funciona</Text>
+    </View>
+  );
+}
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: t.color.bg, padding: 16 },
+  title: { color: t.color.text, fontSize: 22, fontWeight: "700", marginBottom: 6 },
+  sub: { color: t.color.sub },
+});
+
+
+
+src/screens/DashboardScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet } from "react-native";
+import { tokens as t } from "../theme/tokens";
+
+export default function DashboardScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Dashboard</Text>
+      <Text style={styles.sub}>Placeholder</Text>
+    </View>
+  );
+}
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: t.color.bg, padding: 16 },
+  title: { color: t.color.text, fontSize: 22, fontWeight: "700", marginBottom: 6 },
+  sub: { color: t.color.sub },
+});
+
+
+
+src/screens/SettingsScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet, Pressable } from "react-native";
+import { tokens as t } from "../theme/tokens";
+import { useLanguage } from "../context/LanguageContext";
+
+export default function SettingsScreen() {
+  const { lang, setLang } = useLanguage();
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Ajustes</Text>
+      <Text style={styles.sub}>Idioma atual: {lang.toUpperCase()}</Text>
+
+      <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+        {(["pt", "en", "es"] as const).map(code => (
+          <Pressable
+            key={code}
+            onPress={() => setLang(code)}
+            style={{
+              paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10,
+              borderWidth: 1, borderColor: t.color.border,
+              backgroundColor: lang === code ? t.color.accent : "transparent",
+            }}
+          >
+            <Text style={{ color: lang === code ? "#fff" : t.color.text, fontWeight: "700" }}>
+              {code.toUpperCase()}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: t.color.bg, padding: 16 },
+  title: { color: t.color.text, fontSize: 22, fontWeight: "700", marginBottom: 6 },
+  sub: { color: t.color.sub },
+});
+
+
+
+5) Garanta as dependências de navegação instaladas
+
+
+npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context
+npx expo install @expo/vector-icons
+
+
+
+6) (Opcional) tsconfig.json saudável
+
+
+Se não existir, crie na raiz:
+
+
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["ES2017", "DOM"],
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "moduleResolution": "bundler",
+    "allowJs": false,
+    "isolatedModules": true,
+    "types": ["react", "react-native", "expo/metro-runtime"],
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}
+
+
+
+7) Reinicie o bundler
+
+
+npx expo start -c
+
+
+
+Se o erro persistir, verifique:
+
+
+
+
+o nome dos arquivos (ex.: HomeScreen.tsx, não .js),
+
+
+os caminhos de import ("./src/screens/HomeScreen" etc.),
+
+
+se você abriu no VS Code a pasta do projeto (onde está package.json).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Aqui vai um App.tsx já alinhado com o visual (usando os tokens de tema) e mantendo sua navegação com bottom tabs, ícones do Ionicons e suporte a idiomas via LanguageProvider.
 
 
