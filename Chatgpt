@@ -1,3 +1,341 @@
+
+bora — já deixei a câmera maiorzassa (ocupando praticamente a tela toda) e alinhei o visual ao app antigo (preto, card escuro, acento vermelho, bordas finas). É só substituir os arquivos abaixo.
+
+
+
+1) src/screens/CameraScreen.tsx (câmera maior + visual antigo)
+
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image,
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  redSoft: "#FF5A4D",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.3.3"); // ajuste se quiser
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [statusText, setStatusText] = useState<string>("—");
+  const [err, setErr] = useState<string>("");
+
+  // snapshot loop
+  const [snapUri, setSnapUri] = useState<string>("");
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  // endpoints padrão do firmware (CameraWebServer)
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+  const startSnapshot = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshot, clearTimer]);
+
+  useEffect(() => {
+    setErr("");
+    if (mode === "snapshot") startSnapshot(); else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshot, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const r = await fetch(statusUrl);
+      const txt = await r.text();
+      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e) {
+      const er = e as Error;
+      setStatusText("Falhou");
+      setErr(er?.message ?? String(e));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
+  return (
+    <View style={styles.container}>
+      {/* Barra compacta (como no app antigo) */}
+      <View style={styles.topBar}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.label}>ESP IP</Text>
+          <TextInput
+            style={styles.input}
+            value={ip}
+            onChangeText={setIp}
+            placeholder="ex.: 192.168.3.3"
+            placeholderTextColor={PALETTE.sub}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+          />
+        </View>
+
+        <Pressable style={styles.btnTest} onPress={checkStatus}>
+          <Text style={styles.btnTxt}>Testar</Text>
+        </Pressable>
+      </View>
+
+      {/* Chips modo (linha fina, vermelho ativo) */}
+      <View style={styles.modeRow}>
+        <Pressable
+          style={[styles.chip, mode === "mjpeg" && styles.chipActive]}
+          onPress={() => setMode("mjpeg")}
+        >
+          <Text style={[styles.chipTxt, mode === "mjpeg" && styles.chipTxtActive]}>MJPEG (:81/stream)</Text>
+        </Pressable>
+
+        <Pressable
+          style={[styles.chip, mode === "snapshot" && styles.chipActive]}
+          onPress={() => setMode("snapshot")}
+        >
+          <Text style={[styles.chipTxt, mode === "snapshot" && styles.chipTxtActive]}>Snapshot (/capture)</Text>
+        </Pressable>
+      </View>
+
+      {/* VIEWER — agora MUITO MAIOR */}
+      <View style={styles.viewerCard}>
+        {mode === "mjpeg" ? (
+          <WebView
+            source={{ uri: streamUrl }}
+            style={{ width: "100%", height: "100%" }}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            allowUniversalAccessFromFileURLs
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={{ width: "100%", height: "100%" }}
+            resizeMode="contain"
+            onError={onImgError}
+          />
+        )}
+      </View>
+
+      {/* Status enxuto, como no antigo */}
+      <View style={styles.metaBox}>
+        <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{statusText}</Text></Text>
+        {!!err && <Text style={[styles.meta, { color: "#ff8b8b" }]}>Erro: {err}</Text>}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, paddingHorizontal: 12, paddingTop: 10 },
+  topBar: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
+  input: {
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    color: PALETTE.white,
+  },
+  btnTest: {
+    backgroundColor: PALETTE.red,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#00000055",
+  },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+
+  modeRow: { flexDirection: "row", gap: 8, marginTop: 8, marginBottom: 8 },
+  chip: { borderWidth: 1, borderColor: PALETTE.border, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
+  chipActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  chipTxt: { color: PALETTE.white },
+  chipTxtActive: { color: "#fff", fontWeight: "700" },
+
+  // >>> AQUI a câmera cresce: ocupa quase toda a tela (flex: 1) e reduz as margens
+  viewerCard: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+
+  metaBox: { paddingTop: 6 },
+  meta: { color: PALETTE.sub, fontSize: 12 },
+});
+
+
+
+O que mudou
+
+
+
+
+Compactei a top bar (IP + Testar).
+
+
+Chips de modo com vermelho ativo igual ao antigo.
+
+
+O viewer agora tem flex: 1 e fica logo abaixo dos controles, ocupando praticamente todo o espaço disponível.
+
+
+Mantive as cores/bordas do app antigo.
+
+
+
+
+
+2) (Opcional) src/screens/HomeScreen.tsx com o mesmo visual
+
+
+import React from "react";
+import { View, Text, StyleSheet, Pressable } from "react-native";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function HomeScreen({ navigation }: any) {
+  return (
+    <View style={styles.container}>
+      <View style={styles.card}>
+        <Text style={styles.title}>HydroBot</Text>
+        <Text style={styles.sub}>Início do app</Text>
+
+        <Pressable style={styles.btn} onPress={() => navigation.navigate("Camera")}>
+          <Text style={styles.btnTxt}>Ir para Câmera</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, justifyContent: "center" },
+  card: {
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 14,
+    padding: 16,
+    gap: 8,
+  },
+  title: { color: PALETTE.white, fontSize: 22, fontWeight: "700" },
+  sub: { color: PALETTE.sub, marginBottom: 8 },
+  btn: {
+    alignSelf: "flex-start",
+    backgroundColor: PALETTE.red,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+});
+
+
+
+
+Se quiser mais ainda de tela para o vídeo, posso mover os chips para dentro da top bar (em uma linha) ou colocar um botão “Expandir” para esconder toda a UI e deixar full-screen. Quer assim?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // App.tsx
 import React from "react";
 import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
