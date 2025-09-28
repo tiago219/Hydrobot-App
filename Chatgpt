@@ -1,3 +1,629 @@
+
+Perfeito — vamos simplificar tudo para “app ⇄ ESP32-CAM direto”, sem servidor intermediário nem detecção. Abaixo vai:
+
+
+
+
+CameraScreen.tsx (apenas ajustes mínimos pra Android/WebView aceitar HTTP e MJPEG)
+
+
+Firmware ESP32-CAM minimalista com rotas /stream, /snapshot e /status estáveis, resolução segura (QVGA), duplo buffer e backoff — ideal pra parar com travamentos/overflow.
+
+
+
+
+
+1) src/screens/CameraScreen.tsx (substitua o arquivo todo)
+
+
+Principais mudanças:
+
+
+
+
+mixedContentMode="always" no WebView (Android bloqueia HTTP claro por padrão).
+
+
+androidHardwareAccelerationEnabled e setSupportMultipleWindows={false} só pra estabilidade.
+
+
+Mantive sua lógica de fallback para /snapshot sem alterar o resto.
+
+
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  Image,
+  AppState,
+  AppStateStatus,
+} from "react-native";
+import { WebView } from "react-native-webview";
+
+type Mode = "mjpeg" | "snapshot";
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.4.1");
+  const [testedIp, setTestedIp] = useState<string>("");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [status, setStatus] = useState<string>("Aguardando IP");
+  const [snapTick, setSnapTick] = useState<number>(0);
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const snapTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appState = useRef<AppStateStatus>(AppState.currentState);
+
+  const streamURL = useMemo(() => (testedIp ? `http://${testedIp}/stream` : ""), [testedIp]);
+  const snapshotURL = useMemo(
+    () => (testedIp ? `http://${testedIp}/snapshot?_=${snapTick}` : ""),
+    [testedIp, snapTick]
+  );
+  const healthURL = useMemo(() => (testedIp ? `http://${testedIp}/status` : ""), [testedIp]);
+
+  const startSnapshotLoop = useCallback(() => {
+    if (snapTimerRef.current) return;
+    snapTimerRef.current = setInterval(() => setSnapTick((t) => (t + 1) % 1_000_000), 150);
+  }, []);
+  const stopSnapshotLoop = useCallback(() => {
+    if (snapTimerRef.current) {
+      clearInterval(snapTimerRef.current);
+      snapTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (mode === "snapshot" && testedIp) startSnapshotLoop();
+    else stopSnapshotLoop();
+    return stopSnapshotLoop;
+  }, [mode, testedIp, startSnapshotLoop, stopSnapshotLoop]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState) => {
+      const prev = appState.current;
+      appState.current = nextState;
+      if (prev.match(/active/) && nextState.match(/inactive|background/)) {
+        stopSnapshotLoop();
+        setIsRunning(false);
+      } else if (prev.match(/inactive|background/) && nextState === "active") {
+        if (mode === "snapshot" && testedIp) startSnapshotLoop();
+        if (testedIp) setIsRunning(true);
+      }
+    });
+    return () => sub.remove();
+  }, [mode, testedIp, startSnapshotLoop, stopSnapshotLoop]);
+
+  const testConnection = useCallback(async () => {
+    const target = (ip || "").trim();
+    if (!target) {
+      setStatus("Informe o IP do ESP");
+      return;
+    }
+    setStatus("Testando conexão...");
+    setIsRunning(false);
+    stopSnapshotLoop();
+
+    // Primeiro tenta /status (rápido)
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/status`, { signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("mjpeg");
+        setStatus("Conectado (tentando MJPEG)...");
+        setIsRunning(true);
+        return;
+      }
+    } catch {}
+
+    // Tenta /stream
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/stream`, { method: "GET", signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("mjpeg");
+        setStatus("Conectado (MJPEG)...");
+        setIsRunning(true);
+        return;
+      }
+    } catch {}
+
+    // Fallback /snapshot
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/snapshot`, { method: "GET", signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("snapshot");
+        setStatus("Conectado (Snapshot contínuo)...");
+        setIsRunning(true);
+        startSnapshotLoop();
+        return;
+      }
+    } catch {}
+
+    setStatus("Falha ao conectar. Verifique IP/rede/firmware.");
+    setIsRunning(false);
+  }, [ip, startSnapshotLoop, stopSnapshotLoop]);
+
+  const mjpegHTML = useMemo(() => {
+    if (!streamURL) return "";
+    return `
+      <!doctype html>
+      <html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;}
+        #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+        img{max-width:100vw;max-height:100vh;object-fit:contain;}
+        #badge{position:fixed;left:8px;bottom:8px;padding:4px 8px;border-radius:8px;
+               background:#121218;color:#e5e7eb;font-family:system-ui,Arial,sans-serif;font-size:12px;opacity:.7}
+      </style></head>
+      <body>
+        <div id="wrap"><img id="mjpeg" src="${streamURL}" /></div>
+        <div id="badge">Stream: ${streamURL}</div>
+        <script>
+          const img = document.getElementById('mjpeg');
+          let retryMs = 800;
+          img.addEventListener('error', () => {
+            setTimeout(() => { img.src = '${streamURL}' + '?_=' + Date.now(); }, retryMs);
+            retryMs = Math.min(retryMs * 2, 4000);
+          });
+        </script>
+      </body></html>
+    `.trim();
+  }, [streamURL]);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>ESP32-CAM Viewer</Text>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex.: 192.168.4.1"
+          placeholderTextColor="#6b7280"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+        />
+        <Pressable style={styles.button} onPress={testConnection}>
+          <Text style={styles.buttonText}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <Text style={styles.status}>
+        Status: {status} {testedIp ? `| IP: ${testedIp}` : ""}
+        {testedIp ? ` | Modo: ${mode}` : ""}
+      </Text>
+
+      <View style={styles.viewer}>
+        {testedIp && isRunning ? (
+          mode === "mjpeg" ? (
+            <WebView
+              originWhitelist={["*"]}
+              source={{ html: mjpegHTML, baseUrl: `http://${testedIp}` }}
+              javaScriptEnabled
+              domStorageEnabled
+              allowsInlineMediaPlayback
+              allowsFullscreenVideo={false}
+              mediaPlaybackRequiresUserAction={false}
+              mixedContentMode="always"
+              androidHardwareAccelerationEnabled
+              setSupportMultipleWindows={false}
+              onError={() => {
+                setMode("snapshot");
+                setStatus("MJPEG falhou — alternando para Snapshot...");
+              }}
+              style={styles.webview}
+            />
+          ) : (
+            <Image
+              source={{ uri: snapshotURL }}
+              resizeMode="contain"
+              style={styles.image}
+              onError={() => setStatus("Erro no snapshot — checar conexão")}
+            />
+          )
+        ) : (
+          <View style={styles.placeholder}>
+            <Text style={{ color: PALETTE.text, opacity: 0.7, textAlign: "center" }}>
+              Informe o IP e toque em “Testar” para iniciar o vídeo.
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {testedIp ? (
+        <View style={styles.footerRow}>
+          <Pressable
+            style={[styles.smallBtn, mode === "mjpeg" ? styles.smallBtnActive : null]}
+            onPress={() => { setMode("mjpeg"); setStatus("Tentando MJPEG /stream..."); }}
+          >
+            <Text style={styles.smallBtnText}>Usar MJPEG</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.smallBtn, mode === "snapshot" ? styles.smallBtnActive : null]}
+            onPress={() => { setMode("snapshot"); setStatus("Usando /snapshot contínuo..."); }}
+          >
+            <Text style={styles.smallBtnText}>Usar Snapshot</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 12 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  label: { color: PALETTE.text },
+  input: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    color: PALETTE.text,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  button: { backgroundColor: PALETTE.accent, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10 },
+  buttonText: { color: "#fff", fontWeight: "700" },
+  status: { color: PALETTE.text, opacity: 0.9 },
+  viewer: {
+    flex: 1, backgroundColor: "#000", borderRadius: 12, overflow: "hidden",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  webview: { flex: 1, backgroundColor: "#000" },
+  image: { width: "100%", height: "100%" },
+  placeholder: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
+  footerRow: { flexDirection: "row", gap: 10, justifyContent: "center" },
+  smallBtn: {
+    paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, borderWidth: 1,
+    borderColor: PALETTE.border, backgroundColor: PALETTE.card,
+  },
+  smallBtnActive: { borderColor: PALETTE.accent },
+  smallBtnText: { color: PALETTE.text, fontWeight: "600" },
+});
+
+
+
+
+
+Obs. importante (Android Manifest): se seu app não abre HTTP claro, garanta usesCleartextTraffic="true" (Expo/Dev geralmente já permite). Como você está usando fetch("http://...") no testConnection, isso também depende desse flag.
+
+
+
+
+
+2) Firmware ESP32-CAM minimalista (apenas “mostrar câmera”)
+
+
+
+
+Rotas:
+
+
+
+GET /stream → MJPEG (multipart/x-mixed-replace)
+
+
+GET /snapshot → JPEG único
+
+
+GET /status → JSON simplificado
+
+
+
+
+
+
+Estabilidade: QVGA, jpeg_quality=15, fb_count=2, grab_mode=CAMERA_GRAB_LATEST, WiFi.setSleep(false) e pequeno backoff entre frames do stream.
+
+
+CORS: Access-Control-Allow-Origin: * (para seu fetch/Image/WebView não toparem CORS).
+
+
+Pins: usa seu board_config.h. Certifique-se que ele está para AI Thinker (ou seu módulo).
+
+
+
+
+Cole no seu projeto como HydrobotCam_Minimal.ino:
+
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ====== CONFIG WIFI ======
+const char* ssid     = "HydroBot";
+const char* password = "loud2025emibr";
+
+// ====== CAMERA PINS via board_config.h ======
+#include "board_config.h"
+
+// ====== SERVIDOR ======
+WebServer server(80);
+
+// ====== AJUSTES CAMERA ======
+static void apply_sensor_tweaks(sensor_t* s) {
+  if (!s) return;
+  // Ajustes comuns pra estabilizar cores e flip conforme módulo
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
+  }
+  // Resolução segura p/ estabilidade (pode subir p/ VGA se quiser)
+  s->set_framesize(s, FRAMESIZE_QVGA);
+  s->set_quality(s, 15); // 10=melhor qualidade; 15-20=mais leve
+  s->set_colorbar(s, 0);
+}
+
+// ====== HEADERS CORS/NO-CACHE ======
+static void set_no_cache_headers() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+}
+
+// ====== HANDLERS ======
+void handle_status() {
+  set_no_cache_headers();
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handle_snapshot() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    set_no_cache_headers();
+    server.send(503, "text/plain", "NO_FRAME");
+    return;
+  }
+  set_no_cache_headers();
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handle_stream() {
+  WiFiClient client = server.client();
+  const char* _boundary = "frame";
+  String hdr = 
+    "HTTP/1.1 200 OK\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+    "Pragma: no-cache\r\n"
+    "Connection: close\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=" + String(_boundary) + "\r\n\r\n";
+  client.print(hdr);
+
+  // Loop de streaming
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      delay(5);
+      continue;
+    }
+    client.print("--"); client.print(_boundary); client.print("\r\n");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.print("Content-Length: "); client.print(fb->len); client.print("\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    esp_camera_fb_return(fb);
+
+    // pequeno respiro pra reduzir overrun em cenas complexas
+    delay(5);
+  }
+}
+
+void handle_root() {
+  set_no_cache_headers();
+  server.send(200, "text/plain", "ESP32-CAM OK. Rotas: /status, /snapshot, /stream");
+}
+
+// ====== SETUP ======
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println("\nBooting...");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  // XCLK mais baixo ajuda a estabilidade (8~10 MHz); 20 MHz dá mais fps mas pode estourar buffer
+  config.xclk_freq_hz = 10000000; // 10 MHz estável
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.jpeg_quality = 15;
+  config.fb_count     = 2;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+
+  if (!psramFound()) {
+    // Sem PSRAM, adapta
+    config.fb_count    = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.jpeg_quality = 18;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed 0x%x\n", err);
+    // Tenta fallback leve
+    config.xclk_freq_hz = 8000000;
+    config.frame_size   = FRAMESIZE_QQVGA;
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      Serial.printf("Camera init fallback failed 0x%x\n", err);
+      while (true) { delay(1000); }
+    }
+  }
+
+  apply_sensor_tweaks(esp_camera_sensor_get());
+
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+  // Rotas
+  server.on("/", handle_root);
+  server.on("/status", HTTP_GET, handle_status);
+  server.on("/snapshot", HTTP_GET, handle_snapshot);
+  server.on("/stream", HTTP_GET, handle_stream);
+  server.begin();
+
+  Serial.println("HTTP server started");
+  Serial.printf("Use http://%s/stream\n", WiFi.localIP().toString().c_str());
+}
+
+void loop() {
+  server.handleClient();
+}
+
+
+
+Notas rápidas
+
+
+
+
+Se quiser mais qualidade após confirmar estabilidade, suba para FRAMESIZE_VGA ou melhore jpeg_quality (ex.: 12). Faça um ajuste por vez.
+
+
+Se ainda notar “sensibilidade” quando a cena tem muito detalhe, aumente delay(5) do stream para delay(8~12); isso reduz taxa de quadros, mas evita overflow.
+
+
+Se sua build anterior usava /stream na porta 81, este firmware usa porta 80 (padrão HTTP). No app eu já aponto para http://IP/stream (sem porta), então tudo certo.
+
+
+
+
+
+Como testar (sequência curtinha)
+
+
+
+
+Grave o firmware no ESP32-CAM. Abra o Serial Monitor e pegue o IP que ele imprime.
+
+
+No app, abra a tela Câmera, coloque o IP (ex.: 192.168.4.1 ou o IP que o serial mostrou) e toque Testar.
+
+
+Deve entrar em MJPEG. Se falhar (rede oscilando), o botão Usar Snapshot funciona como fallback imediato.
+
+
+
+
+Se algo ainda não aparecer:
+
+
+
+
+Confirme se consegue abrir http://SEU_IP/stream no navegador do celular (mesma rede).
+
+
+Se o WebView abrir “vazio” no Android, verifique o usesCleartextTraffic="true" no Manifest do app.
+
+
+
+
+Pronto — agora é só stream direto, sem heurística nem proxy.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // src/screens/CameraScreen.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
