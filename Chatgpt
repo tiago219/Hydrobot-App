@@ -1,4 +1,234 @@
 
+Perfeito. Vamos gerar um APK na nuvem com EAS Build (sem Android SDK no seu PC) já com usesCleartextTraffic=true, que permite acessar http://192.168.x.x direto do app.
+
+
+Passo a passo (sem SDK)
+
+
+1) Pré-requisitos
+
+
+
+
+Ter uma conta gratuita no Expo: https://expo.dev (faça login no navegador).
+
+
+Node.js instalado no seu PC.
+
+
+
+
+2) Instalar CLIs (sem Android Studio)
+
+
+npm i -g eas-cli
+# opcional: login pelo terminal
+eas login
+
+
+
+3) Configurar o app.json (ou app.config.ts)
+
+
+Abra o arquivo na raiz do projeto e garanta algo assim:
+
+
+{
+  "expo": {
+    "name": "HydroBotApp",
+    "slug": "hydrobot-app",
+    "scheme": "hydrobotapp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "jsEngine": "hermes",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.seuusuario.hydrobotapp",
+      "permissions": [],
+      "usesCleartextTraffic": true
+    },
+    "updates": { "fallbackToCacheTimeout": 0 }
+  }
+}
+
+
+
+
+
+O ponto crucial é "usesCleartextTraffic": true dentro de android.
+
+
+
+
+4) (Opcional mas recomendado) Usar Dev Client para desenvolvimento
+
+
+Se você quer continuar rodando seu JS pelo Metro (hot reload), instale o Dev Client:
+
+
+npm i expo-dev-client
+
+
+
+5) Configurar EAS
+
+
+Na primeira vez:
+
+
+eas build:configure
+# escolha Android, Managed workflow
+
+
+
+Crie um eas.json com dois perfis (dev e prod):
+
+
+{
+  "cli": { "version": ">= 3.0.0" },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": { "buildType": "apk" }
+    },
+    "production": {
+      "android": { "buildType": "apk" }
+    }
+  }
+}
+
+
+
+
+
+development → gera um Dev Client APK (ótimo pra testar seu código JS + hot reload).
+
+
+production → gera um APK “standalone” (leva o bundle JS junto).
+
+
+
+
+6) Fazer o build na nuvem (sem SDK local)
+
+
+Opção A — Dev Client (recomendada para testar a câmera)
+
+
+eas build -p android --profile development
+
+
+
+Ao terminar, o EAS vai mostrar um link para baixar o APK. Instale no seu celular (habilite “Fontes desconhecidas”).
+
+
+Depois, rode o seu projeto local:
+
+
+npx expo start --dev-client
+
+
+
+Abra o app instalado (HydroBotApp Dev Client) e conecte ao seu Metro (QR code/URL).
+
+
+Opção B — Production APK (não precisa Metro depois)
+
+
+eas build -p android --profile production
+
+
+
+Baixe e instale o APK. Ele já vem com o JS embutido.
+
+
+
+
+Importante: Em ambos os casos, o Manifest do APK terá usesCleartextTraffic=true, então seu app poderá acessar http://192.168.3.3 direto.
+
+
+
+
+7) Testar a tela da câmera
+
+
+
+
+Abra sua CameraScreen.tsx (a que te passei com autodetector).
+
+
+No campo IP, digite 192.168.3.3 e toque Testar.
+
+
+Se seu firmware usa porta 81 para /stream, a tela vai detectar http://192.168.3.3:81/stream.
+
+Se falhar, ela cai para capture/jpg/snapshot.
+
+
+
+
+8) Checklist rápido se ainda não aparecer
+
+
+
+
+Celular e ESP32-CAM na mesma rede Wi-Fi.
+
+
+Use IP direto (ex.: 192.168.3.3), não mDNS.
+
+
+Firmware rodando startCameraServer() e abrindo no navegador (como você já confirmou).
+
+
+Se a imagem “congela”, reduza resolução/qualidade no ESP (ex.: QVGA e jpeg_quality 12–16) e mantenha fb_count = 2 com PSRAM.
+
+
+
+
+
+Se preferir, posso te mandar um app.json e eas.json prontos com seu package e slug já preenchidos; é só colar e rodar os comandos do passo 6.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // src/screens/CameraScreen.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
