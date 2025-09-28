@@ -1,4 +1,135 @@
 
+Boa! O erro do print é exatamente do tsconfig:
+
+
+
+
+Cannot find type definition file for: expo/metro-runtime
+
+
+
+
+Isso acontece porque o tsconfig.json está com "types": ["expo/metro-runtime"] (ou algo parecido) e o TS não acha esses types. Em projetos Expo/React Native, você não precisa desse item.
+
+
+Corrija assim
+
+
+
+
+Instale os types básicos (se ainda não fez):
+
+
+
+
+npm i -D typescript @types/react @types/react-native
+
+
+
+
+
+Substitua seu tsconfig.json por este aqui (na raiz do projeto):
+
+
+
+
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["ES2017", "DOM"],
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "moduleResolution": "bundler",
+    "allowJs": false,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": ["react", "react-native"]
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}
+
+
+
+⚠️ Note que removi "expo/metro-runtime" da lista de types.
+
+
+
+
+
+
+Reinicie o TS Server no VS Code:
+
+Ctrl+Shift+P → “TypeScript: Restart TS server”.
+
+
+
+
+
+
+Limpe o cache do Expo e rode de novo:
+
+
+
+
+
+
+npx expo start -c
+
+
+
+Se aparecer qualquer outro erro, manda o novo print/linha que ajusto na hora.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Isso é erro de resolução de módulo: o Metro não está achando ./src/screens/HomeScreen (e os demais). Corrige com estes passos—na ordem:
 
 
