@@ -1,4 +1,326 @@
 
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  Image,
+  AppState,
+  AppStateStatus,
+} from "react-native";
+import { WebView } from "react-native-webview";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.4.1"); // ajuste para seu IP (ou mDNS se usar proxy)
+  const [testedIp, setTestedIp] = useState<string>(""); // IP efetivo em uso na visualização
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [status, setStatus] = useState<string>("Aguardando IP");
+  const [snapTick, setSnapTick] = useState<number>(0);
+  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const snapTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appState = useRef<AppStateStatus>(AppState.currentState);
+
+  const streamURL = useMemo(() => (testedIp ? `http://${testedIp}/stream` : ""), [testedIp]);
+  const snapshotURL = useMemo(
+    () => (testedIp ? `http://${testedIp}/snapshot?_=${snapTick}` : ""),
+    [testedIp, snapTick]
+  );
+  const healthURL = useMemo(() => (testedIp ? `http://${testedIp}/status` : ""), [testedIp]);
+
+  // ---- Controle do modo snapshot (polling) ----
+  const startSnapshotLoop = useCallback(() => {
+    if (snapTimerRef.current) return;
+    snapTimerRef.current = setInterval(() => setSnapTick((t) => (t + 1) % 1_000_000), 150); // ~6-7 FPS
+  }, []);
+
+  const stopSnapshotLoop = useCallback(() => {
+    if (snapTimerRef.current) {
+      clearInterval(snapTimerRef.current);
+      snapTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (mode === "snapshot" && testedIp) {
+      startSnapshotLoop();
+    } else {
+      stopSnapshotLoop();
+    }
+    return stopSnapshotLoop;
+  }, [mode, testedIp, startSnapshotLoop, stopSnapshotLoop]);
+
+  // Pausar quando app em background (evita consumo)
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState) => {
+      const prev = appState.current;
+      appState.current = nextState;
+      if (prev.match(/active/) && nextState.match(/inactive|background/)) {
+        stopSnapshotLoop();
+        setIsRunning(false);
+      } else if (prev.match(/inactive|background/) && nextState === "active") {
+        if (mode === "snapshot" && testedIp) startSnapshotLoop();
+        if (testedIp) setIsRunning(true);
+      }
+    });
+    return () => sub.remove();
+  }, [mode, testedIp, startSnapshotLoop, stopSnapshotLoop]);
+
+  // ---- Teste de conexão e fallback automático ----
+  const testConnection = useCallback(async () => {
+    const target = (ip || "").trim();
+    if (!target) {
+      setStatus("Informe o IP do ESP");
+      return;
+    }
+    setStatus("Testando conexão...");
+    setIsRunning(false);
+    stopSnapshotLoop();
+
+    // 1) Tenta um GET rápido no /status (se existir)
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/status`, { signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("mjpeg");
+        setStatus("Conectado (tentando MJPEG)...");
+        setIsRunning(true);
+        return;
+      }
+    } catch (_) {
+      // segue para checar /stream e /snapshot
+    }
+
+    // 2) Checa se /stream responde pelo menos com headers
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/stream`, { method: "GET", signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("mjpeg");
+        setStatus("Conectado (MJPEG)...");
+        setIsRunning(true);
+        return;
+      }
+    } catch (_) {
+      // segue
+    }
+
+    // 3) Fallback: tenta /snapshot
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 2000);
+      const r = await fetch(`http://${target}/snapshot`, { method: "GET", signal: ctrl.signal });
+      clearTimeout(to);
+      if (r.ok) {
+        setTestedIp(target);
+        setMode("snapshot");
+        setStatus("Conectado (Snapshot contínuo)...");
+        setIsRunning(true);
+        startSnapshotLoop();
+        return;
+      }
+    } catch (_) {
+      // segue
+    }
+
+    setStatus("Falha ao conectar. Verifique IP/rede/firmware.");
+    setIsRunning(false);
+  }, [ip, startSnapshotLoop, stopSnapshotLoop]);
+
+  // ---- UI MJPEG via WebView (funciona bem no Android) ----
+  const mjpegHTML = useMemo(() => {
+    if (!streamURL) return "";
+    // HTML simples que carrega o MJPEG e tenta auto-reconectar em caso de erro
+    return `
+      <!doctype html>
+      <html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
+      <style>
+        html,body{margin:0;padding:0;background:#0b0b0f;height:100%;overflow:hidden;}
+        #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+        img{max-width:100vw;max-height:100vh;object-fit:contain;}
+        #badge{position:fixed;left:8px;bottom:8px;padding:4px 8px;border-radius:8px;
+               background:#121218;color:#e5e7eb;font-family:system-ui,Arial,sans-serif;font-size:12px;opacity:.7}
+      </style></head>
+      <body>
+        <div id="wrap">
+          <img id="mjpeg" src="${streamURL}" />
+        </div>
+        <div id="badge">Stream: ${streamURL}</div>
+        <script>
+          const img = document.getElementById('mjpeg');
+          let retryMs = 1000;
+          img.addEventListener('error', () => {
+            setTimeout(() => {
+              img.src = '${streamURL}' + '?_=' + Date.now();
+            }, retryMs);
+            retryMs = Math.min(retryMs * 2, 5000);
+          });
+        </script>
+      </body></html>
+    `.trim();
+  }, [streamURL]);
+
+  // ---- Render ----
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>ESP32-CAM Viewer</Text>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex.: 192.168.4.1"
+          placeholderTextColor="#6b7280"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+        />
+        <Pressable style={styles.button} onPress={testConnection}>
+          <Text style={styles.buttonText}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <Text style={styles.status}>
+        Status: {status} {testedIp ? `| IP: ${testedIp}` : ""}
+        {testedIp ? ` | Modo: ${mode}` : ""}
+      </Text>
+
+      <View style={styles.viewer}>
+        {testedIp && isRunning ? (
+          mode === "mjpeg" ? (
+            <WebView
+              originWhitelist={["*"]}
+              source={{ html: mjpegHTML, baseUrl: `http://${testedIp}` }}
+              javaScriptEnabled
+              domStorageEnabled
+              allowsInlineMediaPlayback
+              allowsFullscreenVideo={false}
+              mediaPlaybackRequiresUserAction={false}
+              onError={() => {
+                // Cai para snapshot se o WebView reportar erro
+                setMode("snapshot");
+                setStatus("MJPEG falhou — alternando para Snapshot...");
+              }}
+              style={styles.webview}
+            />
+          ) : (
+            <Image
+              source={{ uri: snapshotURL }}
+              resizeMode="contain"
+              style={styles.image}
+              onError={() => setStatus("Erro no snapshot — checar conexão")}
+            />
+          )
+        ) : (
+          <View style={styles.placeholder}>
+            <Text style={{ color: PALETTE.text, opacity: 0.7, textAlign: "center" }}>
+              Informe o IP e toque em “Testar” para iniciar o vídeo.
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {testedIp ? (
+        <View style={styles.footerRow}>
+          <Pressable
+            style={[styles.smallBtn, mode === "mjpeg" ? styles.smallBtnActive : null]}
+            onPress={() => {
+              setMode("mjpeg");
+              setStatus("Tentando MJPEG /stream...");
+            }}
+          >
+            <Text style={styles.smallBtnText}>Usar MJPEG</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.smallBtn, mode === "snapshot" ? styles.smallBtnActive : null]}
+            onPress={() => {
+              setMode("snapshot");
+              setStatus("Usando /snapshot contínuo...");
+            }}
+          >
+            <Text style={styles.smallBtnText}>Usar Snapshot</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 12 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  label: { color: PALETTE.text },
+  input: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    color: PALETTE.text,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  button: {
+    backgroundColor: PALETTE.accent,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  buttonText: { color: "#fff", fontWeight: "700" },
+  status: { color: PALETTE.text, opacity: 0.9 },
+  viewer: {
+    flex: 1,
+    backgroundColor: "#000",
+    borderRadius: 12,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+  },
+  webview: { flex: 1, backgroundColor: "#000" },
+  image: { width: "100%", height: "100%" },
+  placeholder: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
+  footerRow: { flexDirection: "row", gap: 10, justifyContent: "center" },
+  smallBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    backgroundColor: PALETTE.card,
+  },
+  smallBtnActive: { borderColor: PALETTE.accent },
+  smallBtnText: { color: PALETTE.text, fontWeight: "600" },
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — abaixo está a CameraScreen.tsx já adaptada para funcionar com o firmware padrão do ESP32-CAM (que expõe /jpg ou /stream no exemplo oficial, e alguns forks usam /snapshot ou /capture).
 
 O componente tenta automaticamente /snapshot → /jpg → /capture até encontrar um que responda, e mantém polling leve com troca suave de frames (crossfade). É 100% compatível com Expo Go, sem precisar de WebView.
