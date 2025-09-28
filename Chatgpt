@@ -1,4 +1,304 @@
 
+Perfeito. Abaixo vai uma tela simples e direta para o Expo Go que puxa as imagens da sua ESP32-CAM usando o seu firmware (endpoints /stream e /snapshot).
+
+Ela tem dois modos: MJPEG (via WebView) e Snapshot (polling). O Snapshot é o “plano B” caso o stream não renderize no seu aparelho.
+
+
+Antes de usar:
+
+
+# dentro do projeto Expo
+npx expo install react-native-webview
+
+
+
+Crie o arquivo src/screens/CameraScreen.tsx (ou ajuste o caminho que preferir) com o conteúdo abaixo e registre essa tela no seu navigator ou use como App.tsx para testar.
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  Image,
+  AppState,
+  AppStateStatus,
+  Platform,
+} from "react-native";
+import { WebView } from "react-native-webview";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#0b0b0f",
+  card: "#121218",
+  border: "#25273a",
+  accent: "#e6403a",
+  text: "#e5e7eb",
+  sub: "#9ca3af",
+};
+
+export default function CameraScreen() {
+  // Ajuste o IP para o seu ESP (o seu firmware sobe na porta 80)
+  const [ip, setIp] = useState<string>("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [connected, setConnected] = useState<string>("—");
+  const [lastErr, setLastErr] = useState<string>("");
+
+  // ---- SNAPSHOT LOOP ----
+  const [snapUri, setSnapUri] = useState<string>("");
+  const timerRef = useRef<NodeJS.Timer | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  const baseUrl = useMemo(() => `http://${ip}`, [ip]);
+  const statusUrl = useMemo(() => `${baseUrl}/status`, [baseUrl]);
+  const snapshotUrl = useMemo(() => `${baseUrl}/snapshot`, [baseUrl]);
+  const streamUrl = useMemo(() => `${baseUrl}/stream`, [baseUrl]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  const startSnapshotLoop = useCallback(() => {
+    clearTimer();
+    // 8 fps aproximado (125ms) é estável para QVGA; ajuste se quiser aliviar a CPU/Rede
+    timerRef.current = setInterval(() => {
+      // cache-buster para o <Image> puxar sempre um frame novo
+      setSnapUri(`${snapshotUrl}?ts=${Date.now()}`);
+    }, 125);
+  }, [snapshotUrl, clearTimer]);
+
+  // Pausa/retoma o polling quando app vai background/foreground
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active") {
+        if (mode === "snapshot") startSnapshotLoop();
+      }
+      if (next.match(/inactive|background/)) {
+        clearTimer();
+      }
+      appState.current = next;
+    });
+    return () => {
+      sub.remove();
+      clearTimer();
+    };
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  // Inicia/para loop conforme modo
+  useEffect(() => {
+    setLastErr("");
+    if (mode === "snapshot") {
+      startSnapshotLoop();
+    } else {
+      clearTimer();
+    }
+    return () => clearTimer();
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  // Checagem simples de status do ESP (mostra IP retornado)
+  const checkStatus = useCallback(async () => {
+    try {
+      const res = await fetch(statusUrl, { method: "GET" });
+      const txt = await res.text();
+      setConnected(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e: any) {
+      setConnected("Falhou");
+      setLastErr(String(e?.message || e));
+    }
+  }, [statusUrl]);
+
+  // Checa status quando IP muda
+  useEffect(() => {
+    if (!ip) return;
+    checkStatus();
+  }, [ip, checkStatus]);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>ESP32-CAM Viewer</Text>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          style={styles.input}
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex.: 192.168.3.3"
+          placeholderTextColor={PALETTE.sub}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+        />
+        <Pressable style={styles.btn} onPress={checkStatus}>
+          <Text style={styles.btnTxt}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.row, { marginTop: 8 }]}>
+        <ModeButton text="MJPEG (/stream)" active={mode === "mjpeg"} onPress={() => setMode("mjpeg")} />
+        <ModeButton text="Snapshot (/snapshot)" active={mode === "snapshot"} onPress={() => setMode("snapshot")} />
+      </View>
+
+      <View style={styles.card}>
+        {mode === "mjpeg" ? (
+          <WebView
+            source={{ uri: streamUrl }}
+            style={styles.video}
+            // melhora estabilidade em conexões locais
+            allowUniversalAccessFromFileURLs
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            onError={(e) => setLastErr(`WebView: ${e.nativeEvent.description}`)}
+            onHttpError={(e) => setLastErr(`HTTP ${e.nativeEvent.statusCode}`)}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={styles.video}
+            resizeMode="contain"
+            onError={(e) => setLastErr(`Snapshot: erro ao carregar`)}
+          />
+        )}
+      </View>
+
+      <View style={{ gap: 4 }}>
+        <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{connected}</Text></Text>
+        <Text style={styles.meta}>Stream URL: <Text style={{ color: PALETTE.sub }}>{streamUrl}</Text></Text>
+        <Text style={styles.meta}>Snapshot URL: <Text style={{ color: PALETTE.sub }}>{snapshotUrl}</Text></Text>
+        {!!lastErr && <Text style={[styles.meta, { color: "#fca5a5" }]}>Erro: {lastErr}</Text>}
+      </View>
+
+      <View style={{ marginTop: 10 }}>
+        <Text style={[styles.meta, { color: PALETTE.sub }]}>
+          Dicas: para testes, deixe o celular e o ESP no MESMO Wi-Fi. No Expo, escolha{" "}
+          <Text style={{ color: PALETTE.text }}>LAN</Text>. Se o celular estiver no AP do ESP e o PC em outra rede,
+          use <Text style={{ color: PALETTE.text }}>Tunnel</Text> só para carregar o app; o vídeo vem direto do ESP.
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+function ModeButton({
+  text, active, onPress,
+}: { text: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={[
+        styles.modeBtn,
+        { backgroundColor: active ? PALETTE.accent : "transparent", borderColor: PALETTE.border },
+      ]}
+    >
+      <Text style={{ color: active ? "white" : PALETTE.text, fontWeight: "700" }}>{text}</Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 12 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  label: { color: PALETTE.text, width: 60, fontWeight: "600" },
+  input: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: PALETTE.text,
+  },
+  btn: {
+    backgroundColor: PALETTE.accent,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  btnTxt: { color: "white", fontWeight: "700" },
+  modeBtn: {
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  card: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  video: { width: "100%", height: "100%" },
+  meta: { color: PALETTE.text, fontSize: 12 },
+});
+
+
+
+Como usar
+
+
+
+
+Garanta que o ESP32-CAM esteja conectado ao mesmo Wi-Fi do celular (ou que o celular esteja no AP dele) e que o firmware esteja rodando.
+
+
+Abra o app pelo Expo Go.
+
+
+Digite o IP do ESP (ex.: 192.168.3.3) e toque em Testar.
+
+
+Se não aparecer no modo MJPEG, troque para Snapshot e veja se os frames começam a atualizar.
+
+
+Se estiver usando o AP do ESP e o PC em outra rede, abra o app via Tunnel (para carregar o bundle) — o vídeo é acessado direto do ESP, então o essencial é o celular enxergar o ESP.
+
+
+
+
+Se quiser, eu adapto essa tela para salvar o IP em AsyncStorage e adicionar botões para LED ON/OFF depois.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Fechou. Vamos começar do ZERO e rodar no Expo Go (sem Android SDK).
 
 
