@@ -1,3 +1,27 @@
+{/* Controles simples de intervalo */}
+<View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
+  <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
+  <Pressable
+    onPress={() => setIntervalMs(ms => Math.max(400, ms - 50))}
+    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+  >
+    <Text style={styles.btnText}>-50</Text>
+  </Pressable>
+  <Pressable
+    onPress={() => setIntervalMs(ms => Math.min(900, ms + 50))}
+    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+  >
+    <Text style={styles.btnText}>+50</Text>
+  </Pressable>
+</View>
+
+
+
+
+
+
+
+
 Perfeito — vamos rodar sem Android SDK e sem build nativo, direto no Expo Go.
 
 A forma que funciona no Expo Go é snapshot polling: baixar http://ESP/snapshot a cada ~400–800 ms e fazer crossfade. Isso não usa WebView nem precisa de proxy/HTTPS.
