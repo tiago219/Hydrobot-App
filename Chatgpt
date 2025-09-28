@@ -1,3 +1,59 @@
+// App.tsx
+import React from "react";
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+
+export type TabParamList = { Home: undefined; Camera: undefined };
+const Tab = createBottomTabNavigator<TabParamList>();
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#FFFFFF" };
+
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: PALETTE.bg,
+    primary: PALETTE.red,
+    card: PALETTE.card,
+    text: PALETTE.white,
+    border: PALETTE.border,
+    notification: PALETTE.red,
+  },
+};
+
+export default function App() {
+  return (   // <-- sem quebra de linha aqui
+    <NavigationContainer theme={DarkThemeHB}>
+      <Tab.Navigator
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: PALETTE.card },
+          headerTintColor: PALETTE.white,
+          tabBarStyle: { backgroundColor: PALETTE.bg, borderTopColor: PALETTE.border },
+          tabBarActiveTintColor: PALETTE.red,
+          tabBarInactiveTintColor: "#9c9c9c",
+          tabBarIcon: ({ color, size }) => {
+            const iconMap = { Home: "home", Camera: "videocam" } as const;
+            return <Ionicons name={iconMap[route.name as keyof typeof iconMap]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={{ title: "Início", tabBarLabel: "Início" }} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={{ title: "Câmera", tabBarLabel: "Câmera" }} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+
+
+
 
 // App.tsx
 import React from "react";
