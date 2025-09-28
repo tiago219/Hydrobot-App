@@ -1,4 +1,206 @@
 
+// ================= ESP32-CAM – mantém CameraWebServer + adiciona /cmd /pump /hud =================
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+// ======= Modelo de câmera (ou use seu board_config.h) =======
+#include "board_config.h"   // mantém sua seleção do modelo/pinos
+
+// ======= Wi-Fi =======
+const char *ssid     = "HydroBot";
+const char *password = "loud2025emibr";
+
+// ======= Declarações vindas do CameraWebServer original =======
+void startCameraServer();
+void setupLedFlash();
+
+// O CameraWebServer (app_httpd.cpp) costuma expor este handle global:
+extern "C" httpd_handle_t camera_httpd;   // << usamos pra registrar nossos endpoints
+
+// ======= HUD cache (telemetria lida da Serial do Arduino) =======
+static String lastHudJson = "{\"nivelAguaPct\":0,\"fogoE\":false,\"fogoM\":false,\"fogoD\":false,\"modo\":\"AUTO\"}";
+
+// Leitura de linhas JSON da Serial (terminadas em \n)
+static void poll_serial_hud() {
+  static String line;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c=='\n' || c=='\r') {
+      if (line.length() > 0 && line.charAt(0) == '{') {
+        lastHudJson = line;
+      }
+      line = "";
+    } else {
+      if (line.length() < 512) line += c;
+    }
+  }
+}
+
+// ======= Utils HTTP =======
+static void set_nocache(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  httpd_resp_set_hdr(req, "Expires", "0");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+}
+
+// GET /hud  -> retorna o último JSON vindo do Arduino
+static esp_err_t hud_handler(httpd_req_t *req) {
+  set_nocache(req);
+  httpd_resp_set_type(req, "application/json");
+  // leitura rápida para manter fresco (não bloqueia)
+  poll_serial_hud();
+  return httpd_resp_send(req, lastHudJson.c_str(), HTTPD_RESP_USE_STRLEN);
+}
+
+// GET /cmd?c=FWD&ms=250   |   /cmd?c=STOP
+static esp_err_t cmd_handler(httpd_req_t *req) {
+  set_nocache(req);
+  char q[64]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
+  String c = "STOP"; int ms = 200;
+  if (qlen > 1 && qlen < sizeof(q)) {
+    httpd_req_get_url_query_str(req, q, qlen);
+    char v[16];
+    if (httpd_query_key_value(q, "c", v, sizeof(v)) == ESP_OK) c = v;
+    if (httpd_query_key_value(q, "ms", v, sizeof(v)) == ESP_OK) ms = atoi(v);
+  }
+  if (c == "STOP") Serial.println("CMD:STOP");
+  else             Serial.printf("CMD:%s:ms=%d\n", c.c_str(), ms);
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+// GET /pump?on=1|0
+static esp_err_t pump_handler(httpd_req_t *req) {
+  set_nocache(req);
+  char q[32]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
+  int on = 0;
+  if (qlen > 1 && qlen < sizeof(q)) {
+    httpd_req_get_url_query_str(req, q, qlen);
+    char v[8];
+    if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) on = atoi(v);
+  }
+  if (on) Serial.println("CMD:PUMP:on"); else Serial.println("CMD:PUMP:off");
+
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+// Registra endpoints no mesmo servidor (porta 80) criado por startCameraServer()
+static void register_control_endpoints() {
+  if (!camera_httpd) return;   // se por algum motivo não existir (fork diferente)
+
+  httpd_uri_t hud_uri  = { .uri="/hud",  .method=HTTP_GET, .handler=hud_handler,  .user_ctx=NULL };
+  httpd_uri_t cmd_uri  = { .uri="/cmd",  .method=HTTP_GET, .handler=cmd_handler,  .user_ctx=NULL };
+  httpd_uri_t pump_uri = { .uri="/pump", .method=HTTP_GET, .handler=pump_handler, .user_ctx=NULL };
+
+  httpd_register_uri_handler(camera_httpd, &hud_uri);
+  httpd_register_uri_handler(camera_httpd, &cmd_uri);
+  httpd_register_uri_handler(camera_httpd, &pump_uri);
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);               // UART com o Arduino
+  Serial.setDebugOutput(false);
+
+  // ---------- init câmera (igual ao seu "código certo") ----------
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size   = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG;  // streaming
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  } else {
+    config.frame_size = FRAMESIZE_240X240;
+  }
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    // fallback simples, evita reboot em ambientes críticos
+    config.frame_size   = FRAMESIZE_SVGA;
+    config.xclk_freq_hz = 10000000;
+    config.jpeg_quality = 14;
+    config.fb_count     = 1;
+    if (esp_camera_init(&config) != ESP_OK) {
+      for(;;) delay(1000);
+    }
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s->id.PID == OV3660_PID) { s->set_vflip(s, 1); s->set_brightness(s, 1); s->set_saturation(s, -2); }
+  if (config.pixel_format == PIXFORMAT_JPEG) s->set_framesize(s, FRAMESIZE_QVGA);  // taxa mais estável
+
+  // ---------- Wi-Fi ----------
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  while (WiFi.status() != WL_CONNECTED) { delay(400); }
+
+  // ---------- servidor original ----------
+  startCameraServer();
+
+  // ---------- registrar controles no MESMO servidor ----------
+  register_control_endpoints();
+}
+
+void loop() {
+  // Só mantém HUD fresca; não bloqueia
+  poll_serial_hud();
+  delay(10);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ===================== ESP32-CAM — Camera + Controle do Carro + HUD =====================
 #include "esp_camera.h"
 #include <WiFi.h>
