@@ -1,576 +1,354 @@
 
-Beleza — vamos garantir máximo de tela sem corte e sem sobrar “moldura” boba.
 
-
-Tem dois pontos que encolhem o vídeo:
-
-
-
-
-A tab bar ainda ocupa altura (mesmo com headerShown: false).
-
-
-O WebView estava renderizando o <img> sem “prender” no viewport real do webview.
-
-
-
-
-A correção é simples:
-
-
-
-1) App.tsx — esconda a tab bar só na tela Câmera
-
-
-Troque apenas a definição da aba Câmera para:
-
-
-<Tab.Screen
-  name="Câmera"
-  component={CameraScreen}
-  options={{
-    headerShown: false,
-    // Esconde a tab bar só nesta tela:
-    tabBarStyle: { display: "none" },
-  }}
-/>
-
-
-
-
-
-Dica: mantenha o nome exatamente “Câmera”, que é o que você já usa.
-
-
-
-
-
-2) CameraScreen.tsx — force o stream a ocupar o viewport inteiro do WebView com contain
-
-
-Substitua só estes trechos no seu arquivo atual:
-
-
-(a) O HTML do MJPEG
-
-
-Troque sua constante mjpegHtml por esta versão (usa position:fixed + 100vw/100vh e object-fit:contain):
-
-
-const mjpegHtml = useMemo(
-  () => `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover"/>
-    <style>
-      html, body { margin:0; padding:0; background:#000; }
-      /* Ocupa TODO o viewport do WebView */
-      img {
-        position: fixed; inset: 0;       /* prende nas bordas do viewport */
-        width: 100vw; height: 100vh;     /* usa toda a área disponível */
-        object-fit: contain;              /* mostra tudo, sem cortar */
-        background:#000;
-      }
-    </style>
-  </head>
-  <body>
-    <img src="${streamUrl}" />
-  </body>
-</html>`.trim(),
-  [streamUrl]
-);
-
-
-
-(b) O contêiner do viewer
-
-
-Garanta que o viewer realmente ocupe a tela toda. Troque o style do bloco do viewer:
-
-
-<View style={styles.viewer}>
-  {mode === "mjpeg" ? (
-    <WebView
-      originWhitelist={['*']}
-      source={{ html: mjpegHtml }}
-      style={StyleSheet.absoluteFill}   // ocupa tudo
-      allowsInlineMediaPlayback
-      mediaPlaybackRequiresUserAction={false}
-      onError={onWvError}
-      onHttpError={onWvHttpError}
-    />
-  ) : (
-    <Image
-      source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
-      style={StyleSheet.absoluteFill}   // ocupa tudo
-      resizeMode="contain"              // mostra tudo, sem cortar
-      onError={onImgError}
-    />
-  )}
-</View>
-
-
-
-E ajuste o estilo viewer para sumir com bordas:
-
-
-viewer: {
-  ...StyleSheet.absoluteFillObject,   // <<< total
-  backgroundColor: "#000",
-},
-
-
-
-Se você já tinha flex: 1, pode manter, mas absoluteFill garante que nem padding/margem “vazem”.
-
-
-
-3) (opcional) UI em overlay
-
-
-Como você já está usando o botão flutuante para abrir os controles, deixe o showUi como false por padrão (como está) — assim nada rouba altura do viewer.
-
-
-
-Resultado esperado
-
-
-
-
-Tab bar escondida na Câmera → +altura útil.
-
-
-StatusBar oculta (você já está usando <StatusBar hidden />) → +altura útil.
-
-
-<img> do stream e <Image> do snapshot presos ao viewport com object-fit/resizeMode: contain → preenche o máximo possível sem cortar; se a proporção não bater, só aparecem pequenas faixas pretas, mas nada da câmera é cortado.
-
-
-
-
-Se ainda parecer menor do que deveria, me diga:
-
-
-
-
-resolução que o ESP está enviando (QVGA/SVGA, etc.),
-
-
-orientação do aparelho (retrato vs. paisagem),
-
-
-e se a tab bar realmente sumiu (às vezes o nome da aba não bate e a opção não aplica).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React from "react";
-import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
-import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
-import { Ionicons } from "@expo/vector-icons";
-import { LogBox } from "react-native";
-
-import HomeScreen from "./src/screens/HomeScreen";
-import CameraScreen from "./src/screens/CameraScreen";
-
-LogBox.ignoreLogs(["useInsertionEffect must not schedule updates"]);
-
-const Tab = createBottomTabNavigator();
-
-const theme = {
-  ...DefaultTheme,
-  colors: {
-    ...DefaultTheme.colors,
-    background: "#0b0b0f",
-    card: "#0b0b0f",
-    text: "#e5e7eb",
-    border: "#25273a",
-    primary: "#e6403a",
-  },
-};
-
-export default function App() {
-  return (
-    <NavigationContainer theme={theme}>
-      <Tab.Navigator
-        screenOptions={({ route }) => ({
-          headerShown: false,
-          tabBarStyle: { backgroundColor: "#0b0b0f", borderTopColor: "#25273a" },
-          tabBarActiveTintColor: "#e6403a",
-          tabBarInactiveTintColor: "#9aa0a6",
-          tabBarIcon: ({ color, size }) => {
-            const name =
-              route.name === "Início" ? "home" :
-              route.name === "Câmera" ? "videocam" : "ellipse";
-            return <Ionicons name={name as any} size={size} color={color} />;
-          },
-        })}
-      >
-        <Tab.Screen name="Início" component={HomeScreen} />
-        <Tab.Screen name="Câmera" component={CameraScreen} />
-      </Tab.Navigator>
-    </NavigationContainer>
-  );
+// ====== HydroBot – AUTO (delta analógico) + botão alterna MODO_APP/MODO_AUTO (SEM SERVO) ======
+#include <Arduino.h>
+
+/* ---------------- PINOS ---------------- */
+// Motores (ponte H)
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+
+// Sensores KY-026 (digitais)
+#define SENSOR_FOGO_ESQ_D 4   // LOW = fogo
+#define SENSOR_FOGO_MEIO_D 5
+#define SENSOR_FOGO_DIR_D 6
+
+// Sensores KY-026 (analógicos)
+#define SENSOR_FOGO_ESQ  A2
+#define SENSOR_FOGO_MEIO A1
+#define SENSOR_FOGO_DIR  A0
+
+// Bomba / Nível de água / LED
+#define BOMBA_PIN      13          // rele/driver da bomba
+#define NIVEL_AGUA_PIN A3          // sensor nível (0-1023)
+#define LED_NIVEL      12          // LED indicador de água (pino comum, sem PWM no UNO)
+#define BOTAO          7           // alterna modo APP/AUTO (com PULLUP)
+
+/* ---------------- PARÂMETROS ---------------- */
+// Detecção por delta: base - leitura
+static const int DIFERENCA_FOGO  = 150;   // aciona
+static const int DIFERENCA_CLEAR = 100;   // limpa (histerese)
+
+static const uint8_t  CONFIRM_READS = 3;
+static const uint8_t  CONFIRM_MIN   = 2;
+static const uint16_t CONFIRM_SPACING_MS = 15;
+
+static const uint16_t FIRE_HOLD_MS = 250;
+
+static const uint16_t TEMPO_CALIBRACAO_MS = 3000; // 3 s
+static const uint8_t  RECALIB_EVERY_CONFIRMED = 5;
+
+static const uint8_t  VEL_PERC = 60;
+static const uint16_t T_FWD_MS  = 210;
+static const uint16_t T_TURN_MS = 150;
+static const uint16_t T_BACK_MS = 260; // reserva
+
+/* ---------------- ESTADO ---------------- */
+enum Modo : uint8_t { MODO_APP = 0, MODO_AUTO = 1 };
+enum Dir  : uint8_t { DIR_STOP=0, DIR_FWD, DIR_BACK, DIR_LEFT, DIR_RIGHT };
+
+struct State {
+  // modo
+  Modo modo = MODO_AUTO;
+
+  // calibração analógica
+  int baseEsq=0, baseMeio=0, baseDir=0;
+  bool calibrado=false;
+
+  // água/LED/bomba
+  uint8_t nivelAguaPct=0;
+  bool bombaOn=false;
+  unsigned long ledTick=0;
+  bool ledState=false;
+
+  // fogo confirmado
+  bool fogoConfirmado=false;
+  unsigned long fogoHoldUntil=0;
+  uint16_t eventosConfirmados=0;
+
+  // movimento watchdog
+  Dir currentDir=DIR_STOP;
+  bool motionActive=false;
+  unsigned long motionEndMs=0;
+  unsigned long lastMoveCmdAt=0;
+
+  // botão (debounce + toggle)
+  bool lastBtn=HIGH;
+  unsigned long lastBtnChange=0;
+} G;
+
+/* ---------------- PROTÓTIPOS ---------------- */
+void motorsStop(); void motorsFwd(); void motorsBack(); void motorsLeftTurn(); void motorsRightTurn();
+void setMotion(Dir d, uint16_t ms);
+void pwmSoftware(void (*mov)(), int velPerc, int duracaoMs);
+
+void pumpWrite(bool on);
+uint8_t waterPercent();
+void updateWaterLED(uint8_t pct);
+
+void calibrarSensores();
+static inline void leituraDelta(int &dE,int &dM,int &dD, int &side);
+bool detectarFogoConfirmado(int &sideOut);
+bool isClearNow();
+
+void handleAuto();
+void handleApp(); // “manual/app”: aqui só gerencia água/LED e espera comandos pela Serial
+
+void processSerialFromESP();
+
+/* ---------------- IMPLEMENTAÇÃO ---------------- */
+// Motores
+void motorsStop(){ digitalWrite(IN1,LOW);digitalWrite(IN2,LOW);digitalWrite(IN3,LOW);digitalWrite(IN4,LOW); G.currentDir=DIR_STOP; }
+void motorsFwd(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);  G.currentDir=DIR_FWD; }
+void motorsBack(){ digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH); G.currentDir=DIR_BACK; }
+void motorsLeftTurn(){  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW); digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH); G.currentDir=DIR_LEFT; }
+void motorsRightTurn(){ digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);  G.currentDir=DIR_RIGHT; }
+
+void setMotion(Dir d, uint16_t ms){
+  if (ms==0 || d==DIR_STOP){ motorsStop(); G.motionActive=false; return; }
+  switch(d){ case DIR_FWD: motorsFwd(); break; case DIR_BACK: motorsBack(); break;
+             case DIR_LEFT: motorsLeftTurn(); break; case DIR_RIGHT: motorsRightTurn(); break; default: motorsStop(); }
+  G.motionActive=true; G.motionEndMs=millis()+ms; G.lastMoveCmdAt=millis();
 }
 
+// PWM por software para passos curtos
+void pwmSoftware(void (*movimento)(), int vel, int duracao){
+  unsigned long inicio = millis();
+  const int ciclo = 10;               // 10 ms
+  const int onMs = (ciclo * vel) / 100;
+  const int offMs = ciclo - onMs;
+  while ((int)(millis()-inicio) < duracao){
+    movimento(); delay(onMs);
+    if (vel < 100 && offMs>0){ motorsStop(); delay(offMs); }
+  }
+}
 
+// Água / LED / Bomba
+void pumpWrite(bool on){ G.bombaOn=on; digitalWrite(BOMBA_PIN, on?HIGH:LOW); }
+uint8_t waterPercent(){ int raw=analogRead(NIVEL_AGUA_PIN); int pct=map(raw,0,1023,0,100); return (uint8_t)constrain(pct,0,100); }
 
+// LED de nível por FASES (sem PWM de pino):
+// >=60%: LED apagado
+// 40-59%: LED aceso fixo
+// 20-39%: pisca lento (800 ms)
+// 10-19%: pisca médio (400 ms)
+// <10%:  pisca rápido (200 ms)
+void updateWaterLED(uint8_t pct){
+  unsigned long now = millis();
 
+  if (pct >= 60){
+    if (G.ledState){ G.ledState=false; digitalWrite(LED_NIVEL, LOW); }
+    return;
+  }
 
+  if (pct >= 40){
+    if (!G.ledState){ G.ledState=true; digitalWrite(LED_NIVEL, HIGH); }
+    return;
+  }
 
+  uint16_t periodo = (pct >= 20) ? 800 : (pct >= 10 ? 400 : 200);
+  if (now - G.ledTick >= periodo){
+    G.ledTick = now;
+    G.ledState = !G.ledState;
+    digitalWrite(LED_NIVEL, G.ledState ? HIGH : LOW);
+  }
+}
 
+// Calibração
+void calibrarSensores(){
+  unsigned long t0=millis();
+  long sE=0,sM=0,sD=0; int n=0;
+  while (millis()-t0 < TEMPO_CALIBRACAO_MS){
+    sE+=analogRead(SENSOR_FOGO_ESQ);
+    sM+=analogRead(SENSOR_FOGO_MEIO);
+    sD+=analogRead(SENSOR_FOGO_DIR);
+    n++; delay(100);
+  }
+  if (n==0) n=1;
+  G.baseEsq = sE/n; G.baseMeio = sM/n; G.baseDir = sD/n;
+  G.calibrado=true;
+  Serial.print(F("[CALIB] E="));Serial.print(G.baseEsq);
+  Serial.print(F(" M="));Serial.print(G.baseMeio);
+  Serial.print(F(" D="));Serial.println(G.baseDir);
+}
 
+static inline void leituraDelta(int &dE,int &dM,int &dD, int &side){
+  int aE=analogRead(SENSOR_FOGO_ESQ);
+  int aM=analogRead(SENSOR_FOGO_MEIO);
+  int aD=analogRead(SENSOR_FOGO_DIR);
+  dE = G.baseEsq - aE; dM = G.baseMeio - aM; dD = G.baseDir - aD;
+  int md=dM; side=0; if (dE>md){ md=dE; side=-1; } if (dD>md){ md=dD; side=+1; }
+}
 
+bool detectarFogoConfirmado(int &sideOut){
+  uint8_t hits=0;
+  int bestDelta=-32768; int sideBest=0;
+  for (uint8_t i=0;i<CONFIRM_READS;i++){
+    int dE,dM,dD,side; leituraDelta(dE,dM,dD,side);
+    bool fogo = (dE>DIFERENCA_FOGO) || (dM>DIFERENCA_FOGO) || (dD>DIFERENCA_FOGO);
+    if (fogo) hits++;
+    int strongest = dM; if (dE>strongest) strongest=dE; if (dD>strongest) strongest=dD;
+    if (strongest>bestDelta){ bestDelta=strongest; sideBest=side; }
+    delay(CONFIRM_SPACING_MS);
+  }
+  sideOut = sideBest;
+  return (hits>=CONFIRM_MIN);
+}
 
+bool isClearNow(){
+  int dE,dM,dD,sideDummy; leituraDelta(dE,dM,dD,sideDummy);
+  return (dE<DIFERENCA_CLEAR) && (dM<DIFERENCA_CLEAR) && (dD<DIFERENCA_CLEAR);
+}
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, Image,
-  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
-} from "react-native";
-import { WebView } from "react-native-webview";
-import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
-import { useFocusEffect, useNavigation } from "@react-navigation/native";
-import { StatusBar } from "expo-status-bar";
+// ===================== LÓGICA AUTO (SEM SERVO) =====================
+void handleAuto(){
+  if (!G.calibrado){ calibrarSensores(); return; }
 
-type Mode = "mjpeg" | "snapshot";
+  // nível/LED/bomba
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  if (G.nivelAguaPct<=10) pumpWrite(false);
 
-const PALETTE = {
-  bg: "#000000",
-  card: "#0d0d0d",
-  border: "#1a1a1a",
-  red: "#E53B2F",
-  white: "#FFFFFF",
-  sub: "#9c9c9c",
-};
+  int side=0;
+  bool fireNow = detectarFogoConfirmado(side);
 
-export default function CameraScreen() {
-  const navigation = useNavigation<any>();
+  unsigned long now=millis();
+  if (fireNow){
+    G.fogoConfirmado = true;
+    G.fogoHoldUntil = now + FIRE_HOLD_MS;
 
-  const [ip, setIp] = useState<string>("192.168.3.3");
-  const [mode, setMode] = useState<Mode>("mjpeg");
-  const [statusText, setStatusText] = useState<string>("—");
-  const [err, setErr] = useState<string>("");
+    if (G.nivelAguaPct>10) pumpWrite(true); else pumpWrite(false);
 
-  // Controles em overlay (para não consumir área do viewer)
-  const [showUi, setShowUi] = useState<boolean>(false);
-
-  // Snapshot loop
-  const [snapUri, setSnapUri] = useState<string>("");
-  const timerRef = useRef<number | null>(null);
-  const appState = useRef(AppState.currentState);
-
-  // Endpoints CameraWebServer
-  const base80 = useMemo(() => `http://${ip}`, [ip]);
-  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
-  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
-  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
-  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
-
-  // Esconder TAB BAR para liberar espaço total
-  useFocusEffect(
-    useCallback(() => {
-      const parent = navigation.getParent?.();
-      parent?.setOptions({ tabBarStyle: { display: "none" } });
-      return () => parent?.setOptions({ tabBarStyle: undefined });
-    }, [navigation])
-  );
-
-  const clearTimer = useCallback(() => {
-    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
-  }, []);
-  const startSnapshot = useCallback(() => {
-    clearTimer();
-    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
-  }, [snapshotUrl, clearTimer]);
-
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
-      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
-      if (next.match(/inactive|background/)) clearTimer();
-      appState.current = next;
-    });
-    return () => { sub.remove(); clearTimer(); };
-  }, [mode, startSnapshot, clearTimer]);
-
-  useEffect(() => {
-    setErr("");
-    if (mode === "snapshot") startSnapshot(); else clearTimer();
-    return () => clearTimer();
-  }, [mode, startSnapshot, clearTimer]);
-
-  const checkStatus = useCallback(async () => {
-    try {
-      const r = await fetch(statusUrl);
-      const txt = await r.text();
-      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
-    } catch (e) {
-      const er = e as Error;
-      setStatusText("Falhou");
-      setErr(er?.message ?? String(e));
+    // “vira” para o lado do maior delta e avança curto
+    if (side<0){ // fogo mais à esquerda -> vira esquerda, depois avança
+      pwmSoftware([](){ motorsLeftTurn(); }, VEL_PERC, T_TURN_MS);
+      pwmSoftware([](){ motorsFwd();      }, VEL_PERC, T_FWD_MS);
+    } else if (side>0){
+      pwmSoftware([](){ motorsRightTurn(); }, VEL_PERC, T_TURN_MS);
+      pwmSoftware([](){ motorsFwd();       }, VEL_PERC, T_FWD_MS);
+    } else {
+      pwmSoftware([](){ motorsFwd(); }, VEL_PERC, T_FWD_MS);
     }
-  }, [statusUrl]);
 
-  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
-
-  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
-  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
-  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
-
-  // HTML "contain" centralizado — mostra 100% sem cortar (pode sobrar faixa)
-  const mjpegHtml = useMemo(
-    () => `
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <style>
-      html, body {
-        margin:0; padding:0; height:100%; width:100%;
-        display:flex; align-items:center; justify-content:center;
-        background:#000;
+    static bool lastHadFire=false;
+    if (!lastHadFire && G.fogoConfirmado){
+      G.eventosConfirmados++;
+      if (G.eventosConfirmados % RECALIB_EVERY_CONFIRMED == 0){
+        Serial.println(F("[AUTO] Recalibrando por contagem de eventos..."));
+        calibrarSensores();
       }
-      img {
-        max-width:100%;
-        max-height:100%;
-        object-fit: contain;
-        background:#000;
-      }
-    </style>
-  </head>
-  <body>
-    <img src="${streamUrl}" />
-  </body>
-</html>`.trim(),
-    [streamUrl]
-  );
+    }
+    lastHadFire = true;
+  } else {
+    if (G.fogoConfirmado && now > G.fogoHoldUntil){
+      if (isClearNow()){ G.fogoConfirmado=false; }
+    }
 
-  return (
-    <View style={styles.root}>
-      {/* StatusBar escondida para ganhar pixels */}
-      <StatusBar hidden />
-
-      {/* VIEWER ocupa 100% (nada “ao redor” consumindo espaço) */}
-      <View style={styles.viewer}>
-        {mode === "mjpeg" ? (
-          <WebView
-            originWhitelist={['*']}
-            source={{ html: mjpegHtml }}
-            style={StyleSheet.absoluteFill}
-            allowsInlineMediaPlayback
-            mediaPlaybackRequiresUserAction={false}
-            onError={onWvError}
-            onHttpError={onWvHttpError}
-          />
-        ) : (
-          <Image
-            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
-            style={StyleSheet.absoluteFill}
-            resizeMode="contain"   // mantém proporção sem cortar
-            onError={onImgError}
-          />
-        )}
-      </View>
-
-      {/* Botão flutuante para mostrar/ocultar os controles (não consome layout) */}
-      <Pressable style={styles.fab} onPress={() => setShowUi(v => !v)}>
-        <Text style={styles.fabTxt}>{showUi ? "×" : "≡"}</Text>
-      </Pressable>
-
-      {/* Overlay de controles — por cima do vídeo (não tira tamanho do viewer) */}
-      {showUi && (
-        <View style={styles.overlay}>
-          <View style={styles.row}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.label}>ESP IP</Text>
-              <TextInput
-                style={styles.input}
-                value={ip}
-                onChangeText={setIp}
-                placeholder="ex.: 192.168.3.3"
-                placeholderTextColor={PALETTE.sub}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
-              />
-            </View>
-            <Pressable style={styles.btn} onPress={checkStatus}>
-              <Text style={styles.btnTxt}>Testar</Text>
-            </Pressable>
-            <Pressable
-              style={[styles.btn, styles.btnGhost]}
-              onPress={() => setMode(mode === "mjpeg" ? "snapshot" : "mjpeg")}
-            >
-              <Text style={styles.btnTxt}>{mode === "mjpeg" ? "MJPEG" : "Snapshot"}</Text>
-            </Pressable>
-          </View>
-
-          <View style={{ marginTop: 8 }}>
-            <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{statusText}</Text></Text>
-            {!!err && <Text style={[styles.meta, { color: "#ff8b8b" }]} numberOfLines={2}>Erro: {err}</Text>}
-          </View>
-        </View>
-      )}
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: PALETTE.bg },
-  viewer: { flex: 1, backgroundColor: "#000" }, // área do vídeo: 100% da tela
-
-  // Overlay (não reduz o viewer)
-  overlay: {
-    position: "absolute",
-    left: 12, right: 12, bottom: 12,
-    backgroundColor: "#000000b0",
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: 1, borderColor: "#00000055",
-  },
-  row: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
-
-  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
-  input: {
-    backgroundColor: PALETTE.card,
-    borderWidth: 1, borderColor: PALETTE.border,
-    borderRadius: 12,
-    paddingHorizontal: 12, paddingVertical: 9,
-    color: PALETTE.white,
-  },
-  btn: {
-    backgroundColor: PALETTE.red,
-    paddingHorizontal: 14, paddingVertical: 11,
-    borderRadius: 12,
-  },
-  btnGhost: { backgroundColor: "#00000055", borderWidth: 1, borderColor: "#00000080" },
-  btnTxt: { color: "#fff", fontWeight: "700" },
-  meta: { color: PALETTE.sub, fontSize: 12 },
-
-  // FAB para abrir/fechar overlay
-  fab: {
-    position: "absolute",
-    top: 12,
-    right: 12,
-    backgroundColor: "#00000088",
-    borderRadius: 20,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderWidth: 1, borderColor: "#00000055",
-  },
-  fabTxt: { color: "#fff", fontSize: 16, fontWeight: "700" },
-});
-
-
-
-
-{
-  "expo": {
-    "name": "AppHydroBot",
-    "slug": "AppHydroBot",
-    "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
-    "newArchEnabled": true,
-    "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
-    },
-    "ios": {
-      "supportsTablet": true
-    },
-    "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
-    },
-    "web": {
-      "favicon": "./assets/favicon.png"
+    if (!G.fogoConfirmado){
+      pumpWrite(false);
+      motorsStop();
     }
   }
 }
 
+// ===================== MODO “APP” (controle externo) =====================
+// Aqui apenas mantém leitura de água/LED/bomba. Os comandos de movimento/bomba
+// podem chegar pela Serial (vindo do ESP32-CAM). Exemplos aceitos:
+//   CMD:FWD:ms=300
+//   CMD:BACK:ms=250
+//   CMD:LEFT:ms=180
+//   CMD:RIGHT:ms=180
+//   CMD:STOP
+//   CMD:PUMP:on
+//   CMD:PUMP:off
+void handleApp(){
+  G.nivelAguaPct = waterPercent();
+  updateWaterLED(G.nivelAguaPct);
+  processSerialFromESP();
+}
 
+void applyTimedMove(const String& dir, uint16_t ms){
+  if (dir=="FWD")      pwmSoftware([](){ motorsFwd(); }, VEL_PERC, ms);
+  else if (dir=="BACK")  pwmSoftware([](){ motorsBack(); }, VEL_PERC, ms);
+  else if (dir=="LEFT")  pwmSoftware([](){ motorsLeftTurn(); }, VEL_PERC, ms);
+  else if (dir=="RIGHT") pwmSoftware([](){ motorsRightTurn(); }, VEL_PERC, ms);
+  else motorsStop();
+}
 
+void processSerialFromESP(){
+  static String buf;
+  while (Serial.available()){
+    char c = (char)Serial.read();
+    if (c=='\n' || c=='\r'){
+      if (buf.length()){
+        // parse simples
+        if (buf.startsWith("CMD:")){
+          if (buf.indexOf("STOP")>0){ motorsStop(); }
+          else if (buf.indexOf("PUMP:on")>0){ if (G.nivelAguaPct>10) pumpWrite(true); }
+          else if (buf.indexOf("PUMP:off")>0){ pumpWrite(false); }
+          else {
+            // CMD:FWD:ms=300
+            int p1 = buf.indexOf(':',4);
+            int p2 = buf.indexOf(":ms=");
+            if (p1>0){
+              String d = buf.substring(4, p1);
+              uint16_t ms = 200;
+              if (p2>0){ ms = (uint16_t)buf.substring(p2+4).toInt(); }
+              applyTimedMove(d, ms);
+            }
+          }
+        }
+        buf = "";
+      }
+    } else {
+      if (buf.length() < 64) buf += c;
+    }
+  }
+}
 
+/* ===================== SETUP / LOOP ===================== */
+void setup(){
+  Serial.begin(115200);   // UART para falar com ESP32-CAM (ou PC durante testes)
 
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(BOMBA_PIN,OUTPUT); pumpWrite(false);
 
+  pinMode(LED_NIVEL,OUTPUT); digitalWrite(LED_NIVEL, LOW);
 
+  pinMode(SENSOR_FOGO_ESQ_D,INPUT);
+  pinMode(SENSOR_FOGO_MEIO_D,INPUT);
+  pinMode(SENSOR_FOGO_DIR_D,INPUT);
 
+  pinMode(BOTAO,INPUT_PULLUP);
 
+  motorsStop();
+  Serial.println(F("HydroBot pronto. Inicia em MODO_AUTO e calibra ao entrar."));
+  G.modo = MODO_AUTO;
+}
 
+void loop(){
+  // watchdog de movimento (segurança)
+  if (G.motionActive && (long)(millis()-G.motionEndMs)>=0){ motorsStop(); G.motionActive=false; }
+  if ((millis()-G.lastMoveCmdAt)>1000 && G.currentDir!=DIR_STOP){ motorsStop(); G.motionActive=false; }
 
-export const tokens = {
-  color: {
-    bg: "#0b0b0f",
-    card: "#121218",
-    border: "#25273a",
-    text: "#e5e7eb",
-    sub: "#9ca3af",
-    accent: "#e6403a",
-    success: "#10b981",
-    danger: "#ef4444",
-  },
-  radius: { xs: 8, sm: 10, md: 12, lg: 16, xl: 20, pill: 999 },
-  space: { xs: 6, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32 },
-  font: { regular: "System", medium: "System", bold: "System" },
-  shadow: {
-    card: { elevation: 3, shadowOpacity: 0.15, shadowRadius: 6, shadowOffset: { width: 0, height: 3 } },
-  },
-};
-export type Tokens = typeof tokens;
+  // BOTÃO no D7 alterna modos (debounce)
+  bool btn = digitalRead(BOTAO); // HIGH = solto (pullup)
+  unsigned long now = millis();
+  if (btn != G.lastBtn && (now - G.lastBtnChange) > 50){
+    G.lastBtn = btn;
+    G.lastBtnChange = now;
+    if (btn == LOW){ // clique
+      G.modo = (G.modo==MODO_AUTO) ? MODO_APP : MODO_AUTO;
+      Serial.print(F("[MODO] ")); Serial.println(G.modo==MODO_AUTO ? "AUTO" : "APP");
+      if (G.modo==MODO_AUTO){ G.calibrado=false; } // força recalibrar ao voltar p/ AUTO
+      motorsStop();
+      pumpWrite(false);
+    }
+  }
 
-
+  // executa modo
+  if (G.modo==MODO_AUTO) handleAuto();
+  else handleApp();
+}
