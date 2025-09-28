@@ -1,3 +1,271 @@
+
+Fechou. Vamos começar do ZERO e rodar no Expo Go (sem Android SDK).
+
+
+Passo a passo (rápido e certeiro)
+
+
+
+
+Instale o Node.js LTS
+
+
+
+
+
+
+Windows (PowerShell Admin): winget install OpenJS.NodeJS.LTS
+
+
+macOS (Homebrew): brew install node@20
+
+
+Ubuntu/Debian:
+
+sudo apt update
+sudo apt install -y nodejs npm
+
+
+(se o Node ficar velho, instale via nvm depois; por enquanto serve)
+
+
+
+
+
+
+Crie o app base (template TypeScript)
+
+
+
+
+npm create expo-app@latest MeuApp -- --template blank-typescript
+# ou: npx create-expo-app@latest MeuApp --template blank-typescript
+
+
+
+
+
+Entre na pasta e inicie o servidor do Expo
+
+
+
+
+cd MeuApp
+npx expo start
+
+
+
+
+
+O terminal abre o Expo Dev Tools.
+
+
+No terminal, tecle s para alternar entre LAN ↔ Tunnel:
+
+
+
+LAN: celular e PC no mesmo Wi-Fi.
+
+
+Tunnel: funciona mesmo se o celular estiver em outra rede (ex.: conectado ao AP do seu ESP).
+
+Dica: se der problema de rede, escolha Tunnel.
+
+
+
+
+
+
+
+
+
+
+Instale o app Expo Go no Android (Play Store) e escaneie o QR que aparece no terminal/Dev Tools.
+
+
+
+
+
+
+Se não ler o QR, toque em “Enter URL” no Expo Go e cole o link mostrado.
+
+
+
+
+
+
+Edite o app e veja ao vivo
+
+Abra o projeto no editor (VS Code, por ex.) e altere App.tsx. Salve e o Expo Go atualiza sozinho.
+
+
+
+
+
+App.tsx inicial (já pronto pra testar)
+
+
+Cole isto no App.tsx do seu projeto recém-criado (se já existir, pode substituir):
+
+
+import { StatusBar } from 'expo-status-bar';
+import { SafeAreaView, Text, View, Pressable } from 'react-native';
+import { useState } from 'react';
+
+export default function App() {
+  const [count, setCount] = useState(0);
+
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0b0f' }}>
+      <View style={{ flex: 1, padding: 24, gap: 16, justifyContent: 'center' }}>
+        <Text style={{ color: '#e5e7eb', fontSize: 22, fontWeight: '600' }}>
+          Meu primeiro app Expo ✨
+        </Text>
+        <Text style={{ color: '#9ca3af', fontSize: 16 }}>
+          Rodando no Expo Go (sem SDK nativo).
+        </Text>
+
+        <Pressable
+          onPress={() => setCount(c => c + 1)}
+          style={{
+            alignSelf: 'flex-start',
+            backgroundColor: '#e6403a',
+            paddingHorizontal: 16,
+            paddingVertical: 10,
+            borderRadius: 12
+          }}
+        >
+          <Text style={{ color: 'white', fontWeight: '700' }}>Cliquei {count}x</Text>
+        </Pressable>
+
+        <StatusBar style="light" />
+      </View>
+    </SafeAreaView>
+  );
+}
+
+
+
+
+Comando único (criar e abrir direto no Tunnel)
+
+
+Se quiser fazer tudo em um tiro só:
+
+
+npm create expo-app@latest MeuApp -- --template blank-typescript \
+&& cd MeuApp \
+&& npx expo start --tunnel
+
+
+
+
+Dicas e erros comuns (bem prático)
+
+
+
+
+
+
+Fica travado em “Waiting for Expo Go”?
+
+
+
+
+Troque para Tunnel (s no terminal).
+
+
+Desative VPN e permita nas portas 19000–19006 no firewall do Windows.
+
+
+Rode com cache limpo: npx expo start -c.
+
+
+
+
+
+
+
+
+Celular no Wi-Fi do ESP e PC em outra rede?
+
+Use Tunnel. LAN não vai funcionar nesse cenário.
+
+
+
+
+
+
+Porta ocupada/Metro bugado
+
+Ctrl+C para parar, depois npx expo start -c.
+
+
+
+
+
+
+Dependências quebradas
+
+npx expo doctor --fix-dependencies.
+
+
+
+
+
+
+Adicionar libs do futuro (ex.: câmera, webview)
+
+
+npx expo install expo-camera
+npx expo install react-native-webview
+
+
+
+
+
+
+
+Se quiser, na próxima te mando um esqueleto de tela de câmera já usando WebView/expo-camera, mas por enquanto isso já te deixa com o projeto rodando no Expo Go sem dor de cabeça. 🚀
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Esse erro do console (“Must specify "expo-platform" header or "platform" query parameter”) aparece quando o bundler recebe uma requisição sem dizer qual plataforma (android/ios/web). Normalmente acontece quando você abre o endereço do bundler direto no navegador (ex.: http://192.168.x.x:8081) ou iniciou o Expo sem escolher a plataforma.
 
 
