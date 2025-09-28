@@ -1,3 +1,346 @@
+
+massa! bora espelhar o visual do app antigo sem mexer na lógica nova.
+
+pra agilizar, já deixei um esqueleto de tema + componentes onde a gente só “pluga” as cores/fontes/raios/sombras do seu app antigo. quando você mandar os códigos/imagens do antigo, eu só preencho os tokens — sem reescrever as telas.
+
+
+o que me enviar do app antigo
+
+
+
+
+colors.ts (ou onde ficavam as cores) e qualquer ThemeProvider/fonts.
+
+
+1 tela que você quer copiar (JS/TSX) + styles dela.
+
+
+se tiver, variáveis de spacing, radius, shadow, font family.
+
+
+screenshots ajudam pra acertar microdetalhes.
+
+
+
+
+
+1) tokens de tema (adicione em src/theme/tokens.ts)
+
+
+// src/theme/tokens.ts
+export const tokens = {
+  color: {
+    bg: "#0b0b0f",
+    card: "#121218",
+    border: "#25273a",
+    text: "#e5e7eb",
+    sub: "#9ca3af",
+    accent: "#e6403a",
+    success: "#10b981",
+    danger: "#ef4444",
+  },
+  radius: {
+    xs: 8,
+    sm: 10,
+    md: 12,
+    lg: 16,
+    xl: 20,
+    pill: 999,
+  },
+  space: {
+    xs: 6,
+    sm: 8,
+    md: 12,
+    lg: 16,
+    xl: 24,
+    xxl: 32,
+  },
+  font: {
+    // trocamos assim que você mandar as famílias/weights do app antigo
+    regular: "System",
+    medium: "System",
+    bold: "System",
+  },
+  shadow: {
+    card: { elevation: 3, shadowOpacity: 0.15, shadowRadius: 6, shadowOffset: { width: 0, height: 3 } },
+  },
+};
+export type Tokens = typeof tokens;
+
+
+
+2) UI base (botão, campo, cartão, header) — src/ui/index.tsx
+
+
+// src/ui/index.tsx
+import React, { PropsWithChildren } from "react";
+import { View, Text, Pressable, TextInput, StyleSheet, ViewStyle, TextStyle, TextInputProps } from "react-native";
+import { tokens as t } from "../theme/tokens";
+
+export function Screen({ children }: PropsWithChildren) {
+  return <View style={{ flex: 1, backgroundColor: t.color.bg, padding: t.space.lg }}>{children}</View>;
+}
+
+export function Header({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <View style={{ marginBottom: t.space.lg }}>
+      <Text style={{ color: t.color.text, fontSize: 22, fontWeight: "700" }}>{title}</Text>
+      {!!subtitle && <Text style={{ color: t.color.sub, marginTop: 4 }}>{subtitle}</Text>}
+    </View>
+  );
+}
+
+export function Card({ children, style }: PropsWithChildren<{ style?: ViewStyle }>) {
+  return (
+    <View style={[styles.card, style]}>
+      {children}
+    </View>
+  );
+}
+
+export function Button({
+  label, onPress, variant = "primary", style, textStyle,
+}: { label: string; onPress: () => void; variant?: "primary" | "ghost"; style?: ViewStyle; textStyle?: TextStyle }) {
+  const bg = variant === "primary" ? t.color.accent : "transparent";
+  const color = variant === "primary" ? "#fff" : t.color.text;
+  return (
+    <Pressable onPress={onPress} style={[styles.btn, { backgroundColor: bg, borderColor: t.color.border }, style]}>
+      <Text style={[{ color, fontWeight: "700" }, textStyle]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+export function Field({
+  label, value, onChangeText, placeholder, keyboardType,
+}: { label: string } & TextInputProps) {
+  return (
+    <View style={{ flex: 1 }}>
+      <Text style={{ color: t.color.text, marginBottom: 6, fontWeight: "600" }}>{label}</Text>
+      <TextInput
+        style={styles.input}
+        value={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor={t.color.sub}
+        keyboardType={keyboardType}
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  card: {
+    backgroundColor: t.color.card,
+    borderWidth: 1,
+    borderColor: t.color.border,
+    borderRadius: t.radius.lg,
+    overflow: "hidden",
+    ...t.shadow.card,
+  },
+  btn: {
+    paddingHorizontal: t.space.lg,
+    paddingVertical: t.space.sm + 2,
+    borderRadius: t.radius.md,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  input: {
+    backgroundColor: t.color.card,
+    borderWidth: 1,
+    borderColor: t.color.border,
+    borderRadius: t.radius.md,
+    paddingHorizontal: t.space.md,
+    paddingVertical: t.space.sm,
+    color: t.color.text,
+  },
+});
+
+
+
+3) CameraScreen reestilizada usando os componentes
+
+
+Substitua sua tela atual por esta versão (funcionalidade idêntica; visual padronizado pelos tokens):
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { View, Text, Image, AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData, StyleSheet } from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+import { Screen, Header, Card, Button, Field } from "../ui";
+import { tokens as t } from "../theme/tokens";
+
+type Mode = "mjpeg" | "snapshot";
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [connected, setConnected] = useState("—");
+  const [lastErr, setLastErr] = useState("");
+
+  const [snapUri, setSnapUri] = useState("");
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+  const startSnapshotLoop = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshotLoop();
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  useEffect(() => {
+    setLastErr("");
+    if (mode === "snapshot") startSnapshotLoop(); else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const res = await fetch(statusUrl);
+      const txt = await res.text();
+      setConnected(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e) {
+      const err = e as Error;
+      setConnected("Falhou");
+      setLastErr(err?.message ?? String(e));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => setLastErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setLastErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setLastErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
+  return (
+    <Screen>
+      <Header title="Câmera" subtitle="Visual ao estilo do app antigo (tokens prontos para ajuste)" />
+
+      <View style={{ flexDirection: "row", gap: t.space.sm, alignItems: "flex-end" }}>
+        <Field label="ESP IP" value={ip} onChangeText={setIp}
+               placeholder="ex.: 192.168.3.3"
+               keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"} />
+        <Button label="Testar" onPress={checkStatus} />
+      </View>
+
+      <View style={{ flexDirection: "row", gap: t.space.sm, marginTop: t.space.sm }}>
+        <Button label="MJPEG" onPress={() => setMode("mjpeg")} variant={mode === "mjpeg" ? "primary" : "ghost"} />
+        <Button label="Snapshot" onPress={() => setMode("snapshot")} variant={mode === "snapshot" ? "primary" : "ghost"} />
+      </View>
+
+      <Card style={{ flex: 1, marginTop: t.space.md }}>
+        {mode === "mjpeg" ? (
+          <WebView
+            source={{ uri: streamUrl }}
+            style={{ width: "100%", height: "100%" }}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            allowUniversalAccessFromFileURLs
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={{ width: "100%", height: "100%" }}
+            resizeMode="contain"
+            onError={onImgError}
+          />
+        )}
+      </Card>
+
+      <View style={{ marginTop: t.space.sm }}>
+        <Text style={styles.meta}>Status: <Text style={{ color: t.color.success }}>{connected}</Text></Text>
+        <Text style={styles.meta}>Stream: <Text style={{ color: t.color.sub }}>{streamUrl}</Text></Text>
+        <Text style={styles.meta}>Snapshot: <Text style={{ color: t.color.sub }}>{snapshotUrl}</Text></Text>
+        {!!lastErr && <Text style={[styles.meta, { color: t.color.danger }]}>Erro: {lastErr}</Text>}
+      </View>
+    </Screen>
+  );
+}
+
+const styles = StyleSheet.create({
+  meta: { color: t.color.text, fontSize: 12 },
+});
+
+
+
+
+como vamos “copiar” o design antigo
+
+
+
+
+assim que você me mandar os arquivos do tema antigo, eu só edito tokens.ts (cores, radius, shadows, tipografia) e, se precisar, ajusto o Button, Card e Field pra bater 100% com o seu visual (bordas, ícones, padding, etc.).
+
+
+a CameraScreen já está usando esses componentes — então o app inteiro “troca de roupa” com pouca mudança.
+
+
+
+
+manda a primeira tela/estilos do app antigo e eu já deixo os tokens idênticos 👌
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 App.tsx
 
 import React from "react";
