@@ -1,3 +1,411 @@
+
+Perfeito — abaixo está a CameraScreen.tsx já adaptada para funcionar com o firmware padrão do ESP32-CAM (que expõe /jpg ou /stream no exemplo oficial, e alguns forks usam /snapshot ou /capture).
+
+O componente tenta automaticamente /snapshot → /jpg → /capture até encontrar um que responda, e mantém polling leve com troca suave de frames (crossfade). É 100% compatível com Expo Go, sem precisar de WebView.
+
+
+
+
+Basta substituir o arquivo HydroBotApp2/src/screens/CameraScreen.tsx pelo código completo a seguir.
+
+
+
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+// Expo Go friendly — snapshot polling com auto-fallback de endpoint (/snapshot → /jpg → /capture)
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState,
+} from "react-native";
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+
+const textsByLang = {
+  pt: {
+    heroSubtitle: "Visualização da Câmera (snapshot)",
+    espIp: "Host/IP do ESP:",
+    placeholderIp: "192.168.0.50",
+    start: "Iniciar",
+    stop: "Parar",
+    statusIdle: "Pronto",
+    statusResolving: "Detectando endpoint…",
+    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
+    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi.",
+    endpoint: (p:string)=>`Endpoint: ${p}`,
+  },
+  en: {
+    heroSubtitle: "Camera Viewer (snapshot)",
+    espIp: "ESP Host/IP:",
+    placeholderIp: "192.168.0.50",
+    start: "Start",
+    stop: "Stop",
+    statusIdle: "Ready",
+    statusResolving: "Detecting endpoint…",
+    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
+    statusErr: "Failed to load image. Check IP & Wi-Fi.",
+    endpoint: (p:string)=>`Endpoint: ${p}`,
+  },
+  es: {
+    heroSubtitle: "Visor de Cámara (snapshot)",
+    espIp: "Host/IP del ESP:",
+    placeholderIp: "192.168.0.50",
+    start: "Iniciar",
+    stop: "Parar",
+    statusIdle: "Listo",
+    statusResolving: "Detectando endpoint…",
+    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
+    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi.",
+    endpoint: (p:string)=>`Endpoint: ${p}`,
+  },
+};
+
+const DEFAULT_HOST = "192.168.0.50"; // use o IP numérico do seu ESP
+const CANDIDATE_PATHS = ["/snapshot", "/jpg", "/capture"]; // tentativas em ordem
+const appLogo = require("../../assets/logo.png");
+
+/* ---------- Header ---------- */
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+/* ---------- Crossfade de imagens ---------- */
+function CrossfadeImage({
+  currentUri, nextUri, onNextLoadStart, onNextShown
+}: {
+  currentUri: string; nextUri: string;
+  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastRef.current) return;
+    lastRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            key={nextUri}
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown(true); fade.setValue(0); setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+/* ---------- Tela principal ---------- */
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  const [host, setHost] = useState(DEFAULT_HOST);
+  const [running, setRunning] = useState(false);
+  const [hadError, setHadError] = useState(false);
+  const [intervalMs, setIntervalMs] = useState(550);
+  const [endpointPath, setEndpointPath] = useState<string | null>(null);
+  const [resolving, setResolving] = useState(false);
+
+  const [currentUri, setCurrentUri] = useState("");
+  const [nextUri, setNextUri] = useState("");
+  const loadingNext = useRef(false);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const pathIndexRef = useRef(0);
+  const stablePathRef = useRef<string | null>(null);
+  const consecutiveFailsRef = useRef(0);
+
+  const cleanHost = (s:string)=> s.replace(/^https?:\/\//,"").replace(/\/+$/,"");
+  const baseUrl = useMemo(()=> `http://${cleanHost(host)}`, [host]);
+
+  const makeUrl = (path:string)=> `${baseUrl}${path}?t=${Date.now()}`;
+
+  const pickNextCandidate = () => {
+    pathIndexRef.current = (pathIndexRef.current + 1) % CANDIDATE_PATHS.length;
+    const p = CANDIDATE_PATHS[pathIndexRef.current];
+    setEndpointPath(p);
+    return p;
+  };
+
+  const resolveEndpointIfNeeded = () => {
+    if (stablePathRef.current) { setEndpointPath(stablePathRef.current); return; }
+    setResolving(true);
+    // estratégia: começamos do índice atual; ao primeiro sucesso de imagem, fixamos
+    const p = CANDIDATE_PATHS[pathIndexRef.current];
+    setEndpointPath(p);
+  };
+
+  const schedule = () => {
+    if (!running) return;
+    timerRef.current = setTimeout(() => {
+      if (!loadingNext.current && endpointPath) {
+        setNextUri(makeUrl(endpointPath));
+      }
+      schedule();
+    }, intervalMs);
+  };
+
+  const start = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setRunning(true);
+    setHadError(false);
+    consecutiveFailsRef.current = 0;
+    stablePathRef.current = null;
+    resolveEndpointIfNeeded();
+    if (endpointPath) setCurrentUri(makeUrl(endpointPath));
+    schedule();
+  };
+
+  const stop = () => {
+    setRunning(false);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+  };
+
+  // pausa automática em background
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s !== "active") stop();
+    });
+    return () => sub.remove();
+  }, []);
+
+  // limpa timer ao desmontar
+  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
+
+  // se mudar host/intervalo, reinicia polling (se estiver rodando)
+  useEffect(() => {
+    if (running) { stop(); start(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intervalMs, host]);
+
+  // quando endpointPath muda (ex: fallback), atualiza frame inicial
+  useEffect(() => {
+    if (running && endpointPath) {
+      setCurrentUri(makeUrl(endpointPath));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [endpointPath]);
+
+  const onNextLoadStart = ()=>{ loadingNext.current = true; };
+
+  const onNextShown = (ok:boolean)=>{
+    loadingNext.current = false;
+    if (ok) {
+      setHadError(false);
+      setResolving(false);
+      consecutiveFailsRef.current = 0;
+      if (!stablePathRef.current && endpointPath) {
+        // fixamos o endpoint que funcionou
+        stablePathRef.current = endpointPath;
+      }
+      if (nextUri) setCurrentUri(nextUri);
+    } else {
+      setHadError(true);
+      consecutiveFailsRef.current += 1;
+
+      // Se falhar algumas vezes seguidas, tenta próximo endpoint
+      if (consecutiveFailsRef.current >= 2) {
+        const next = pickNextCandidate();
+        consecutiveFailsRef.current = 0;
+        stablePathRef.current = null; // “desfixa” para poder testar
+        // força tentativa imediata no novo path
+        setCurrentUri(""); // remove frame atual para evitar “imagem congelada”
+        setNextUri(makeUrl(next));
+        setResolving(true);
+      }
+    }
+  };
+
+  const statusText = !running
+    ? T.statusIdle
+    : (hadError
+      ? T.statusErr
+      : (resolving ? T.statusResolving : T.statusRunning(intervalMs)));
+
+  return (
+    <View style={styles.container}>
+      <AppHero subtitle={T.heroSubtitle} />
+
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={host}
+          onChangeText={(v)=>{ setHost(v); setEndpointPath(null); stablePathRef.current=null; }}
+          placeholder={T.placeholderIp}
+          placeholderTextColor="#8a93a5"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        {!running ? (
+          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
+            <Text style={styles.btnText}>{T.start}</Text>
+          </Pressable>
+        ) : (
+          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
+            <Text style={styles.btnText}>{T.stop}</Text>
+          </Pressable>
+        )}
+      </View>
+
+      <View style={styles.statusRow}>
+        <Text style={styles.statusText}>{statusText}</Text>
+        {!!(endpointPath) && (
+          <Text style={[styles.statusText, { marginTop: 4, opacity: 0.8 }]}>
+            {T.endpoint(endpointPath)}
+          </Text>
+        )}
+      </View>
+
+      {/* Controles simples de intervalo */}
+      <View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
+        <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
+        <Pressable
+          onPress={() => setIntervalMs(ms => Math.max(350, ms - 50))}
+          style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+        >
+          <Text style={styles.btnText}>-50</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setIntervalMs(ms => Math.min(1200, ms + 50))}
+          style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+        >
+          <Text style={styles.btnText}>+50</Text>
+        </Pressable>
+      </View>
+
+      <View style={{ flex:1 }}>
+        <CrossfadeImage
+          currentUri={currentUri}
+          nextUri={nextUri}
+          onNextLoadStart={onNextLoadStart}
+          onNextShown={onNextShown}
+        />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container:{ flex:1, backgroundColor:PALETTE.bg },
+  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
+  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
+  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
+  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
+
+  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
+           paddingHorizontal:12, paddingVertical:10, gap:8,
+           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  label:{ color:"#cfd3d8", fontSize:12 },
+  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
+          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
+  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
+  btnText:{ color:"white", fontWeight:"700" },
+
+  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
+              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  statusText:{ color:"#cbd5ff", fontSize:12 },
+
+  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
+              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
+});
+
+
+
+O que mudou e por quê (rápido):
+
+
+
+
+Auto-fallback entre "/snapshot", "/jpg" e "/capture": evita “No live frame” quando o firmware usa um nome diferente.
+
+
+Fixação do endpoint após o primeiro sucesso: reduz tentativas e melhora a estabilidade.
+
+
+Reconexão leve: a cada 2 falhas seguidas, troca para o próximo endpoint.
+
+
+Cache-busting por ?t=Date.now(): impede cache do Android.
+
+
+Polling ajustável (350–1200 ms): dá espaço para placas instáveis sem afogar a rede.
+
+
+
+
+
+
+Dica: com seu firmware acima (webserver padrão), o caminho mais comum é http://<IP>/jpg. No app, basta digitar o IP numérico (sem http://) e tocar Iniciar.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #include "esp_camera.h"
 #include <WiFi.h>
 
