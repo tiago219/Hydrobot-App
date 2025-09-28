@@ -1,3 +1,165 @@
+Boa, vamos direto ao ponto 🚀.
+
+No Windows você precisa instalar Java 17 e o Android SDK (vem com o Android Studio). Vou te dar os comandos e links:
+
+
+
+🔹 1. Instalar Java 17 (JDK)
+
+
+Baixe o instalador do Temurin JDK 17 (recomendado):
+👉 Adoptium Temurin JDK 17
+
+
+Durante a instalação, marque a opção “Add to PATH”.
+
+
+Depois confirme:
+
+
+java -version
+
+
+
+Deve aparecer algo como:
+
+
+openjdk version "17.0.x"
+
+
+
+
+🔹 2. Instalar Android Studio (SDK + ferramentas)
+
+
+Baixe aqui:
+👉 Android Studio Download
+
+
+Durante a instalação, marque:
+
+
+
+
+Android SDK
+
+
+Android SDK Platform-Tools
+
+
+Android SDK Build-Tools
+
+
+
+
+
+🔹 3. Instalar SDK pela linha de comando
+
+
+Abra PowerShell e rode:
+
+
+# Aceitar licenças
+& "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat" --licenses
+
+# Instalar pacotes básicos
+& "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+
+
+
+🔹 4. Configurar variáveis de ambiente
+
+
+Ainda no PowerShell, rode (ajuste o caminho do JDK se precisar):
+
+
+[Environment]::SetEnvironmentVariable("ANDROID_SDK_ROOT","$env:LOCALAPPDATA\Android\Sdk","User")
+[Environment]::SetEnvironmentVariable("ANDROID_HOME","$env:LOCALAPPDATA\Android\Sdk","User")
+[Environment]::SetEnvironmentVariable("JAVA_HOME","C:\Program Files\Eclipse Adoptium\jdk-17.0.10","User")
+
+$path = [Environment]::GetEnvironmentVariable("Path","User")
+$adds = @(
+  "$env:LOCALAPPDATA\Android\Sdk\platform-tools",
+  "$env:LOCALAPPDATA\Android\Sdk\emulator",
+  "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin",
+  "$env:JAVA_HOME\bin"
+)
+$novo = ($path.Split(';') + $adds) | Select-Object -Unique -ExcludeEmpty
+[Environment]::SetEnvironmentVariable("Path",$novo -join ';',"User")
+
+
+
+⚠️ Depois disso, feche e reabra o VS Code/PowerShell.
+
+
+
+🔹 5. Testar
+
+
+Rode:
+
+
+java -version
+adb --version
+
+
+
+Se os dois responderem, rode seu app:
+
+
+npx expo prebuild -p android --clean
+npx expo run:android
+
+
+
+
+👉 Quer que eu monte um script .bat pronto que instala e configura o SDK e JDK automaticamente pra você só rodar?
+
+
+
+
+
+
+
+https://adoptium.net/pt-BR/temurin/releases?version=17
+
+https://developer.android.com/studio
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 Tem sim — o caminho “sem proxy e sem certificado” é buildar o app (Expo Dev/Release) com HTTP liberado (cleartext) no Android. No Expo Go isso é bloqueado pelo sistema e não tem como mudar; mas no seu próprio build você libera e o app acessa http://<ip>/stream direto do ESP.
 
