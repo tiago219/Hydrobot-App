@@ -1,3 +1,217 @@
+
+Beleza — vamos garantir máximo de tela sem corte e sem sobrar “moldura” boba.
+
+
+Tem dois pontos que encolhem o vídeo:
+
+
+
+
+A tab bar ainda ocupa altura (mesmo com headerShown: false).
+
+
+O WebView estava renderizando o <img> sem “prender” no viewport real do webview.
+
+
+
+
+A correção é simples:
+
+
+
+1) App.tsx — esconda a tab bar só na tela Câmera
+
+
+Troque apenas a definição da aba Câmera para:
+
+
+<Tab.Screen
+  name="Câmera"
+  component={CameraScreen}
+  options={{
+    headerShown: false,
+    // Esconde a tab bar só nesta tela:
+    tabBarStyle: { display: "none" },
+  }}
+/>
+
+
+
+
+
+Dica: mantenha o nome exatamente “Câmera”, que é o que você já usa.
+
+
+
+
+
+2) CameraScreen.tsx — force o stream a ocupar o viewport inteiro do WebView com contain
+
+
+Substitua só estes trechos no seu arquivo atual:
+
+
+(a) O HTML do MJPEG
+
+
+Troque sua constante mjpegHtml por esta versão (usa position:fixed + 100vw/100vh e object-fit:contain):
+
+
+const mjpegHtml = useMemo(
+  () => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover"/>
+    <style>
+      html, body { margin:0; padding:0; background:#000; }
+      /* Ocupa TODO o viewport do WebView */
+      img {
+        position: fixed; inset: 0;       /* prende nas bordas do viewport */
+        width: 100vw; height: 100vh;     /* usa toda a área disponível */
+        object-fit: contain;              /* mostra tudo, sem cortar */
+        background:#000;
+      }
+    </style>
+  </head>
+  <body>
+    <img src="${streamUrl}" />
+  </body>
+</html>`.trim(),
+  [streamUrl]
+);
+
+
+
+(b) O contêiner do viewer
+
+
+Garanta que o viewer realmente ocupe a tela toda. Troque o style do bloco do viewer:
+
+
+<View style={styles.viewer}>
+  {mode === "mjpeg" ? (
+    <WebView
+      originWhitelist={['*']}
+      source={{ html: mjpegHtml }}
+      style={StyleSheet.absoluteFill}   // ocupa tudo
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      onError={onWvError}
+      onHttpError={onWvHttpError}
+    />
+  ) : (
+    <Image
+      source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+      style={StyleSheet.absoluteFill}   // ocupa tudo
+      resizeMode="contain"              // mostra tudo, sem cortar
+      onError={onImgError}
+    />
+  )}
+</View>
+
+
+
+E ajuste o estilo viewer para sumir com bordas:
+
+
+viewer: {
+  ...StyleSheet.absoluteFillObject,   // <<< total
+  backgroundColor: "#000",
+},
+
+
+
+Se você já tinha flex: 1, pode manter, mas absoluteFill garante que nem padding/margem “vazem”.
+
+
+
+3) (opcional) UI em overlay
+
+
+Como você já está usando o botão flutuante para abrir os controles, deixe o showUi como false por padrão (como está) — assim nada rouba altura do viewer.
+
+
+
+Resultado esperado
+
+
+
+
+Tab bar escondida na Câmera → +altura útil.
+
+
+StatusBar oculta (você já está usando <StatusBar hidden />) → +altura útil.
+
+
+<img> do stream e <Image> do snapshot presos ao viewport com object-fit/resizeMode: contain → preenche o máximo possível sem cortar; se a proporção não bater, só aparecem pequenas faixas pretas, mas nada da câmera é cortado.
+
+
+
+
+Se ainda parecer menor do que deveria, me diga:
+
+
+
+
+resolução que o ESP está enviando (QVGA/SVGA, etc.),
+
+
+orientação do aparelho (retrato vs. paisagem),
+
+
+e se a tab bar realmente sumiu (às vezes o nome da aba não bate e a opção não aplica).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import React from "react";
 import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
