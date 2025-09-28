@@ -1,4 +1,269 @@
 
+Valeu pelo print — o erro vem desta linha dentro do stream_handler:
+
+
+snprintf(part_buf, sizeof(part_buf),
+         "Content-Type: %s\r\n" _JPG_CONTENT_LENGTH "\r\n",
+         _JPG_CONTENT_TYPE, fb->len);
+
+
+
+Em C/C++ só dá para “colar” literais de string. Como _JPG_CONTENT_LENGTH é uma variável const char*, o compilador quebra. Vamos simplificar o handler e montar o cabeçalho numa única snprintf.
+
+
+Abaixo está o firmware completo já corrigido (cole num sketch novo e grave). É exatamente o mesmo que te mandei, mas com stream_handler reescrito e uns ajustes pequenos:
+
+
+#include <WiFi.h>
+#include "esp_camera.h"
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "esp_http_server.h"
+
+// ================= WIFI =================
+const char* WIFI_SSID  = "HydroBot";
+const char* WIFI_PASS  = "loud2025emibr";
+
+// ============ PINOS (AI Thinker) ============
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ============ HTTP SERVER ============
+httpd_handle_t httpd_handle = NULL;
+
+static void set_nocache(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  httpd_resp_set_hdr(req, "Expires", "0");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+}
+
+static esp_err_t status_handler(httpd_req_t *req) {
+  set_nocache(req);
+  char buf[96];
+  snprintf(buf, sizeof(buf),
+           "{\"ok\":true,\"ip\":\"%s\"}", WiFi.localIP().toString().c_str());
+  httpd_resp_set_type(req, "application/json");
+  return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t jpg_handler(httpd_req_t *req) {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+  set_nocache(req);
+  httpd_resp_set_type(req, "image/jpeg");
+  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  // Cabeçalho MIME multipart (MJPEG)
+  const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+  const char *BOUNDARY            = "\r\n--frame\r\n";
+  httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  set_nocache(req);
+
+  esp_err_t res = ESP_OK;
+  while (true) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; break; }
+
+    // --- boundary ---
+    if ((res = httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY))) != ESP_OK) {
+      esp_camera_fb_return(fb); break;
+    }
+
+    // --- header do frame (Content-Type + Content-Length) ---
+    char header[96];
+    int hlen = snprintf(header, sizeof(header),
+                        "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    if (hlen < 0 || hlen >= (int)sizeof(header)) { esp_camera_fb_return(fb); res = ESP_FAIL; break; }
+    if ((res = httpd_resp_send_chunk(req, header, hlen)) != ESP_OK) {
+      esp_camera_fb_return(fb); break;
+    }
+
+    // --- payload (JPEG) + CRLF ---
+    if ((res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len)) != ESP_OK) {
+      esp_camera_fb_return(fb); break;
+    }
+    esp_camera_fb_return(fb);
+    if ((res = httpd_resp_send_chunk(req, "\r\n", 2)) != ESP_OK) {
+      break;
+    }
+
+    // respiro curto para evitar overrun
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
+  // fecha chunked
+  httpd_resp_send_chunk(req, NULL, 0);
+  return res;
+}
+
+static void apply_sensor_defaults(sensor_t* s) {
+  if (!s) return;
+  s->set_framesize(s, FRAMESIZE_QVGA); // 320x240 estável
+  s->set_quality(s, 15);               // 10~15 boa qualidade; maior = mais leve
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 0);
+}
+
+static void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.max_uri_handlers = 8;
+  config.stack_size = 6144;
+
+  httpd_uri_t root_uri   = { .uri="/",        .method=HTTP_GET, .handler=status_handler, .user_ctx=NULL };
+  httpd_uri_t status_uri = { .uri="/status",  .method=HTTP_GET, .handler=status_handler, .user_ctx=NULL };
+  httpd_uri_t snap_uri   = { .uri="/snapshot",.method=HTTP_GET, .handler=jpg_handler,    .user_ctx=NULL };
+  httpd_uri_t stream_uri = { .uri="/stream",  .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL };
+
+  if (httpd_start(&httpd_handle, &config) == ESP_OK) {
+    httpd_register_uri_handler(httpd_handle, &root_uri);
+    httpd_register_uri_handler(httpd_handle, &status_uri);
+    httpd_register_uri_handler(httpd_handle, &snap_uri);
+    httpd_register_uri_handler(httpd_handle, &stream_uri);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println("\nBooting...");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 10000000; // 10 MHz estável
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;
+  config.jpeg_quality = 15;
+  config.fb_count     = 2;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+
+  if (!psramFound()) {
+    Serial.println("PSRAM not found -> DRAM fallback");
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    config.fb_count     = 1;
+    config.jpeg_quality = 18;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed 0x%x, fallback...\n", err);
+    config.xclk_freq_hz = 8000000;
+    config.frame_size   = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 20;
+    config.fb_count     = 1;
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      Serial.printf("Fallback failed 0x%x\n", err);
+      while(true){ delay(1000); }
+    }
+  }
+  apply_sensor_defaults(esp_camera_sensor_get());
+
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+  startCameraServer();
+  Serial.println("HTTP server started");
+  Serial.printf("Open: http://%s/stream\n", WiFi.localIP().toString().c_str());
+}
+
+void loop() { delay(1000); }
+
+
+
+Depois de compilar/gravar:
+
+
+
+
+Abra no navegador do celular: http://<IP>/stream.
+
+
+No app, use o mesmo IP e toque Testar.
+
+
+
+
+Se ainda aparecer reboot, reduza carga rápida:
+
+
+
+
+troque FRAMESIZE_QVGA → FRAMESIZE_QQVGA
+
+
+aumente o vTaskDelay do stream_handler para 10–12 ms
+
+
+confira a alimentação (5V ≥ 1A).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_timer.h"
