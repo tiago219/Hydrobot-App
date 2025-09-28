@@ -1,1759 +1,3 @@
-{/* Controles simples de intervalo */}
-<View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
-  <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
-  <Pressable
-    onPress={() => setIntervalMs(ms => Math.max(400, ms - 50))}
-    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-  >
-    <Text style={styles.btnText}>-50</Text>
-  </Pressable>
-  <Pressable
-    onPress={() => setIntervalMs(ms => Math.min(900, ms + 50))}
-    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-  >
-    <Text style={styles.btnText}>+50</Text>
-  </Pressable>
-</View>
-
-
-
-
-
-
-
-
-Perfeito — vamos rodar sem Android SDK e sem build nativo, direto no Expo Go.
-
-A forma que funciona no Expo Go é snapshot polling: baixar http://ESP/snapshot a cada ~400–800 ms e fazer crossfade. Isso não usa WebView nem precisa de proxy/HTTPS.
-
-
-Aqui está o CameraScreen.tsx completo (pronto pra colar) com:
-
-
-
-
-polling de /snapshot (com cache-busting ?t=),
-
-
-crossfade suave,
-
-
-start/stop,
-
-
-slider para ajustar intervalo,
-
-
-pausa automática quando o app vai para background.
-
-
-
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-// Expo Go friendly: renderiza /snapshot por polling (sem SDK/HTTPS/WebView)
-
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState
-} from "react-native";
-import Slider from "@react-native-community/slider"; // npm i @react-native-community/slider
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (snapshot)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Pronto",
-    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
-    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (snapshot)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    start: "Start",
-    stop: "Stop",
-    statusIdle: "Ready",
-    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
-    statusErr: "Failed to load image. Check IP & Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (snapshot)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Listo",
-    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
-    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP (numérico funciona melhor no Android)
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-function CrossfadeImage({
-  currentUri, nextUri, onNextLoadStart, onNextShown
-}: {
-  currentUri: string; nextUri: string;
-  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
-}) {
-  const fade = useRef(new Animated.Value(0)).current;
-  const [showNext, setShowNext] = useState(false);
-  const lastRef = useRef<string>("");
-
-  useEffect(() => {
-    if (!nextUri || nextUri === lastRef.current) return;
-    lastRef.current = nextUri;
-    setShowNext(true);
-  }, [nextUri]);
-
-  return (
-    <View style={{ flex: 1, backgroundColor: "black" }}>
-      {!!currentUri && (
-        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
-      )}
-      {showNext && (
-        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-          <Image
-            key={nextUri}
-            source={{ uri: nextUri }}
-            style={{ flex: 1, width: "100%" }}
-            resizeMode="contain"
-            onLoadStart={onNextLoadStart}
-            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
-            onLoadEnd={() => {
-              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
-                onNextShown(true); fade.setValue(0); setShowNext(false);
-              });
-            }}
-          />
-        </Animated.View>
-      )}
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [running, setRunning] = useState(false);
-  const [hadError, setHadError] = useState(false);
-  const [intervalMs, setIntervalMs] = useState(600); // ajuste fino no slider (400–900 ms)
-
-  const [currentUri, setCurrentUri] = useState("");
-  const [nextUri, setNextUri] = useState("");
-  const loadingNext = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const snapshotUrl = useMemo(()=> `http://${clean(host)}/snapshot`, [host]);
-
-  const schedule = () => {
-    if (!running) return;
-    timerRef.current = setTimeout(() => {
-      if (!loadingNext.current) {
-        setNextUri(`${snapshotUrl}?t=${Date.now()}`); // cache-busting
-      }
-      schedule();
-    }, intervalMs);
-  };
-
-  const start = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setRunning(true);
-    setHadError(false);
-    setCurrentUri(`${snapshotUrl}?t=${Date.now()}`);
-    schedule();
-  };
-
-  const stop = () => {
-    setRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
-
-  // pausa automática quando app vai para background
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s !== "active") stop();
-    });
-    return () => sub.remove();
-  }, []);
-
-  // limpa timer ao desmontar
-  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
-
-  // se mudar o intervalo durante execução, reprograma
-  useEffect(() => {
-    if (running) { stop(); start(); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, host]);
-
-  const onNextLoadStart = ()=>{ loadingNext.current = true; };
-  const onNextShown = (ok:boolean)=>{
-    loadingNext.current = false;
-    if (ok) {
-      setHadError(false);
-      if (nextUri) setCurrentUri(nextUri);
-    } else {
-      setHadError(true);
-    }
-  };
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={setHost}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        {!running ? (
-          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
-            <Text style={styles.btnText}>{T.start}</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
-            <Text style={styles.btnText}>{T.stop}</Text>
-          </Pressable>
-        )}
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {!running ? T.statusIdle : (hadError ? T.statusErr : T.statusRunning(intervalMs))}
-        </Text>
-      </View>
-
-      {/* Slider de intervalo */}
-      <View style={styles.sliderRow}>
-        <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
-        <Slider
-          style={{ width: "100%", height: 34 }}
-          minimumValue={400}
-          maximumValue={900}
-          step={50}
-          value={intervalMs}
-          onValueChange={v => setIntervalMs(Math.round(v))}
-        />
-      </View>
-
-      <View style={{ flex:1 }}>
-        <CrossfadeImage
-          currentUri={currentUri}
-          nextUri={nextUri}
-          onNextLoadStart={onNextLoadStart}
-          onNextShown={onNextShown}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-
-  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
-});
-
-
-
-Como usar (sem SDK)
-
-
-
-
-Ligue a ESP32-CAM e confirme no navegador do celular: http://<IP>/snapshot carrega.
-
-
-No app (Expo Go), abra a tela, digite o IP numérico (ex.: 192.168.0.50) e toque Iniciar.
-
-
-Ajuste o intervalo no slider (recomendo 600–700 ms para estabilidade da câmera).
-
-
-
-
-Dicas rápidas
-
-
-
-
-Evite <300 ms para não estressar a ESP32-CAM (memória/encoder).
-
-
-Se notar quedas, aumente o intervalo (750–900 ms).
-
-
-Esta solução é para visualização leve. Se no futuro quiser 10–15 fps fluídos, aí sim vale gerar build nativo (com cleartext) ou usar HTTPS/proxy.
-
-
-
-
-Se quiser, eu adapto o layout para manter também seus botões de LED e UART junto da visualização por snapshot.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-// Expo Go friendly: renderiza /snapshot por polling (sem SDK/HTTPS/WebView)
-
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState
-} from "react-native";
-import Slider from "@react-native-community/slider"; // npm i @react-native-community/slider
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (snapshot)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Pronto",
-    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
-    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (snapshot)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    start: "Start",
-    stop: "Stop",
-    statusIdle: "Ready",
-    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
-    statusErr: "Failed to load image. Check IP & Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (snapshot)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Listo",
-    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
-    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP (numérico funciona melhor no Android)
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-function CrossfadeImage({
-  currentUri, nextUri, onNextLoadStart, onNextShown
-}: {
-  currentUri: string; nextUri: string;
-  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
-}) {
-  const fade = useRef(new Animated.Value(0)).current;
-  const [showNext, setShowNext] = useState(false);
-  const lastRef = useRef<string>("");
-
-  useEffect(() => {
-    if (!nextUri || nextUri === lastRef.current) return;
-    lastRef.current = nextUri;
-    setShowNext(true);
-  }, [nextUri]);
-
-  return (
-    <View style={{ flex: 1, backgroundColor: "black" }}>
-      {!!currentUri && (
-        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
-      )}
-      {showNext && (
-        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-          <Image
-            key={nextUri}
-            source={{ uri: nextUri }}
-            style={{ flex: 1, width: "100%" }}
-            resizeMode="contain"
-            onLoadStart={onNextLoadStart}
-            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
-            onLoadEnd={() => {
-              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
-                onNextShown(true); fade.setValue(0); setShowNext(false);
-              });
-            }}
-          />
-        </Animated.View>
-      )}
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [running, setRunning] = useState(false);
-  const [hadError, setHadError] = useState(false);
-  const [intervalMs, setIntervalMs] = useState(600); // ajuste fino no slider (400–900 ms)
-
-  const [currentUri, setCurrentUri] = useState("");
-  const [nextUri, setNextUri] = useState("");
-  const loadingNext = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const snapshotUrl = useMemo(()=> `http://${clean(host)}/snapshot`, [host]);
-
-  const schedule = () => {
-    if (!running) return;
-    timerRef.current = setTimeout(() => {
-      if (!loadingNext.current) {
-        setNextUri(`${snapshotUrl}?t=${Date.now()}`); // cache-busting
-      }
-      schedule();
-    }, intervalMs);
-  };
-
-  const start = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setRunning(true);
-    setHadError(false);
-    setCurrentUri(`${snapshotUrl}?t=${Date.now()}`);
-    schedule();
-  };
-
-  const stop = () => {
-    setRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
-
-  // pausa automática quando app vai para background
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s !== "active") stop();
-    });
-    return () => sub.remove();
-  }, []);
-
-  // limpa timer ao desmontar
-  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
-
-  // se mudar o intervalo durante execução, reprograma
-  useEffect(() => {
-    if (running) { stop(); start(); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, host]);
-
-  const onNextLoadStart = ()=>{ loadingNext.current = true; };
-  const onNextShown = (ok:boolean)=>{
-    loadingNext.current = false;
-    if (ok) {
-      setHadError(false);
-      if (nextUri) setCurrentUri(nextUri);
-    } else {
-      setHadError(true);
-    }
-  };
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={setHost}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        {!running ? (
-          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
-            <Text style={styles.btnText}>{T.start}</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
-            <Text style={styles.btnText}>{T.stop}</Text>
-          </Pressable>
-        )}
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {!running ? T.statusIdle : (hadError ? T.statusErr : T.statusRunning(intervalMs))}
-        </Text>
-      </View>
-
-      {/* Slider de intervalo */}
-      <View style={styles.sliderRow}>
-        <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
-        <Slider
-          style={{ width: "100%", height: 34 }}
-          minimumValue={400}
-          maximumValue={900}
-          step={50}
-          value={intervalMs}
-          onValueChange={v => setIntervalMs(Math.round(v))}
-        />
-      </View>
-
-      <View style={{ flex:1 }}>
-        <CrossfadeImage
-          currentUri={currentUri}
-          nextUri={nextUri}
-          onNextLoadStart={onNextLoadStart}
-          onNextShown={onNextShown}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-
-  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-// Expo Go friendly: usa /snapshot (HTTP) com taxa baixa, sem WebView/SDK/proxy.
-
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, Image, Animated } from "react-native";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (snapshot)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Pronto",
-    statusRunning: "Coletando snapshots…",
-    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (snapshot)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    start: "Start",
-    stop: "Stop",
-    statusIdle: "Ready",
-    statusRunning: "Fetching snapshots…",
-    statusErr: "Failed to load image. Check IP & Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (snapshot)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Listo",
-    statusRunning: "Obteniendo snapshots…",
-    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP
-
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-function CrossfadeImage({
-  currentUri, nextUri, onNextLoadStart, onNextShown
-}: {
-  currentUri: string; nextUri: string;
-  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
-}) {
-  const fade = useRef(new Animated.Value(0)).current;
-  const [showNext, setShowNext] = useState(false);
-  const lastRef = useRef<string>("");
-
-  useEffect(() => {
-    if (!nextUri || nextUri === lastRef.current) return;
-    lastRef.current = nextUri;
-    setShowNext(true);
-  }, [nextUri]);
-
-  return (
-    <View style={{ flex: 1, backgroundColor: "black" }}>
-      {!!currentUri && (
-        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
-      )}
-      {showNext && (
-        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-          <Image
-            key={nextUri}
-            source={{ uri: nextUri }}
-            style={{ flex: 1, width: "100%" }}
-            resizeMode="contain"
-            onLoadStart={onNextLoadStart}
-            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
-            onLoadEnd={() => {
-              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
-                onNextShown(true); fade.setValue(0); setShowNext(false);
-              });
-            }}
-          />
-        </Animated.View>
-      )}
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [running, setRunning] = useState(false);
-  const [hadError, setHadError] = useState(false);
-
-  const [currentUri, setCurrentUri] = useState("");
-  const [nextUri, setNextUri] = useState("");
-  const loadingNext = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const snapshotUrl = useMemo(()=> `http://${clean(host)}/snapshot`, [host]);
-
-  const start = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setRunning(true);
-    setHadError(false);
-    // carrega o primeiro frame imediatamente
-    setCurrentUri(`${snapshotUrl}?t=${Date.now()}`);
-    schedule();
-  };
-
-  const stop = () => {
-    setRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
-
-  const schedule = () => {
-    if (!running) return;
-    // taxa baixa para não estressar a ESP32-CAM (ajuste entre 400–800ms)
-    timerRef.current = setTimeout(() => {
-      if (!loadingNext.current) {
-        setNextUri(`${snapshotUrl}?t=${Date.now()}`);
-      }
-      schedule();
-    }, 600);
-  };
-
-  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
-
-  const onNextLoadStart = ()=>{ loadingNext.current = true; };
-  const onNextShown = (ok:boolean)=>{
-    loadingNext.current = false;
-    if (ok) {
-      setHadError(false);
-      if (nextUri) setCurrentUri(nextUri);
-    } else {
-      setHadError(true);
-    }
-  };
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={setHost}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        {!running ? (
-          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
-            <Text style={styles.btnText}>{T.start}</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
-            <Text style={styles.btnText}>{T.stop}</Text>
-          </Pressable>
-        )}
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {!running ? T.statusIdle : (hadError ? T.statusErr : T.statusRunning)}
-        </Text>
-      </View>
-
-      <View style={{ flex:1 }}>
-        <CrossfadeImage
-          currentUri={currentUri}
-          nextUri={nextUri}
-          onNextLoadStart={onNextLoadStart}
-          onNextShown={onNextShown}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Boa, vamos direto ao ponto 🚀.
-
-No Windows você precisa instalar Java 17 e o Android SDK (vem com o Android Studio). Vou te dar os comandos e links:
-
-
-
-🔹 1. Instalar Java 17 (JDK)
-
-
-Baixe o instalador do Temurin JDK 17 (recomendado):
-👉 Adoptium Temurin JDK 17
-
-
-Durante a instalação, marque a opção “Add to PATH”.
-
-
-Depois confirme:
-
-
-java -version
-
-
-
-Deve aparecer algo como:
-
-
-openjdk version "17.0.x"
-
-
-
-
-🔹 2. Instalar Android Studio (SDK + ferramentas)
-
-
-Baixe aqui:
-👉 Android Studio Download
-
-
-Durante a instalação, marque:
-
-
-
-
-Android SDK
-
-
-Android SDK Platform-Tools
-
-
-Android SDK Build-Tools
-
-
-
-
-
-🔹 3. Instalar SDK pela linha de comando
-
-
-Abra PowerShell e rode:
-
-
-# Aceitar licenças
-& "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat" --licenses
-
-# Instalar pacotes básicos
-& "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
-
-
-
-🔹 4. Configurar variáveis de ambiente
-
-
-Ainda no PowerShell, rode (ajuste o caminho do JDK se precisar):
-
-
-[Environment]::SetEnvironmentVariable("ANDROID_SDK_ROOT","$env:LOCALAPPDATA\Android\Sdk","User")
-[Environment]::SetEnvironmentVariable("ANDROID_HOME","$env:LOCALAPPDATA\Android\Sdk","User")
-[Environment]::SetEnvironmentVariable("JAVA_HOME","C:\Program Files\Eclipse Adoptium\jdk-17.0.10","User")
-
-$path = [Environment]::GetEnvironmentVariable("Path","User")
-$adds = @(
-  "$env:LOCALAPPDATA\Android\Sdk\platform-tools",
-  "$env:LOCALAPPDATA\Android\Sdk\emulator",
-  "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin",
-  "$env:JAVA_HOME\bin"
-)
-$novo = ($path.Split(';') + $adds) | Select-Object -Unique -ExcludeEmpty
-[Environment]::SetEnvironmentVariable("Path",$novo -join ';',"User")
-
-
-
-⚠️ Depois disso, feche e reabra o VS Code/PowerShell.
-
-
-
-🔹 5. Testar
-
-
-Rode:
-
-
-java -version
-adb --version
-
-
-
-Se os dois responderem, rode seu app:
-
-
-npx expo prebuild -p android --clean
-npx expo run:android
-
-
-
-
-👉 Quer que eu monte um script .bat pronto que instala e configura o SDK e JDK automaticamente pra você só rodar?
-
-
-
-
-
-
-
-https://adoptium.net/pt-BR/temurin/releases?version=17
-
-https://developer.android.com/studio
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Tem sim — o caminho “sem proxy e sem certificado” é buildar o app (Expo Dev/Release) com HTTP liberado (cleartext) no Android. No Expo Go isso é bloqueado pelo sistema e não tem como mudar; mas no seu próprio build você libera e o app acessa http://<ip>/stream direto do ESP.
-
-
-Abaixo vai o passo-a-passo + o CameraScreen.tsx completo (HTTP).
-
-
-
-Passo a passo (Expo Managed → Dev Build com HTTP liberado)
-
-
-
-
-Instale o plugin de build:
-
-
-
-
-npm i -D expo-build-properties
-
-
-
-
-
-Edite o app.json (na raiz do seu projeto) e adicione o plugin e a permissão:
-
-
-
-
-{
-  "expo": {
-    "name": "HydroBotApp2",
-    "slug": "HydroBotApp2",
-    "android": {
-      "package": "com.seu.pacote.hydrobot",
-      "permissions": ["INTERNET"]
-    },
-    "plugins": [
-      ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
-    ]
-  }
-}
-
-
-
-
-
-Isso injeta android:usesCleartextTraffic="true" no Manifest durante o build.
-
-Em muitos aparelhos isso já resolve. Se algum device específico ainda bloquear, depois do prebuild você pode (opcional) criar android/app/src/main/res/xml/network_security_config.xml e referenciar no Manifest — mas só faça se necessário.
-
-
-
-
-
-
-Gere e rode um Dev Build (não use Expo Go):
-
-
-
-
-npx expo prebuild -p android
-npx expo run:android
-
-
-
-
-
-Use IP numérico do ESP (ex.: 192.168.0.50) para evitar problemas de mDNS em Android.
-
-
-
-
-
-CameraScreen.tsx (HTTP direto do ESP32-CAM via WebView)
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-import React, { useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, Image } from "react-native";
-import { WebView } from "react-native-webview";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (ESP32-CAM)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    reload: "Recarregar",
-    connecting: "Conectando stream…",
-    failed: "Falha ao carregar. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (ESP32-CAM)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    reload: "Reload",
-    connecting: "Connecting stream…",
-    failed: "Failed to load. Check IP & Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (ESP32-CAM)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    reload: "Recargar",
-    connecting: "Conectando stream…",
-    failed: "Error al cargar. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [status, setStatus] = useState<"idle"|"loading"|"ok"|"error">("idle");
-  const [nonce, setNonce] = useState(0);
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const streamUrl = useMemo(() => `http://${clean(host)}/stream`, [host]);
-
-  // Página mínima para renderizar MJPEG (alguns devices lidam melhor via HTML do que source:uri direto)
-  const html = useMemo(() => `
-    <!doctype html>
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width,initial-scale=1"/>
-        <style>
-          html,body { margin:0; padding:0; height:100%; background:#000; }
-          #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; }
-          img { max-width:100vw; max-height:100vh; width:100%; height:auto; object-fit:contain; }
-        </style>
-      </head>
-      <body>
-        <div id="wrap">
-          <img id="mjpeg" src="${streamUrl}"
-               onload="window.ReactNativeWebView && window.ReactNativeWebView.postMessage('ok')"
-               onerror="window.ReactNativeWebView && window.ReactNativeWebView.postMessage('error')" />
-        </div>
-      </body>
-    </html>
-  `.trim(), [streamUrl, nonce]);
-
-  const webref = useRef<WebView>(null);
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={setHost}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        <Pressable
-          onPress={() => { setStatus("loading"); setNonce(n => n+1); }}
-          style={[styles.btn, { backgroundColor: "#2563eb" }]}
-        >
-          <Text style={styles.btnText}>{T.reload}</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {status === "loading" && T.connecting}
-          {status === "error" && T.failed}
-          {status === "ok" && streamUrl}
-          {status === "idle" && "—"}
-        </Text>
-      </View>
-
-      <View style={{ flex:1, backgroundColor:"#000" }}>
-        <WebView
-          key={nonce}
-          ref={webref}
-          originWhitelist={["*"]}
-          mixedContentMode="always"
-          javaScriptEnabled
-          domStorageEnabled
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction={false}
-          source={{ html }}
-          onLoadStart={() => setStatus("loading")}
-          onMessage={(e) => {
-            const msg = String(e.nativeEvent.data || "");
-            setStatus(msg === "ok" ? "ok" : "error");
-          }}
-          onError={() => setStatus("error")}
-          onHttpError={() => setStatus("error")}
-          setSupportMultipleWindows={false}
-          style={{ backgroundColor:"#000" }}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:160, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-});
-
-
-
-
-Dica final
-
-
-
-
-Depois que funcionar no Dev Build, se quiser gerar APK/AAB release, use eas build --platform android mantendo o plugin expo-build-properties.
-
-
-Se algum aparelho específico ainda barrar HTTP, me avise que te passo o passo opcional do network_security_config.xml (após o prebuild) — continua sem proxy/certificado, só ajusta a política do próprio app.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-import React, { useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, Image } from "react-native";
-import { WebView } from "react-native-webview";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (ESP32-CAM)",
-    espIp: "URL do Stream:",
-    placeholderIp: "https://meuservidor.com",
-    reload: "Recarregar",
-    connecting: "Conectando stream…",
-    failed: "Falha ao carregar. Verifique URL e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (ESP32-CAM)",
-    espIp: "Stream URL:",
-    placeholderIp: "https://myserver.com",
-    reload: "Reload",
-    connecting: "Connecting stream…",
-    failed: "Failed to load. Check URL and Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (ESP32-CAM)",
-    espIp: "URL del Stream:",
-    placeholderIp: "https://miservidor.com",
-    reload: "Recargar",
-    connecting: "Conectando stream…",
-    failed: "Error al cargar. Verifica URL y Wi-Fi."
-  },
-};
-
-const DEFAULT_URL = "https://meuservidor.com"; // coloque aqui seu proxy HTTPS
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [url, setUrl] = useState(DEFAULT_URL);
-  const [status, setStatus] = useState<"idle"|"loading"|"ok"|"error">("idle");
-  const [nonce, setNonce] = useState(0);
-
-  const streamUrl = useMemo(() => `${url.replace(/\/+$/,"")}/stream`, [url]);
-
-  const html = useMemo(() => `
-    <!doctype html>
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width,initial-scale=1"/>
-        <style>
-          html,body { margin:0; padding:0; height:100%; background:#000; }
-          #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; }
-          img { max-width:100vw; max-height:100vh; width:100%; height:auto; object-fit:contain; }
-        </style>
-      </head>
-      <body>
-        <div id="wrap">
-          <img id="mjpeg" src="${streamUrl}"
-               onload="window.ReactNativeWebView.postMessage('ok')"
-               onerror="window.ReactNativeWebView.postMessage('error')" />
-        </div>
-      </body>
-    </html>
-  `.trim(), [streamUrl, nonce]);
-
-  const webref = useRef<WebView>(null);
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={url}
-          onChangeText={setUrl}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-        />
-        <Pressable
-          onPress={() => { setStatus("loading"); setNonce(n => n+1); }}
-          style={[styles.btn, { backgroundColor: "#2563eb" }]}
-        >
-          <Text style={styles.btnText}>{T.reload}</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {status === "loading" && T.connecting}
-          {status === "error" && T.failed}
-          {status === "ok" && streamUrl}
-          {status === "idle" && "—"}
-        </Text>
-      </View>
-
-      <View style={{ flex:1, backgroundColor:"#000" }}>
-        <WebView
-          key={nonce}
-          ref={webref}
-          originWhitelist={["*"]}
-          mixedContentMode="always"
-          javaScriptEnabled
-          domStorageEnabled
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction={false}
-          source={{ html }}
-          onLoadStart={() => setStatus("loading")}
-          onMessage={(e) => {
-            const msg = String(e.nativeEvent.data || "");
-            setStatus(msg === "ok" ? "ok" : "error");
-          }}
-          onError={() => setStatus("error")}
-          onHttpError={() => setStatus("error")}
-          setSupportMultipleWindows={false}
-          style={{ backgroundColor:"#000" }}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:160, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Perfeito — como essa firmware já roda o webserver padrão da ESP32-CAM (com /stream estável), segue um CameraScreen.tsx enxuto que exibe o MJPEG direto do ESP via WebView (sem passar pelo servidor). Ele inclui:
-
-
-
-
-Campo para IP/host (ex.: hydrobot.local ou 192.168.x.y)
-
-
-Player MJPEG em WebView com <img src="http://IP/stream">
-
-
-Botão “Recarregar” (força bust de cache)
-
-
-Status de conexão simples
-
-
-
-
-
-
-Observação: MJPEG não renderiza em <Image> do RN; o jeito mais consistente no Android é um WebView com uma mini-página HTML contendo a tag <img> apontando para /stream.
-
-
-
-
-
-HydroBotApp2/src/screens/CameraScreen.tsx
-
-
-import React, { useMemo, useRef, useState } from "react";
-import { View, Text, TextInput, Pressable, StyleSheet, Image } from "react-native";
-import { WebView } from "react-native-webview";
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (ESP32-CAM)",
-    espIp: "ESP:",
-    placeholderIp: "hydrobot.local",
-    reload: "Recarregar",
-    connecting: "Conectando stream…",
-    failed: "Falha ao carregar. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (ESP32-CAM)",
-    espIp: "ESP:",
-    placeholderIp: "hydrobot.local",
-    reload: "Reload",
-    connecting: "Connecting stream…",
-    failed: "Failed to load. Check IP and Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (ESP32-CAM)",
-    espIp: "ESP:",
-    placeholderIp: "hydrobot.local",
-    reload: "Recargar",
-    connecting: "Conectando stream…",
-    failed: "Error al cargar. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_IP = "hydrobot.local";
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [ip, setIp] = useState(DEFAULT_IP);
-  const [status, setStatus] = useState<"idle"|"loading"|"ok"|"error">("idle");
-  const [nonce, setNonce] = useState(0); // força reload
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const streamUrl = useMemo(() => `http://${clean(ip)}/stream`, [ip]);
-
-  // HTML minimalista para renderizar MJPEG e respeitar aspect ratio
-  const html = useMemo(() => `
-    <!doctype html>
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-        <style>
-          html,body { margin:0; padding:0; height:100%; background:#000; }
-          #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; }
-          img { max-width:100vw; max-height:100vh; width:100%; height:auto; object-fit:contain; }
-        </style>
-      </head>
-      <body>
-        <div id="wrap">
-          <img id="mjpeg" src="${streamUrl}" onload="window.ReactNativeWebView.postMessage('ok')" onerror="window.ReactNativeWebView.postMessage('error')" />
-        </div>
-      </body>
-    </html>
-  `.trim(), [streamUrl, nonce]); // 'nonce' garante atualização do conteúdo
-
-  const webref = useRef<WebView>(null);
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={ip}
-          onChangeText={setIp}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-        />
-        <Pressable
-          onPress={() => { setStatus("loading"); setNonce(n => n+1); }}
-          style={[styles.btn, { backgroundColor: "#2563eb" }]}
-        >
-          <Text style={styles.btnText}>{T.reload}</Text>
-        </Pressable>
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {status === "loading" && T.connecting}
-          {status === "error" && T.failed}
-          {status === "ok" && streamUrl}
-          {status === "idle" && "—"}
-        </Text>
-      </View>
-
-      <View style={{ flex:1, backgroundColor:"#000" }}>
-        <WebView
-          key={nonce}                    // força reconstrução
-          ref={webref}
-          originWhitelist={["*"]}
-          source={{ html }}
-          javaScriptEnabled
-          domStorageEnabled
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction={false}
-          onLoadStart={() => setStatus("loading")}
-          onMessage={(e) => {
-            const msg = String(e.nativeEvent.data || "");
-            setStatus(msg === "ok" ? "ok" : "error");
-          }}
-          onError={() => setStatus("error")}
-          onHttpError={() => setStatus("error")}
-          setSupportMultipleWindows={false}
-          // evita barras de rolagem
-          scalesPageToFit={false}
-          automaticallyAdjustContentInsets={false}
-          style={{ backgroundColor:"#000" }}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:160, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-});
-
-
-
-Como usar
-
-
-
-
-Abra a tela, digite o host/IP do ESP (ex.: hydrobot.local ou 192.168.3.3).
-
-
-Toque Recarregar → o status deve mudar para “Conectando stream…”, depois mostrar o próprio URL quando o <img> confirmar o carregamento.
-
-
-Se aparecer “Falha ao carregar”, confirme no navegador do mesmo celular: http://SEU_IP/stream abre? Se sim, volte e toque Recarregar (ou troque para o IP numérico em vez do .local se o mDNS não resolver no Android).
-
-
-
-
-Se quiser manter os botões de LED/UART depois, dá pra reintroduzir — mas para ver o vídeo dessa firmware, isso aqui basta.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "esp_camera.h"
 #include <WiFi.h>
 
@@ -1884,3 +128,268 @@ void loop() {
   // Do nothing. Everything is done in another task by the web server
   delay(10000);
 }
+
+
+
+
+
+
+
+
+
+// HydroBotApp2/src/screens/CameraScreen.tsx
+// Expo Go friendly: renderiza /snapshot por polling (sem SDK/HTTPS/WebView)
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState
+} from "react-native";
+
+import { useLanguage } from "../context/LanguageContext";
+
+const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+
+const textsByLang = {
+  pt: {
+    heroSubtitle: "Visualização da Câmera (snapshot)",
+    espIp: "Host/IP do ESP:",
+    placeholderIp: "192.168.0.50",
+    start: "Iniciar",
+    stop: "Parar",
+    statusIdle: "Pronto",
+    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
+    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi."
+  },
+  en: {
+    heroSubtitle: "Camera Viewer (snapshot)",
+    espIp: "ESP Host/IP:",
+    placeholderIp: "192.168.0.50",
+    start: "Start",
+    stop: "Stop",
+    statusIdle: "Ready",
+    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
+    statusErr: "Failed to load image. Check IP & Wi-Fi."
+  },
+  es: {
+    heroSubtitle: "Visor de Cámara (snapshot)",
+    espIp: "Host/IP del ESP:",
+    placeholderIp: "192.168.0.50",
+    start: "Iniciar",
+    stop: "Parar",
+    statusIdle: "Listo",
+    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
+    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi."
+  },
+};
+
+const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP (numérico funciona melhor no Android)
+const appLogo = require("../../assets/logo.png");
+
+function AppHero({ subtitle }: { subtitle: string }) {
+  return (
+    <View style={styles.hero}>
+      <Image source={appLogo} style={styles.heroLogo} />
+      <Text style={styles.heroTitle}>HydroBot</Text>
+      <Text style={styles.heroSubtitle}>{subtitle}</Text>
+    </View>
+  );
+}
+
+function CrossfadeImage({
+  currentUri, nextUri, onNextLoadStart, onNextShown
+}: {
+  currentUri: string; nextUri: string;
+  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
+}) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const [showNext, setShowNext] = useState(false);
+  const lastRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!nextUri || nextUri === lastRef.current) return;
+    lastRef.current = nextUri;
+    setShowNext(true);
+  }, [nextUri]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "black" }}>
+      {!!currentUri && (
+        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
+      )}
+      {showNext && (
+        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+          <Image
+            key={nextUri}
+            source={{ uri: nextUri }}
+            style={{ flex: 1, width: "100%" }}
+            resizeMode="contain"
+            onLoadStart={onNextLoadStart}
+            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
+            onLoadEnd={() => {
+              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
+                onNextShown(true); fade.setValue(0); setShowNext(false);
+              });
+            }}
+          />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+export default function CameraScreen() {
+  const { lang } = useLanguage();
+  const T = textsByLang[lang];
+
+  const [host, setHost] = useState(DEFAULT_HOST);
+  const [running, setRunning] = useState(false);
+  const [hadError, setHadError] = useState(false);
+  const [intervalMs, setIntervalMs] = useState(600); // ajuste fino no slider (400–900 ms)
+
+  const [currentUri, setCurrentUri] = useState("");
+  const [nextUri, setNextUri] = useState("");
+  const loadingNext = useRef(false);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const clean = (s:string)=> s.replace(/\/+$/,"");
+  const snapshotUrl = useMemo(()=> `http://${clean(host)}/snapshot`, [host]);
+
+  const schedule = () => {
+    if (!running) return;
+    timerRef.current = setTimeout(() => {
+      if (!loadingNext.current) {
+        setNextUri(`${snapshotUrl}?t=${Date.now()}`); // cache-busting
+      }
+      schedule();
+    }, intervalMs);
+  };
+
+  const start = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setRunning(true);
+    setHadError(false);
+    setCurrentUri(`${snapshotUrl}?t=${Date.now()}`);
+    schedule();
+  };
+
+  const stop = () => {
+    setRunning(false);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+  };
+
+  // pausa automática quando app vai para background
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s !== "active") stop();
+    });
+    return () => sub.remove();
+  }, []);
+
+  // limpa timer ao desmontar
+  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
+
+  // se mudar o intervalo durante execução, reprograma
+  useEffect(() => {
+    if (running) { stop(); start(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intervalMs, host]);
+
+  const onNextLoadStart = ()=>{ loadingNext.current = true; };
+  const onNextShown = (ok:boolean)=>{
+    loadingNext.current = false;
+    if (ok) {
+      setHadError(false);
+      if (nextUri) setCurrentUri(nextUri);
+    } else {
+      setHadError(true);
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <AppHero subtitle={T.heroSubtitle} />
+
+      <View style={styles.topbar}>
+        <Text style={styles.label}>{T.espIp}</Text>
+        <TextInput
+          value={host}
+          onChangeText={setHost}
+          placeholder={T.placeholderIp}
+          placeholderTextColor="#8a93a5"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+          keyboardType="numeric"
+        />
+        {!running ? (
+          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
+            <Text style={styles.btnText}>{T.start}</Text>
+          </Pressable>
+        ) : (
+          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
+            <Text style={styles.btnText}>{T.stop}</Text>
+          </Pressable>
+        )}
+      </View>
+
+      <View style={styles.statusRow}>
+        <Text style={styles.statusText}>
+          {!running ? T.statusIdle : (hadError ? T.statusErr : T.statusRunning(intervalMs))}
+        </Text>
+      </View>
+
+      {/* Controles simples de intervalo */}
+<View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
+  <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
+  <Pressable
+    onPress={() => setIntervalMs(ms => Math.max(400, ms - 50))}
+    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+  >
+    <Text style={styles.btnText}>-50</Text>
+  </Pressable>
+  <Pressable
+    onPress={() => setIntervalMs(ms => Math.min(900, ms + 50))}
+    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
+  >
+    <Text style={styles.btnText}>+50</Text>
+  </Pressable>
+</View>
+
+
+      <View style={{ flex:1 }}>
+        <CrossfadeImage
+          currentUri={currentUri}
+          nextUri={nextUri}
+          onNextLoadStart={onNextLoadStart}
+          onNextShown={onNextShown}
+        />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container:{ flex:1, backgroundColor:PALETTE.bg },
+  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
+  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
+  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
+  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
+
+  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
+           paddingHorizontal:12, paddingVertical:10, gap:8,
+           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  label:{ color:"#cfd3d8", fontSize:12 },
+  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
+          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
+  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
+  btnText:{ color:"white", fontWeight:"700" },
+
+  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
+              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  statusText:{ color:"#cbd5ff", fontSize:12 },
+
+  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
+              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
+  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
+});
