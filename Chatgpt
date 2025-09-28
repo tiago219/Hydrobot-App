@@ -1,4 +1,298 @@
 
+bora deixar bonito e com a câmera GRANDONA. Abaixo estão os 3 arquivos completos: App.tsx, src/screens/HomeScreen.tsx e src/screens/CameraScreen.tsx.
+
+Eles mantêm só Home e Câmera, colocam a logo (assets/logo.png) em ambas as telas, e deixam o MJPEG ocupando praticamente a tela toda (com proporção estável 4:3).
+
+
+
+App.tsx
+
+
+import React from "react";
+import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+import { LogBox } from "react-native";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+
+LogBox.ignoreLogs(["useInsertionEffect must not schedule updates"]);
+
+const Tab = createBottomTabNavigator();
+
+const theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: "#0b0b0f",
+    card: "#0b0b0f",
+    text: "#e5e7eb",
+    border: "#25273a",
+    primary: "#e6403a",
+  },
+};
+
+export default function App() {
+  return (
+    <NavigationContainer theme={theme}>
+      <Tab.Navigator
+        screenOptions={({ route }) => ({
+          headerShown: false,
+          tabBarStyle: { backgroundColor: "#0b0b0f", borderTopColor: "#25273a" },
+          tabBarActiveTintColor: "#e6403a",
+          tabBarInactiveTintColor: "#9aa0a6",
+          tabBarIcon: ({ color, size }) => {
+            const name =
+              route.name === "Início" ? "home" :
+              route.name === "Câmera" ? "videocam" : "ellipse";
+            return <Ionicons name={name as any} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Início" component={HomeScreen} />
+        <Tab.Screen name="Câmera" component={CameraScreen} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+
+src/screens/HomeScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet, Image, Pressable } from "react-native";
+import { useNavigation } from "@react-navigation/native";
+
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+export default function HomeScreen() {
+  const nav = useNavigation<any>();
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.logoWrap}>
+        <Image source={require("../../assets/logo.png")} style={styles.logo} resizeMode="contain" />
+        <Text style={styles.title}>HydroBot</Text>
+        <Text style={styles.subtitle}>Monitoramento e Controle</Text>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Bem-vindo</Text>
+        <Text style={styles.cardText}>
+          Toque abaixo para abrir a câmera e visualizar o stream MJPEG do ESP32-CAM.
+        </Text>
+
+        <Pressable style={styles.cta} onPress={() => nav.navigate("Câmera")}>
+          <Text style={styles.ctaText}>Abrir Câmera</Text>
+        </Pressable>
+      </View>
+
+      <Text style={styles.footer}>v2 • feito com ❤️</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, alignItems: "center", paddingHorizontal: 20, paddingTop: 48 },
+  logoWrap: { alignItems: "center", gap: 8, marginBottom: 16 },
+  logo: { width: 120, height: 120 },
+  title: { color: PALETTE.text, fontSize: 28, fontWeight: "700", letterSpacing: 0.4 },
+  subtitle: { color: "#9aa0a6", fontSize: 14 },
+  card: { width: "100%", backgroundColor: PALETTE.card, borderColor: PALETTE.border, borderWidth: 1, borderRadius: 16, padding: 16, gap: 10 },
+  cardTitle: { color: PALETTE.text, fontSize: 18, fontWeight: "700" },
+  cardText: { color: "#cdd1d5", fontSize: 14, lineHeight: 20 },
+  cta: { marginTop: 8, backgroundColor: PALETTE.accent, borderRadius: 12, paddingVertical: 12, alignItems: "center" },
+  ctaText: { color: "white", fontWeight: "700", fontSize: 16 },
+  footer: { position: "absolute", bottom: 20, color: "#6b7280", fontSize: 12 },
+});
+
+
+
+
+src/screens/CameraScreen.tsx
+
+
+
+
+Câmera grande: o WebView fica dentro de um container com aspectRatio: 4/3 e maxHeight: '78%', ocupando praticamente a tela.
+
+Inclui a logo no topo e mantém os botões de stream/snapshot.
+
+
+
+
+import React, { useMemo, useRef, useState } from "react";
+import { View, Text, TextInput, Pressable, StyleSheet, Image, Dimensions, Platform } from "react-native";
+import { WebView } from "react-native-webview";
+
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+type Mode = "mjpeg" | "snapshot";
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const webRef = useRef<WebView>(null);
+
+  const url = useMemo(() => {
+    if (!ip) return "about:blank";
+    return mode === "mjpeg" ? `http://${ip}:81/stream` : `http://${ip}/capture`;
+  }, [ip, mode]);
+
+  const reload = () => webRef.current?.reload();
+
+  return (
+    <View style={styles.container}>
+      {/* Header com logo */}
+      <View style={styles.header}>
+        <Image source={require("../../assets/logo.png")} style={styles.logo} resizeMode="contain" />
+        <Text style={styles.title}>Câmera</Text>
+      </View>
+
+      {/* Controles simples */}
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex: 192.168.3.3"
+          placeholderTextColor="#7b7f86"
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType={Platform.OS === "ios" ? "numbers-and-punctuation" : "numeric"}
+          style={styles.input}
+        />
+        <Pressable style={styles.testBtn} onPress={reload}>
+          <Text style={styles.testTxt}>Testar</Text>
+        </Pressable>
+      </View>
+
+      {/* Botões de modo */}
+      <View style={styles.modes}>
+        <Pressable onPress={() => setMode("mjpeg")} style={[styles.modeBtn, mode === "mjpeg" && styles.modeActive]}>
+          <Text style={[styles.modeTxt, mode === "mjpeg" && styles.modeTxtActive]}>MJPEG (:81/stream)</Text>
+        </Pressable>
+        <Pressable onPress={() => setMode("snapshot")} style={[styles.modeBtn, mode === "snapshot" && styles.modeActive]}>
+          <Text style={[styles.modeTxt, mode === "snapshot" && styles.modeTxtActive]}>Snapshot (/capture)</Text>
+        </Pressable>
+      </View>
+
+      {/* VIEWPORT GRANDONA */}
+      <View style={styles.viewport}>
+        <WebView
+          ref={webRef}
+          source={{ uri: url }}
+          style={styles.web}
+          javaScriptEnabled
+          domStorageEnabled
+          allowsInlineMediaPlayback
+          cacheEnabled={false}
+          automaticallyAdjustContentInsets={false}
+          bounces={false}
+          onError={() => {}}
+        />
+      </View>
+
+      <Text style={styles.status}>URL: {url}</Text>
+    </View>
+  );
+}
+
+const { height } = Dimensions.get("window");
+const VIEWPORT_MAX_H = Math.floor(height * 0.78); // ocupa ~78% da tela
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, paddingHorizontal: 16, paddingTop: 16 },
+  header: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 12 },
+  logo: { width: 32, height: 32 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+
+  row: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
+  label: { color: "#9aa0a6", width: 56 },
+  input: { flex: 1, backgroundColor: PALETTE.card, color: PALETTE.text, borderColor: PALETTE.border, borderWidth: 1, borderRadius: 10, paddingHorizontal: 10, height: 40 },
+  testBtn: { backgroundColor: PALETTE.accent, paddingHorizontal: 14, height: 40, borderRadius: 10, justifyContent: "center" },
+  testTxt: { color: "white", fontWeight: "700" },
+
+  modes: { flexDirection: "row", gap: 10, marginBottom: 10 },
+  modeBtn: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: PALETTE.border, backgroundColor: PALETTE.card },
+  modeActive: { backgroundColor: "#2a0f11", borderColor: "#5a1e21" },
+  modeTxt: { color: "#cdd1d5", fontSize: 12 },
+  modeTxtActive: { color: "#ffd9d7", fontWeight: "700" },
+
+  // viewport grande estável (proporção 4:3)
+  viewport: {
+    width: "100%",
+    maxHeight: VIEWPORT_MAX_H,
+    aspectRatio: 4 / 3,
+    backgroundColor: "black",
+    borderRadius: 12,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    alignSelf: "center",
+  },
+  web: { flex: 1, backgroundColor: "black" },
+
+  status: { marginTop: 8, color: "#7b7f86", fontSize: 12 },
+});
+
+
+
+
+Notas
+
+
+
+
+A câmera agora preenche o container 4:3 com até ~78% da altura da tela. Se quiser ainda maior, aumente VIEWPORT_MAX_H para 0.86 (86%).
+
+
+A logo vem de assets/logo.png. Certifique-se de que o caminho é exatamente ./assets/logo.png na raiz do projeto.
+
+
+Mantive o visual escuro do seu app, só refinei a Home (logo + card + CTA) para ficar limpa e parecida com o design anterior.
+
+
+
+
+Se algo ainda ficar pequeno no seu tablet específico, me diga a altura/largura em pixels que você quer para o viewport e eu já mando um ajuste fino (ou coloco full-bleed com aspectRatio dinâmico).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 bora — já deixei a câmera maiorzassa (ocupando praticamente a tela toda) e alinhei o visual ao app antigo (preto, card escuro, acento vermelho, bordas finas). É só substituir os arquivos abaixo.
 
 
