@@ -1,4 +1,342 @@
 
+Beleza — vou adaptar a CameraScreen para funcionar com o “teste do ESP32” clássico (o exemplo da ESP32-CAM que faz http://IP:81/stream e o snapshot em /capture).
+
+Ela faz auto-detecção de rotas mais comuns: tenta primeiro :81/stream, depois /stream, e cai para snapshot (/capture ou /snapshot) se preciso. Não precisa mudar o firmware.
+
+
+Substitua seu arquivo inteiro por este:
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { View, Text, TextInput, Pressable, StyleSheet, Image, AppState, AppStateStatus } from "react-native";
+import { WebView } from "react-native-webview";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = { bg: "#0b0b0f", card: "#121218", border: "#25273a", accent: "#e6403a", text: "#e5e7eb" };
+
+// Utilitário de timeout para fetch
+async function fetchWithTimeout(url: string, ms = 2000) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { method: "GET", signal: ctrl.signal });
+    return r;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState("192.168.4.1"); // coloque o IP do seu ESP
+  const [status, setStatus] = useState("Aguardando IP");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [streamURL, setStreamURL] = useState<string>("");
+  const [snapshotURL, setSnapshotURL] = useState<string>("");
+  const [snapTick, setSnapTick] = useState(0);
+  const [isRunning, setIsRunning] = useState(false);
+
+  const snapTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appState = useRef<AppStateStatus>(AppState.currentState);
+
+  // Candidatos típicos do firmware “teste esp32”
+  const streamCandidates = useMemo(() => {
+    const base = (ip || "").trim();
+    if (!base) return [];
+    return [
+      `http://${base}:81/stream`,   // padrão do exemplo oficial
+      `http://${base}/stream`,      // alguns firmwares servem na 80
+      `http://${base}:80/stream`,
+      `http://${base}:81/mjpeg`,    // variações
+      `http://${base}/mjpeg`,
+    ];
+  }, [ip]);
+
+  const snapshotCandidates = useMemo(() => {
+    const base = (ip || "").trim();
+    if (!base) return [];
+    return [
+      `http://${base}/capture`,     // padrão do exemplo oficial
+      `http://${base}/snapshot`,
+      `http://${base}:81/capture`,
+      `http://${base}:81/snapshot`,
+      `http://${base}:80/capture`,
+      `http://${base}:80/snapshot`,
+    ];
+  }, [ip]);
+
+  // Loop do snapshot (fallback)
+  const startSnapshotLoop = useCallback(() => {
+    if (snapTimerRef.current) return;
+    snapTimerRef.current = setInterval(() => setSnapTick((t) => (t + 1) % 1_000_000), 200); // ~5 fps estável
+  }, []);
+  const stopSnapshotLoop = useCallback(() => {
+    if (!snapTimerRef.current) return;
+    clearInterval(snapTimerRef.current);
+    snapTimerRef.current = null;
+  }, []);
+  useEffect(() => {
+    if (mode === "snapshot" && snapshotURL) startSnapshotLoop();
+    else stopSnapshotLoop();
+    return stopSnapshotLoop;
+  }, [mode, snapshotURL, startSnapshotLoop, stopSnapshotLoop]);
+
+  // Pausar ao ir para background
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next) => {
+      const prev = appState.current;
+      appState.current = next;
+      if (prev.match(/active/) && next.match(/inactive|background/)) {
+        stopSnapshotLoop();
+        setIsRunning(false);
+      } else if (prev.match(/inactive|background/) && next === "active") {
+        if (mode === "snapshot" && snapshotURL) startSnapshotLoop();
+        if (streamURL || snapshotURL) setIsRunning(true);
+      }
+    });
+    return () => sub.remove();
+  }, [mode, snapshotURL, streamURL, startSnapshotLoop, stopSnapshotLoop]);
+
+  // Teste/auto-detecção
+  const testConnection = useCallback(async () => {
+    const target = (ip || "").trim();
+    if (!target) {
+      setStatus("Informe o IP do ESP");
+      return;
+    }
+    setStatus("Testando...");
+    setIsRunning(false);
+    stopSnapshotLoop();
+    setStreamURL("");
+    setSnapshotURL("");
+
+    // 1) Tentar candidatos de MJPEG
+    for (const u of streamCandidates) {
+      try {
+        const r = await fetchWithTimeout(u, 2000);
+        if (r.ok) {
+          setStreamURL(u);
+          setMode("mjpeg");
+          setStatus(`Conectado (MJPEG): ${u}`);
+          setIsRunning(true);
+          return;
+        }
+      } catch {}
+    }
+
+    // 2) Fallback: tentar snapshot
+    for (const u of snapshotCandidates) {
+      try {
+        const r = await fetchWithTimeout(u, 2000);
+        if (r.ok) {
+          setSnapshotURL(u);
+          setMode("snapshot");
+          setStatus(`Conectado (Snapshot): ${u}`);
+          setIsRunning(true);
+          startSnapshotLoop();
+          return;
+        }
+      } catch {}
+    }
+
+    setStatus("Falha ao conectar — verifique IP, porta 81/80 e rotas (/stream ou /capture).");
+    setIsRunning(false);
+  }, [ip, streamCandidates, snapshotCandidates, startSnapshotLoop, stopSnapshotLoop]);
+
+  // HTML que carrega o MJPEG com auto-reconnect
+  const mjpegHTML = useMemo(() => {
+    if (!streamURL) return "";
+    return `
+      <!doctype html>
+      <html><head><meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <style>
+        html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;}
+        #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+        img{max-width:100vw;max-height:100vh;object-fit:contain;}
+        #badge{position:fixed;left:8px;bottom:8px;padding:4px 8px;border-radius:8px;
+               background:#121218;color:#e5e7eb;font-family:system-ui,Arial,sans-serif;font-size:12px;opacity:.7}
+      </style></head>
+      <body>
+        <div id="wrap"><img id="mjpeg" src="${streamURL}"/></div>
+        <div id="badge">${streamURL}</div>
+        <script>
+          const img = document.getElementById('mjpeg');
+          let backoff=800;
+          img.addEventListener('error',()=>{
+            setTimeout(()=>{ img.src='${streamURL}?_='+Date.now(); }, backoff);
+            backoff = Math.min(backoff*2, 4000);
+          });
+        </script>
+      </body></html>
+    `.trim();
+  }, [streamURL]);
+
+  const snapshotURI = useMemo(
+    () => (snapshotURL ? `${snapshotURL}?_=${snapTick}` : ""),
+    [snapshotURL, snapTick]
+  );
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>ESP32-CAM Viewer</Text>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex.: 192.168.3.3"
+          placeholderTextColor="#6b7280"
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+        />
+        <Pressable style={styles.button} onPress={testConnection}>
+          <Text style={styles.buttonText}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <Text style={styles.status}>Status: {status} {isRunning ? " | OK" : ""}</Text>
+
+      <View style={styles.viewer}>
+        {isRunning ? (
+          mode === "mjpeg" && streamURL ? (
+            <WebView
+              originWhitelist={["*"]}
+              source={{ html: mjpegHTML, baseUrl: streamURL }}
+              javaScriptEnabled
+              domStorageEnabled
+              allowsInlineMediaPlayback
+              mediaPlaybackRequiresUserAction={false}
+              allowsFullscreenVideo={false}
+              mixedContentMode="always"                         // Android: libera HTTP claro
+              androidHardwareAccelerationEnabled
+              setSupportMultipleWindows={false}
+              onError={() => {
+                // se falhar, tenta cair automaticamente para snapshot candidates
+                setStatus("MJPEG falhou — alternando para Snapshot...");
+                setMode("snapshot");
+                // escolhe o melhor snapshot disponível já conhecido ou o primeiro candidato
+                setSnapshotURL((prev) => prev || snapshotCandidates[0] || "");
+                startSnapshotLoop();
+              }}
+              style={styles.webview}
+            />
+          ) : (
+            <Image
+              source={{ uri: snapshotURI }}
+              resizeMode="contain"
+              style={styles.image}
+              onError={() => setStatus("Erro no snapshot — verifique /capture ou /snapshot")}
+            />
+          )
+        ) : (
+          <View style={styles.placeholder}>
+            <Text style={{ color: PALETTE.text, opacity: 0.7, textAlign: "center" }}>
+              Informe o IP e toque em “Testar”. A tela tenta automaticamente
+              <Text> :81/stream → /stream → /capture.</Text>
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {isRunning ? (
+        <View style={styles.footerRow}>
+          <Pressable
+            style={[styles.smallBtn, mode === "mjpeg" ? styles.smallBtnActive : null]}
+            onPress={() => { setMode("mjpeg"); setStatus("Tentando MJPEG /stream..."); }}
+          >
+            <Text style={styles.smallBtnText}>Usar MJPEG</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.smallBtn, mode === "snapshot" ? styles.smallBtnActive : null]}
+            onPress={() => { setMode("snapshot"); setStatus("Usando Snapshot (/capture)"); }}
+          >
+            <Text style={styles.smallBtnText}>Usar Snapshot</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 12 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  label: { color: PALETTE.text },
+  input: {
+    flex: 1, backgroundColor: PALETTE.card, color: PALETTE.text,
+    borderWidth: 1, borderColor: PALETTE.border, borderRadius: 10,
+    paddingHorizontal: 10, paddingVertical: 8,
+  },
+  button: { backgroundColor: PALETTE.accent, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10 },
+  buttonText: { color: "#fff", fontWeight: "700" },
+  status: { color: PALETTE.text, opacity: 0.9 },
+  viewer: {
+    flex: 1, backgroundColor: "#000", borderRadius: 12, overflow: "hidden",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  webview: { flex: 1, backgroundColor: "#000" },
+  image: { width: "100%", height: "100%" },
+  placeholder: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
+  footerRow: { flexDirection: "row", gap: 10, justifyContent: "center" },
+  smallBtn: {
+    paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, borderWidth: 1,
+    borderColor: PALETTE.border, backgroundColor: PALETTE.card,
+  },
+  smallBtnActive: { borderColor: PALETTE.accent },
+  smallBtnText: { color: PALETTE.text, fontWeight: "600" },
+});
+
+
+
+Dicas rápidas
+
+
+
+
+No navegador, confirme qual rota seu firmware expõe (geralmente http://IP:81/stream e http://IP/capture).
+
+
+No Android, se ainda bloquear HTTP, ative usesCleartextTraffic="true" no Manifest (Expo Dev costuma permitir).
+
+
+Se o stream abrir no navegador mas no app cair para snapshot, deixe em “Usar Snapshot” — é mais tolerante quando o firmware está reiniciando.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Valeu pelo print — o erro vem desta linha dentro do stream_handler:
 
 
