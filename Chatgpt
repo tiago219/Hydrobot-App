@@ -1,4 +1,350 @@
 
+Valeu pelo print — os erros são de TypeScript/typings e 2 coisinhas do código:
+
+
+
+
+o projeto não tem (ou o VS Code não detectou) os types corretos;
+
+
+usei NodeJS.Timer e handlers sem tipo, o que ativa os avisos (noImplicitAny).
+
+
+
+
+Segue o conserto rápido + código atualizado.
+
+
+
+1) Ajustes de dependências
+
+
+No diretório do projeto:
+
+
+# WebView (se ainda não instalou)
+npx expo install react-native-webview
+
+# Tipos do TypeScript para React/React Native
+npm i -D typescript @types/react @types/react-native
+
+
+
+
+
+Observação: o React Native já traz tipos, mas alguns ambientes pedem @types/react-native para o TS Server do VS Code parar de reclamar.
+
+
+
+
+Reinicie o TS server do VS Code (Ctrl+Shift+P → TypeScript: Restart TS server) ou feche e reabra o VS Code.
+
+
+
+2) Confirme o tsconfig.json
+
+
+Deve existir (o template TS já cria). Se não tiver, crie assim na raiz:
+
+
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["ES2017", "DOM"],
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "moduleResolution": "bundler",
+    "allowJs": false,
+    "isolatedModules": true,
+    "types": ["react", "react-native", "expo/metro-runtime"],
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}
+
+
+
+
+3) Código da tela corrigido (sem NodeJS.Timer e com tipos nos handlers)
+
+
+Substitua o seu CameraScreen.tsx por este:
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  Image,
+  AppState,
+  AppStateStatus,
+  Platform,
+  NativeSyntheticEvent,
+  ImageErrorEventData,
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#0b0b0f",
+  card: "#121218",
+  border: "#25273a",
+  accent: "#e6403a",
+  text: "#e5e7eb",
+  sub: "#9ca3af",
+};
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [connected, setConnected] = useState<string>("—");
+  const [lastErr, setLastErr] = useState<string>("");
+
+  // ---- SNAPSHOT LOOP ----
+  const [snapUri, setSnapUri] = useState<string>("");
+  // Em RN, setInterval retorna number; evite NodeJS.Timer p/ não exigir @types/node
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  const baseUrl = useMemo(() => `http://${ip}`, [ip]);
+  const statusUrl = useMemo(() => `${baseUrl}/status`, [baseUrl]);
+  const snapshotUrl = useMemo(() => `${baseUrl}/snapshot`, [baseUrl]);
+  const streamUrl = useMemo(() => `${baseUrl}/stream`, [baseUrl]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  const startSnapshotLoop = useCallback(() => {
+    clearTimer();
+    // ~8fps; ajuste se quiser aliviar rede/CPU
+    timerRef.current = setInterval(() => {
+      setSnapUri(`${snapshotUrl}?ts=${Date.now()}`);
+    }, 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active") {
+        if (mode === "snapshot") startSnapshotLoop();
+      }
+      if (next.match(/inactive|background/)) {
+        clearTimer();
+      }
+      appState.current = next;
+    });
+    return () => {
+      sub.remove();
+      clearTimer();
+    };
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  useEffect(() => {
+    setLastErr("");
+    if (mode === "snapshot") startSnapshotLoop();
+    else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshotLoop, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const res = await fetch(statusUrl, { method: "GET" });
+      const txt = await res.text();
+      setConnected(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (error) {
+      const e = error as Error;
+      setConnected("Falhou");
+      setLastErr(e?.message ?? String(error));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => {
+    if (ip) checkStatus();
+  }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => {
+    setLastErr(`WebView: ${e.nativeEvent.description}`);
+  }, []);
+
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => {
+    setLastErr(`HTTP ${e.nativeEvent.statusCode}`);
+  }, []);
+
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => {
+    setLastErr(`Snapshot: ${e.nativeEvent.error}`);
+  }, []);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>ESP32-CAM Viewer</Text>
+
+      <View style={styles.row}>
+        <Text style={styles.label}>ESP IP</Text>
+        <TextInput
+          style={styles.input}
+          value={ip}
+          onChangeText={setIp}
+          placeholder="ex.: 192.168.3.3"
+          placeholderTextColor={PALETTE.sub}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+        />
+        <Pressable style={styles.btn} onPress={checkStatus}>
+          <Text style={styles.btnTxt}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.row, { marginTop: 8 }]}>
+        <ModeButton text="MJPEG (/stream)" active={mode === "mjpeg"} onPress={() => setMode("mjpeg")} />
+        <ModeButton text="Snapshot (/snapshot)" active={mode === "snapshot"} onPress={() => setMode("snapshot")} />
+      </View>
+
+      <View style={styles.card}>
+        {mode === "mjpeg" ? (
+          <WebView
+            source={{ uri: streamUrl }}
+            style={styles.video}
+            allowUniversalAccessFromFileURLs
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={styles.video}
+            resizeMode="contain"
+            onError={onImgError}
+          />
+        )}
+      </View>
+
+      <View style={{ gap: 4 }}>
+        <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{connected}</Text></Text>
+        <Text style={styles.meta}>Stream URL: <Text style={{ color: PALETTE.sub }}>{streamUrl}</Text></Text>
+        <Text style={styles.meta}>Snapshot URL: <Text style={{ color: PALETTE.sub }}>{snapshotUrl}</Text></Text>
+        {!!lastErr && <Text style={[styles.meta, { color: "#fca5a5" }]}>Erro: {lastErr}</Text>}
+      </View>
+    </View>
+  );
+}
+
+function ModeButton({
+  text, active, onPress,
+}: { text: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={[
+        styles.modeBtn,
+        { backgroundColor: active ? PALETTE.accent : "transparent", borderColor: PALETTE.border },
+      ]}
+    >
+      <Text style={{ color: active ? "white" : PALETTE.text, fontWeight: "700" }}>{text}</Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 12 },
+  title: { color: PALETTE.text, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  label: { color: PALETTE.text, width: 60, fontWeight: "600" },
+  input: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: PALETTE.text,
+  },
+  btn: {
+    backgroundColor: PALETTE.accent,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  btnTxt: { color: "white", fontWeight: "700" },
+  modeBtn: {
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+  },
+  card: {
+    flex: 1,
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  video: { width: "100%", height: "100%" },
+  meta: { color: PALETTE.text, fontSize: 12 },
+});
+
+
+
+
+4) Se ainda aparecer “Cannot find module 'react-native'…”
+
+
+
+
+Confirme que você abriu a pasta do projeto (onde está package.json) no VS Code.
+
+
+Rode uma vez:
+
+npx expo start -c
+
+
+
+
+
+Depois, Restart TS server no VS Code.
+
+
+
+
+
+Se der outro erro, me manda o novo print/linha que eu ajusto na hora.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito. Abaixo vai uma tela simples e direta para o Expo Go que puxa as imagens da sua ESP32-CAM usando o seu firmware (endpoints /stream e /snapshot).
 
 Ela tem dois modos: MJPEG (via WebView) e Snapshot (polling). O Snapshot é o “plano B” caso o stream não renderize no seu aparelho.
