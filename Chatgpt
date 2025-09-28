@@ -1,3 +1,334 @@
+
+Entendi o objetivo: encher o máximo da tela sem cortar nada.
+
+Isso só é possível com contain + tela realmente full-screen (sem header, sem tab bar, sem status bar) e controles como overlay (não ocupam altura do viewer).
+
+
+Abaixo vai o código completo da tela e 1 ajuste no App.tsx.
+
+
+
+1) App.tsx — esconda o header da Câmera
+
+
+<Tab.Screen
+  name="Camera"
+  component={CameraScreen}
+  options={{ title: "Câmera", tabBarLabel: "Câmera", headerShown: false }} // << importante
+/>
+
+
+
+
+2) src/screens/CameraScreen.tsx — full-screen, “contain”, controles em overlay
+
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image,
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { StatusBar } from "expo-status-bar";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function CameraScreen() {
+  const navigation = useNavigation<any>();
+
+  const [ip, setIp] = useState<string>("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [statusText, setStatusText] = useState<string>("—");
+  const [err, setErr] = useState<string>("");
+
+  // Controles em overlay (para não consumir área do viewer)
+  const [showUi, setShowUi] = useState<boolean>(false);
+
+  // Snapshot loop
+  const [snapUri, setSnapUri] = useState<string>("");
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  // Endpoints CameraWebServer
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
+
+  // Esconder TAB BAR para liberar espaço total
+  useFocusEffect(
+    useCallback(() => {
+      const parent = navigation.getParent?.();
+      parent?.setOptions({ tabBarStyle: { display: "none" } });
+      return () => parent?.setOptions({ tabBarStyle: undefined });
+    }, [navigation])
+  );
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+  const startSnapshot = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshot, clearTimer]);
+
+  useEffect(() => {
+    setErr("");
+    if (mode === "snapshot") startSnapshot(); else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshot, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const r = await fetch(statusUrl);
+      const txt = await r.text();
+      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e) {
+      const er = e as Error;
+      setStatusText("Falhou");
+      setErr(er?.message ?? String(e));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
+  // HTML "contain" centralizado — mostra 100% sem cortar (pode sobrar faixa)
+  const mjpegHtml = useMemo(
+    () => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+      html, body {
+        margin:0; padding:0; height:100%; width:100%;
+        display:flex; align-items:center; justify-content:center;
+        background:#000;
+      }
+      img {
+        max-width:100%;
+        max-height:100%;
+        object-fit: contain;
+        background:#000;
+      }
+    </style>
+  </head>
+  <body>
+    <img src="${streamUrl}" />
+  </body>
+</html>`.trim(),
+    [streamUrl]
+  );
+
+  return (
+    <View style={styles.root}>
+      {/* StatusBar escondida para ganhar pixels */}
+      <StatusBar hidden />
+
+      {/* VIEWER ocupa 100% (nada “ao redor” consumindo espaço) */}
+      <View style={styles.viewer}>
+        {mode === "mjpeg" ? (
+          <WebView
+            originWhitelist={['*']}
+            source={{ html: mjpegHtml }}
+            style={StyleSheet.absoluteFill}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={StyleSheet.absoluteFill}
+            resizeMode="contain"   // mantém proporção sem cortar
+            onError={onImgError}
+          />
+        )}
+      </View>
+
+      {/* Botão flutuante para mostrar/ocultar os controles (não consome layout) */}
+      <Pressable style={styles.fab} onPress={() => setShowUi(v => !v)}>
+        <Text style={styles.fabTxt}>{showUi ? "×" : "≡"}</Text>
+      </Pressable>
+
+      {/* Overlay de controles — por cima do vídeo (não tira tamanho do viewer) */}
+      {showUi && (
+        <View style={styles.overlay}>
+          <View style={styles.row}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>ESP IP</Text>
+              <TextInput
+                style={styles.input}
+                value={ip}
+                onChangeText={setIp}
+                placeholder="ex.: 192.168.3.3"
+                placeholderTextColor={PALETTE.sub}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+              />
+            </View>
+            <Pressable style={styles.btn} onPress={checkStatus}>
+              <Text style={styles.btnTxt}>Testar</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.btn, styles.btnGhost]}
+              onPress={() => setMode(mode === "mjpeg" ? "snapshot" : "mjpeg")}
+            >
+              <Text style={styles.btnTxt}>{mode === "mjpeg" ? "MJPEG" : "Snapshot"}</Text>
+            </Pressable>
+          </View>
+
+          <View style={{ marginTop: 8 }}>
+            <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{statusText}</Text></Text>
+            {!!err && <Text style={[styles.meta, { color: "#ff8b8b" }]} numberOfLines={2}>Erro: {err}</Text>}
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: PALETTE.bg },
+  viewer: { flex: 1, backgroundColor: "#000" }, // área do vídeo: 100% da tela
+
+  // Overlay (não reduz o viewer)
+  overlay: {
+    position: "absolute",
+    left: 12, right: 12, bottom: 12,
+    backgroundColor: "#000000b0",
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1, borderColor: "#00000055",
+  },
+  row: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+
+  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
+  input: {
+    backgroundColor: PALETTE.card,
+    borderWidth: 1, borderColor: PALETTE.border,
+    borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 9,
+    color: PALETTE.white,
+  },
+  btn: {
+    backgroundColor: PALETTE.red,
+    paddingHorizontal: 14, paddingVertical: 11,
+    borderRadius: 12,
+  },
+  btnGhost: { backgroundColor: "#00000055", borderWidth: 1, borderColor: "#00000080" },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+  meta: { color: PALETTE.sub, fontSize: 12 },
+
+  // FAB para abrir/fechar overlay
+  fab: {
+    position: "absolute",
+    top: 12,
+    right: 12,
+    backgroundColor: "#00000088",
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1, borderColor: "#00000055",
+  },
+  fabTxt: { color: "#fff", fontSize: 16, fontWeight: "700" },
+});
+
+
+
+Por que agora preenche o “máximo possível” sem corte?
+
+
+
+
+O viewer ocupa 100% da tela (header, tab bar e status bar escondidos).
+
+
+O vídeo/imagem usam contain (sem corte).
+
+
+Os controles ficam em overlay, então não roubam altura do viewer.
+
+
+
+
+Se quiser, coloco um botão no overlay para alternar Ajustar (contain) ↔ Preencher (cover) durante o uso.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View, Text, TextInput, Pressable, StyleSheet, Image,
