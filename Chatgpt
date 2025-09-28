@@ -1,3 +1,166 @@
+Esse erro do console (“Must specify "expo-platform" header or "platform" query parameter”) aparece quando o bundler recebe uma requisição sem dizer qual plataforma (android/ios/web). Normalmente acontece quando você abre o endereço do bundler direto no navegador (ex.: http://192.168.x.x:8081) ou iniciou o Expo sem escolher a plataforma.
+
+
+Faça assim, passo a passo, sem precisar de SDK/Android Studio (usando Expo Go no celular):
+
+
+
+
+
+
+Feche o processo atual do Expo (Ctrl+C).
+
+
+
+
+
+
+Limpe cache e reinicie já escolhendo Android:
+
+
+
+
+
+
+npx expo start -c
+
+
+
+
+
+Quando aparecer o menu, aperte s para mostrar o QR code (ou ele já aparece).
+
+
+Abra o app “Expo Go” no celular e escaneie o QR.
+
+
+
+Não abra a URL do bundler no navegador; sempre pelo Expo Go.
+
+
+
+
+
+
+
+
+
+
+Se o QR não conecta por LAN, rode com túnel:
+
+
+
+
+npx expo start --tunnel -c
+
+
+
+Escaneie o novo QR no Expo Go.
+
+
+
+
+Alternativas (se quiser abrir direto):
+
+
+
+
+
+
+Pressione a no terminal para abrir em Android (se tiver emulador/SDK).
+
+
+Ou use:
+
+
+
+
+npx expo start --android
+
+
+
+(precisa de SDK; se você não tem, fique com o Expo Go + QR/tunnel).
+
+
+
+
+Se o erro continuar aparecendo:
+
+
+
+
+
+
+Apague caches e a pasta interna do Expo:
+
+
+
+
+rm -rf .expo node_modules
+npm install
+npx expo start -c
+
+
+
+
+
+Atualize o CLI local do projeto:
+
+
+
+
+npm i -D expo@latest
+
+
+
+
+
+Dicas rápidas
+
+
+
+
+
+
+Não acesse http://localhost:8081/19000 no navegador: isso dispara a mensagem do “expo-platform”.
+
+
+Garanta que o celular e o PC estão na mesma rede (se não, use --tunnel).
+
+
+No Android 9+, para carregar HTTP da câmera, seu app já está usando WebView com mixedContentMode="always". Se estiver em build standalone mais tarde, lembre de permitir cleartext no Manifest.
+
+
+
+
+Seguindo os passos acima (Expo Go + QR ou --tunnel), o bundler recebe automaticamente o header expo-platform: android e o app abre normalmente.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 Beleza — vou adaptar a CameraScreen para funcionar com o “teste do ESP32” clássico (o exemplo da ESP32-CAM que faz http://IP:81/stream e o snapshot em /capture).
 
