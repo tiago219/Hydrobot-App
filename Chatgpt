@@ -74,6 +74,242 @@ export default function CameraScreen() {
   const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
   const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
 
+  // HTML que mantém proporção certinha (contain)
+  const mjpegHtml = useMemo(
+    () => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <style>
+      html, body {
+        margin:0; padding:0; height:100%; width:100%;
+        display:flex; align-items:center; justify-content:center;
+        background:#000;
+      }
+      img {
+        max-width:100%;
+        max-height:100%;
+        object-fit: contain; /* <<< mantém proporção */
+        background:#000;
+      }
+    </style>
+  </head>
+  <body>
+    <img src="${streamUrl}" />
+  </body>
+</html>`.trim(),
+    [streamUrl]
+  );
+
+  return (
+    <View style={styles.root}>
+      {/* Barra de controles */}
+      <View style={styles.controls}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.label}>ESP IP</Text>
+          <TextInput
+            style={styles.input}
+            value={ip}
+            onChangeText={setIp}
+            placeholder="ex.: 192.168.3.3"
+            placeholderTextColor={PALETTE.sub}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+          />
+        </View>
+        <Pressable style={styles.btn} onPress={checkStatus}>
+          <Text style={styles.btnTxt}>Testar</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.btn, styles.btnGhost]}
+          onPress={() => setMode(mode === "mjpeg" ? "snapshot" : "mjpeg")}
+        >
+          <Text style={styles.btnTxt}>{mode === "mjpeg" ? "MJPEG" : "Snapshot"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Viewer */}
+      <View style={styles.viewer}>
+        {mode === "mjpeg" ? (
+          <WebView
+            originWhitelist={['*']}
+            source={{ html: mjpegHtml }}
+            style={StyleSheet.absoluteFill}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={StyleSheet.absoluteFill}
+            resizeMode="contain"   // <<< mantém proporção
+            onError={onImgError}
+          />
+        )}
+      </View>
+
+      {/* Status */}
+      <View style={styles.status}>
+        <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{statusText}</Text></Text>
+        {!!err && <Text style={[styles.meta, { color: "#ff8b8b" }]} numberOfLines={2}>Erro: {err}</Text>}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: PALETTE.bg },
+  controls: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 8,
+    backgroundColor: PALETTE.bg,
+  },
+  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
+  input: {
+    backgroundColor: PALETTE.card,
+    borderWidth: 1, borderColor: PALETTE.border,
+    borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 9,
+    color: PALETTE.white,
+  },
+  btn: {
+    backgroundColor: PALETTE.red,
+    paddingHorizontal: 14, paddingVertical: 11,
+    borderRadius: 12,
+  },
+  btnGhost: { backgroundColor: "#00000055", borderWidth: 1, borderColor: "#00000080" },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+
+  viewer: {
+    flex: 1,
+    backgroundColor: "#000",
+  },
+
+  status: { paddingHorizontal: 12, paddingVertical: 6 },
+  meta: { color: PALETTE.sub, fontSize: 12 },
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image,
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [statusText, setStatusText] = useState<string>("—");
+  const [err, setErr] = useState<string>("");
+
+  const [snapUri, setSnapUri] = useState<string>("");
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+  const startSnapshot = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshot, clearTimer]);
+
+  useEffect(() => {
+    setErr("");
+    if (mode === "snapshot") startSnapshot(); else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshot, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const r = await fetch(statusUrl);
+      const txt = await r.text();
+      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e) {
+      const er = e as Error;
+      setStatusText("Falhou");
+      setErr(er?.message ?? String(e));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
   // HTML que força o stream a ocupar 100% (sem bordas pretas)
   const mjpegHtml = useMemo(
     () => `
