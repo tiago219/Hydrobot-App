@@ -1,4 +1,211 @@
 
+Isso é erro de resolução de módulo: o Metro não está achando ./src/screens/HomeScreen (e os demais). Corrige com estes passos—na ordem:
+
+
+1) Verifique o caminho e o nome (case-sensitive)
+
+
+O import no App.tsx é:
+
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+
+
+
+Então os arquivos precisam existir exatamente com estes paths e nomes:
+
+
+<raiz-do-projeto>/
+  App.tsx
+  src/
+    screens/
+      HomeScreen.tsx
+      CameraScreen.tsx
+
+
+
+⚠️ O Metro é case-sensitive, mesmo no Windows. Se sua pasta estiver Screens, screen, homescreen.tsx, etc., vai falhar. Renomeie para screens e HomeScreen.tsx / CameraScreen.tsx.
+
+
+2) Garanta a extensão e o export
+
+
+
+
+Extensão deve ser .tsx (não .ts / .js).
+
+
+Cada arquivo deve ter export default.
+
+
+
+
+Conteúdo mínimo—cole exatamente:
+
+
+src/screens/HomeScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet } from "react-native";
+
+export default function HomeScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>Home Screen</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" },
+  text: { color: "#fff", fontSize: 20 },
+});
+
+
+
+src/screens/CameraScreen.tsx
+
+
+import React from "react";
+import { View, Text, StyleSheet } from "react-native";
+
+export default function CameraScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>Camera Screen</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" },
+  text: { color: "#fff", fontSize: 20 },
+});
+
+
+
+3) Confirme que você abriu a pasta raiz no VS Code
+
+
+A raiz é a que contém App.tsx e package.json. O print mostra D:\\HydroBotApp\\AppHydroBot\\App.tsx. Abra AppHydroBot no VS Code (File → Open Folder).
+
+
+4) Limpe o cache do bundler
+
+
+No terminal na raiz do projeto:
+
+
+npx expo start -c
+
+
+
+5) Se ainda der o mesmo erro
+
+
+
+
+Confira no Explorer se não ficou HomeScreen.tsx.txt (Windows às vezes oculta extensão).
+
+
+Verifique se não há um arquivo com mesmo nome mas extensão diferente (ex.: HomeScreen.js conflitando).
+
+
+No App.tsx, confira se os imports são relativos (começam com ./) e não têm espaços estranhos.
+
+
+
+
+App.tsx (igual ao que te mandei, mas sem mudanças de path)
+
+
+import React from "react";
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+
+export type TabParamList = { Home: undefined; Camera: undefined };
+const Tab = createBottomTabNavigator<TabParamList>();
+
+const PALETTE = { bg: "#000000", card: "#0d0d0d", border: "#1a1a1a", red: "#E53B2F", white: "#FFFFFF" };
+
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: { ...DefaultTheme.colors, background: PALETTE.bg, primary: PALETTE.red, card: PALETTE.card, text: PALETTE.white, border: PALETTE.border, notification: PALETTE.red },
+};
+
+export default function App() {
+  return (
+    <NavigationContainer theme={DarkThemeHB}>
+      <Tab.Navigator
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: PALETTE.card },
+          headerTintColor: PALETTE.white,
+          tabBarStyle: { backgroundColor: PALETTE.bg, borderTopColor: PALETTE.border },
+          tabBarActiveTintColor: PALETTE.red,
+          tabBarInactiveTintColor: "#9c9c9c",
+          tabBarIcon: ({ color, size }) => {
+            const iconMap = { Home: "home", Camera: "videocam" } as const;
+            return <Ionicons name={iconMap[route.name as keyof typeof iconMap]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={{ title: "Início", tabBarLabel: "Início" }} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={{ title: "Câmera", tabBarLabel: "Câmera" }} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+Se, depois disso, ainda acusar o mesmo caminho, me diga exatamente como está o nome das pastas/arquivos (com maiúsculas/minúsculas) que eu ajusto o import na hora.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 show! vamos reduzir ao essencial: apenas Home e Camera, mantendo o design preto + acento vermelho do app antigo. Home é a tela inicial.
 
 
