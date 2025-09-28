@@ -1,3 +1,156 @@
+Aqui vai um App.tsx já alinhado com o visual (usando os tokens de tema) e mantendo sua navegação com bottom tabs, ícones do Ionicons e suporte a idiomas via LanguageProvider.
+
+
+
+
+Se ainda não tem as deps de navegação:
+
+
+npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context
+npx expo install @expo/vector-icons
+
+
+
+
+
+// App.tsx
+import React from "react";
+import { LogBox } from "react-native";
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+import DashboardScreen from "./src/screens/DashboardScreen";
+import SettingsScreen from "./src/screens/SettingsScreen";
+
+import { LanguageProvider, useLanguage } from "./src/context/LanguageContext";
+import { tokens as t } from "./src/theme/tokens";
+
+LogBox.ignoreLogs(["useInsertionEffect must not schedule updates"]);
+
+export type TabParamList = {
+  Home: undefined;
+  Camera: undefined;
+  Dashboard: undefined;
+  Settings: undefined;
+};
+
+const Tab = createBottomTabNavigator<TabParamList>();
+
+// Tema escuro baseado nos tokens
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: t.color.bg,
+    primary: t.color.accent,
+    card: t.color.card,
+    text: t.color.text,
+    border: t.color.border,
+    notification: t.color.accent,
+  },
+};
+
+// Labels por idioma (simples)
+const labels = {
+  pt: { home: "Início", camera: "Câmera", dashboard: "Dashboard", settings: "Ajustes" },
+  en: { home: "Home", camera: "Camera", dashboard: "Dashboard", settings: "Settings" },
+  es: { home: "Inicio", camera: "Cámara", dashboard: "Panel", settings: "Ajustes" },
+} as const;
+
+function AppNavigator() {
+  const { lang } = useLanguage();
+  const L = labels[lang as keyof typeof labels] ?? labels.en;
+
+  return (
+    <NavigationContainer theme={DarkThemeHB}>
+      {/* key={lang} força os rótulos a atualizarem quando o idioma muda */}
+      <Tab.Navigator
+        key={lang}
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: t.color.card },
+          headerTintColor: t.color.text,
+          tabBarStyle: { backgroundColor: t.color.bg, borderTopColor: t.color.border },
+          tabBarActiveTintColor: t.color.accent,
+          tabBarInactiveTintColor: t.color.sub,
+          tabBarIcon: ({ color, size }) => {
+            const icons: Record<keyof TabParamList, keyof typeof Ionicons.glyphMap> = {
+              Home: "home",
+              Camera: "videocam",
+              Dashboard: "pulse",
+              Settings: "settings",
+            };
+            return <Ionicons name={icons[route.name as keyof TabParamList]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={() => ({ title: L.home, tabBarLabel: L.home })} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={() => ({ title: L.camera, tabBarLabel: L.camera })} />
+        <Tab.Screen name="Dashboard" component={DashboardScreen} options={() => ({ title: L.dashboard, tabBarLabel: L.dashboard })} />
+        <Tab.Screen name="Settings" component={SettingsScreen} options={() => ({ title: L.settings, tabBarLabel: L.settings })} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+export default function App() {
+  return (
+    <LanguageProvider>
+      <AppNavigator />
+    </LanguageProvider>
+  );
+}
+
+
+
+Se quiser que eu deixe os ícones, paddings e bordas idênticos ao app antigo, me manda os estilos/prints e eu ajusto os tokens (cores, radius, sombras, tipografia) para espelhar 1:1.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 import React from "react";
 import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
