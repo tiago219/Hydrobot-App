@@ -1,234 +1,3 @@
-
-Perfeito. Vamos gerar um APK na nuvem com EAS Build (sem Android SDK no seu PC) já com usesCleartextTraffic=true, que permite acessar http://192.168.x.x direto do app.
-
-
-Passo a passo (sem SDK)
-
-
-1) Pré-requisitos
-
-
-
-
-Ter uma conta gratuita no Expo: https://expo.dev (faça login no navegador).
-
-
-Node.js instalado no seu PC.
-
-
-
-
-2) Instalar CLIs (sem Android Studio)
-
-
-npm i -g eas-cli
-# opcional: login pelo terminal
-eas login
-
-
-
-3) Configurar o app.json (ou app.config.ts)
-
-
-Abra o arquivo na raiz do projeto e garanta algo assim:
-
-
-{
-  "expo": {
-    "name": "HydroBotApp",
-    "slug": "hydrobot-app",
-    "scheme": "hydrobotapp",
-    "version": "1.0.0",
-    "orientation": "portrait",
-    "jsEngine": "hermes",
-    "platforms": ["android"],
-    "android": {
-      "package": "com.seuusuario.hydrobotapp",
-      "permissions": [],
-      "usesCleartextTraffic": true
-    },
-    "updates": { "fallbackToCacheTimeout": 0 }
-  }
-}
-
-
-
-
-
-O ponto crucial é "usesCleartextTraffic": true dentro de android.
-
-
-
-
-4) (Opcional mas recomendado) Usar Dev Client para desenvolvimento
-
-
-Se você quer continuar rodando seu JS pelo Metro (hot reload), instale o Dev Client:
-
-
-npm i expo-dev-client
-
-
-
-5) Configurar EAS
-
-
-Na primeira vez:
-
-
-eas build:configure
-# escolha Android, Managed workflow
-
-
-
-Crie um eas.json com dois perfis (dev e prod):
-
-
-{
-  "cli": { "version": ">= 3.0.0" },
-  "build": {
-    "development": {
-      "developmentClient": true,
-      "distribution": "internal",
-      "android": { "buildType": "apk" }
-    },
-    "production": {
-      "android": { "buildType": "apk" }
-    }
-  }
-}
-
-
-
-
-
-development → gera um Dev Client APK (ótimo pra testar seu código JS + hot reload).
-
-
-production → gera um APK “standalone” (leva o bundle JS junto).
-
-
-
-
-6) Fazer o build na nuvem (sem SDK local)
-
-
-Opção A — Dev Client (recomendada para testar a câmera)
-
-
-eas build -p android --profile development
-
-
-
-Ao terminar, o EAS vai mostrar um link para baixar o APK. Instale no seu celular (habilite “Fontes desconhecidas”).
-
-
-Depois, rode o seu projeto local:
-
-
-npx expo start --dev-client
-
-
-
-Abra o app instalado (HydroBotApp Dev Client) e conecte ao seu Metro (QR code/URL).
-
-
-Opção B — Production APK (não precisa Metro depois)
-
-
-eas build -p android --profile production
-
-
-
-Baixe e instale o APK. Ele já vem com o JS embutido.
-
-
-
-
-Importante: Em ambos os casos, o Manifest do APK terá usesCleartextTraffic=true, então seu app poderá acessar http://192.168.3.3 direto.
-
-
-
-
-7) Testar a tela da câmera
-
-
-
-
-Abra sua CameraScreen.tsx (a que te passei com autodetector).
-
-
-No campo IP, digite 192.168.3.3 e toque Testar.
-
-
-Se seu firmware usa porta 81 para /stream, a tela vai detectar http://192.168.3.3:81/stream.
-
-Se falhar, ela cai para capture/jpg/snapshot.
-
-
-
-
-8) Checklist rápido se ainda não aparecer
-
-
-
-
-Celular e ESP32-CAM na mesma rede Wi-Fi.
-
-
-Use IP direto (ex.: 192.168.3.3), não mDNS.
-
-
-Firmware rodando startCameraServer() e abrindo no navegador (como você já confirmou).
-
-
-Se a imagem “congela”, reduza resolução/qualidade no ESP (ex.: QVGA e jpeg_quality 12–16) e mantenha fb_count = 2 com PSRAM.
-
-
-
-
-
-Se preferir, posso te mandar um app.json e eas.json prontos com seu package e slug já preenchidos; é só colar e rodar os comandos do passo 6.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // src/screens/CameraScreen.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -549,402 +318,313 @@ const styles = StyleSheet.create({
 
 
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HydroBot Server (ESTÁVEL) – Lê /stream (MJPEG) do ESP32-CAM, guarda o último frame,
+serve /frame.jpg e calcula score simples de fogo (HSV + EMA).
 
+Rodar:
+  uvicorn server_heuristic:app --host 0.0.0.0 --port 8000
+Deps:
+  pip install fastapi uvicorn requests opencv-python numpy pydantic
+"""
 
-Perfeito — abaixo está a CameraScreen.tsx já adaptada para funcionar com o firmware padrão do ESP32-CAM (que expõe /jpg ou /stream no exemplo oficial, e alguns forks usam /snapshot ou /capture).
+import time
+import threading
+from typing import Optional, Dict, Any
+import re
 
-O componente tenta automaticamente /snapshot → /jpg → /capture até encontrar um que responda, e mantém polling leve com troca suave de frames (crossfade). É 100% compatível com Expo Go, sem precisar de WebView.
+import requests
+import cv2
+import numpy as np
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+# ========= CONFIG =========
+CAMERA_IP = "hydrobot.local"
+STREAM_URL_FMT = "http://{}/stream"
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 10.0
+MAX_FRAME_AGE_MS = 10_000
+MAX_RESULT_AGE_MS = 800
+JPEG_QUALITY = 85
 
+# Fire (HSV simples)
+HSV_LOW = (8, 70, 120)
+HSV_HIGH = (40, 255, 255)
+EMA_ALPHA = 0.3
+FIRE_THRESHOLD = 0.15
 
+BOUNDARY_RE = re.compile(br'--[^\r\n]+')
+REQ_HEADERS = {"Connection": "keep-alive", "User-Agent": "HydroBot-Grabber/3.0"}
 
-Basta substituir o arquivo HydroBotApp2/src/screens/CameraScreen.tsx pelo código completo a seguir.
+# ========= FASTAPI =========
+app = FastAPI(title="HydroBot Server (Stable)", version="4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
+class ConfigIn(BaseModel):
+  camera_ip: str
 
+def placeholder_jpeg(msg: str = "NO FRAME") -> bytes:
+  img = np.zeros((240, 320, 3), dtype=np.uint8)
+  img[:, :] = (50, 50, 150)
+  cv2.putText(img, msg, (38, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+  cv2.putText(img, time.strftime("%H:%M:%S"), (38, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+  ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+  return buf.tobytes()
 
+# ========= MJPEG Stream Grabber =========
+class StreamGrabber:
+  def __init__(self, ip: str):
+    self.ip = ip
+    self._stop = threading.Event()
+    self._lock = threading.Lock()
+    self._last_jpeg: Optional[bytes] = None
+    self._last_ts = 0
+    self._fps_in = 0.0
+    self._frames = 0
+    self._tick = time.time()
+    self._last_err: Optional[str] = None
 
-// HydroBotApp2/src/screens/CameraScreen.tsx
-// Expo Go friendly — snapshot polling com auto-fallback de endpoint (/snapshot → /jpg → /capture)
+  def start(self):
+    self._stop.clear()
+    t = threading.Thread(target=self._run, daemon=True)
+    t.start()
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState,
-} from "react-native";
-import { useLanguage } from "../context/LanguageContext";
+  def stop(self):
+    self._stop.set()
 
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
+  def _run(self):
+    while not self._stop.is_set():
+      url = STREAM_URL_FMT.format(self.ip)
+      buf = b""
+      try:
+        with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), headers=REQ_HEADERS) as r:
+          r.raise_for_status()
+          for chunk in r.iter_content(chunk_size=4096):
+            if self._stop.is_set():
+              break
+            if not chunk:
+              continue
+            buf += chunk
 
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (snapshot)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Pronto",
-    statusResolving: "Detectando endpoint…",
-    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
-    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi.",
-    endpoint: (p:string)=>`Endpoint: ${p}`,
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (snapshot)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    start: "Start",
-    stop: "Stop",
-    statusIdle: "Ready",
-    statusResolving: "Detecting endpoint…",
-    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
-    statusErr: "Failed to load image. Check IP & Wi-Fi.",
-    endpoint: (p:string)=>`Endpoint: ${p}`,
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (snapshot)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Listo",
-    statusResolving: "Detectando endpoint…",
-    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
-    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi.",
-    endpoint: (p:string)=>`Endpoint: ${p}`,
-  },
-};
+            # procurar boundaries e extrair o penúltimo part (frame completo)
+            m = BOUNDARY_RE.search(buf)
+            if not m:
+              if len(buf) > 2_000_000:
+                buf = buf[-200_000:]
+              continue
 
-const DEFAULT_HOST = "192.168.0.50"; // use o IP numérico do seu ESP
-const CANDIDATE_PATHS = ["/snapshot", "/jpg", "/capture"]; // tentativas em ordem
-const appLogo = require("../../assets/logo.png");
+            parts = BOUNDARY_RE.split(buf)
+            if len(parts) >= 2:
+              frame_blob = parts[-2]
+              buf = parts[-1]
 
-/* ---------- Header ---------- */
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
+              header_end = frame_blob.find(b"\r\n\r\n")
+              if header_end == -1:
+                continue
+              body = frame_blob[header_end+4:]
 
-/* ---------- Crossfade de imagens ---------- */
-function CrossfadeImage({
-  currentUri, nextUri, onNextLoadStart, onNextShown
-}: {
-  currentUri: string; nextUri: string;
-  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
-}) {
-  const fade = useRef(new Animated.Value(0)).current;
-  const [showNext, setShowNext] = useState(false);
-  const lastRef = useRef<string>("");
+              if body.startswith(b"\xff\xd8") and body.endswith(b"\xff\xd9"):
+                with self._lock:
+                  self._last_jpeg = body
+                  self._last_ts = int(time.time()*1000)
+                  self._last_err = None
+                  self._frames += 1
+                  now = time.time()
+                  if now - self._tick >= 1.0:
+                    self._fps_in = self._frames / (now - self._tick)
+                    self._frames = 0
+                    self._tick = now
 
-  useEffect(() => {
-    if (!nextUri || nextUri === lastRef.current) return;
-    lastRef.current = nextUri;
-    setShowNext(true);
-  }, [nextUri]);
+      except Exception as e:
+        with self._lock:
+          self._last_err = str(e)
+        time.sleep(0.8)  # backoff curto e reconecta
 
-  return (
-    <View style={{ flex: 1, backgroundColor: "black" }}>
-      {!!currentUri && (
-        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
-      )}
-      {showNext && (
-        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-          <Image
-            key={nextUri}
-            source={{ uri: nextUri }}
-            style={{ flex: 1, width: "100%" }}
-            resizeMode="contain"
-            onLoadStart={onNextLoadStart}
-            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
-            onLoadEnd={() => {
-              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
-                onNextShown(true); fade.setValue(0); setShowNext(false);
-              });
-            }}
-          />
-        </Animated.View>
-      )}
-    </View>
-  );
-}
+  def get_latest(self, max_age_ms=MAX_FRAME_AGE_MS) -> Optional[bytes]:
+    with self._lock:
+      if not self._last_jpeg:
+        return None
+      if int(time.time()*1000) - self._last_ts > max_age_ms:
+        return None
+      return self._last_jpeg
 
-/* ---------- Tela principal ---------- */
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [running, setRunning] = useState(false);
-  const [hadError, setHadError] = useState(false);
-  const [intervalMs, setIntervalMs] = useState(550);
-  const [endpointPath, setEndpointPath] = useState<string | null>(null);
-  const [resolving, setResolving] = useState(false);
-
-  const [currentUri, setCurrentUri] = useState("");
-  const [nextUri, setNextUri] = useState("");
-  const loadingNext = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-
-  const pathIndexRef = useRef(0);
-  const stablePathRef = useRef<string | null>(null);
-  const consecutiveFailsRef = useRef(0);
-
-  const cleanHost = (s:string)=> s.replace(/^https?:\/\//,"").replace(/\/+$/,"");
-  const baseUrl = useMemo(()=> `http://${cleanHost(host)}`, [host]);
-
-  const makeUrl = (path:string)=> `${baseUrl}${path}?t=${Date.now()}`;
-
-  const pickNextCandidate = () => {
-    pathIndexRef.current = (pathIndexRef.current + 1) % CANDIDATE_PATHS.length;
-    const p = CANDIDATE_PATHS[pathIndexRef.current];
-    setEndpointPath(p);
-    return p;
-  };
-
-  const resolveEndpointIfNeeded = () => {
-    if (stablePathRef.current) { setEndpointPath(stablePathRef.current); return; }
-    setResolving(true);
-    // estratégia: começamos do índice atual; ao primeiro sucesso de imagem, fixamos
-    const p = CANDIDATE_PATHS[pathIndexRef.current];
-    setEndpointPath(p);
-  };
-
-  const schedule = () => {
-    if (!running) return;
-    timerRef.current = setTimeout(() => {
-      if (!loadingNext.current && endpointPath) {
-        setNextUri(makeUrl(endpointPath));
+  def status(self) -> Dict[str, Any]:
+    with self._lock:
+      age = int(time.time()*1000) - self._last_ts if self._last_ts else None
+      return {
+        "ip": self.ip,
+        "hasFrame": self._last_jpeg is not None,
+        "age_ms": age,
+        "fps_in": round(self._fps_in, 2),
+        "last_err": self._last_err
       }
-      schedule();
-    }, intervalMs);
-  };
 
-  const start = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setRunning(true);
-    setHadError(false);
-    consecutiveFailsRef.current = 0;
-    stablePathRef.current = null;
-    resolveEndpointIfNeeded();
-    if (endpointPath) setCurrentUri(makeUrl(endpointPath));
-    schedule();
-  };
+grabber = StreamGrabber(CAMERA_IP)
+grabber.start()
 
-  const stop = () => {
-    setRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
+# ========= Fire Detection =========
+def simple_fire_score(frame_bgr: np.ndarray) -> float:
+  try:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(HSV_LOW, np.uint8), np.array(HSV_HIGH, np.uint8))
+    fire_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    v_mean = float(np.mean(hsv[:, :, 2])) / 255.0
+    score = min(1.0, fire_ratio * 4.0 + v_mean * 0.1)
+    return float(score)
+  except Exception:
+    return 0.0
 
-  // pausa automática em background
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s !== "active") stop();
-    });
-    return () => sub.remove();
-  }, []);
+class FireDetector:
+  def __init__(self, src: StreamGrabber):
+    self.src = src
+    self._lock = threading.Lock()
+    self._stop = threading.Event()
+    self._thr: Optional[threading.Thread] = None
 
-  // limpa timer ao desmontar
-  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
+    self._ema = 0.0
+    self._raw = 0.0
+    self._is_fire = False
+    self._ts = 0
+    self._fps = 0.0
+    self._frames = 0
+    self._tick = time.time()
+    self._wh: Optional[tuple] = None
 
-  // se mudar host/intervalo, reinicia polling (se estiver rodando)
-  useEffect(() => {
-    if (running) { stop(); start(); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, host]);
+  def start(self):
+    self._stop.clear()
+    self._thr = threading.Thread(target=self._run, daemon=True)
+    self._thr.start()
 
-  // quando endpointPath muda (ex: fallback), atualiza frame inicial
-  useEffect(() => {
-    if (running && endpointPath) {
-      setCurrentUri(makeUrl(endpointPath));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [endpointPath]);
+  def stop(self):
+    self._stop.set()
+    if self._thr and self._thr.is_alive():
+      self._thr.join(timeout=1.0)
 
-  const onNextLoadStart = ()=>{ loadingNext.current = true; };
+  def _run(self):
+    interval = 1.0 / 5.0
+    while not self._stop.is_set():
+      t0 = time.time()
+      jpeg = self.src.get_latest()
+      if jpeg is None:
+        time.sleep(0.1)
+        continue
+      try:
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+          time.sleep(0.05)
+          continue
+        H, W = frame.shape[:2]
+        score = simple_fire_score(frame)
+        ema = score if self._ema == 0.0 else EMA_ALPHA*score + (1.0-EMA_ALPHA)*self._ema
+        is_fire = (ema >= FIRE_THRESHOLD)
+        with self._lock:
+          self._raw = score
+          self._ema = ema
+          self._is_fire = is_fire
+          self._ts = int(time.time()*1000)
+          self._wh = (W, H)
+          self._frames += 1
+          now = time.time()
+          if now - self._tick >= 1.0:
+            self._fps = self._frames / (now - self._tick)
+            self._frames = 0
+            self._tick = now
+      except Exception:
+        pass
+      dt = time.time() - t0
+      time.sleep(max(0.0, interval - dt))
 
-  const onNextShown = (ok:boolean)=>{
-    loadingNext.current = false;
-    if (ok) {
-      setHadError(false);
-      setResolving(false);
-      consecutiveFailsRef.current = 0;
-      if (!stablePathRef.current && endpointPath) {
-        // fixamos o endpoint que funcionou
-        stablePathRef.current = endpointPath;
+  def get(self) -> Dict[str, Any]:
+    with self._lock:
+      return {
+        "ok": True,
+        "isFire": bool(self._is_fire),
+        "score": round(float(self._ema), 3),
+        "score_raw": round(float(self._raw), 3),
+        "ts": int(self._ts),
+        "fps_det": round(float(self._fps), 2),
+        "frame_wh": list(self._wh) if self._wh else None
       }
-      if (nextUri) setCurrentUri(nextUri);
-    } else {
-      setHadError(true);
-      consecutiveFailsRef.current += 1;
 
-      // Se falhar algumas vezes seguidas, tenta próximo endpoint
-      if (consecutiveFailsRef.current >= 2) {
-        const next = pickNextCandidate();
-        consecutiveFailsRef.current = 0;
-        stablePathRef.current = null; // “desfixa” para poder testar
-        // força tentativa imediata no novo path
-        setCurrentUri(""); // remove frame atual para evitar “imagem congelada”
-        setNextUri(makeUrl(next));
-        setResolving(true);
-      }
-    }
-  };
+detector = FireDetector(grabber)
+detector.start()
 
-  const statusText = !running
-    ? T.statusIdle
-    : (hadError
-      ? T.statusErr
-      : (resolving ? T.statusResolving : T.statusRunning(intervalMs)));
+# ========= Endpoints =========
+@app.get("/healthz")
+def healthz():
+  s = grabber.status()
+  return {"ok": True, "camera_ip": s.get("ip"), **s}
 
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
+@app.get("/status")
+def status():
+  s = grabber.status()
+  d = detector.get()
+  return {"ok": True, "camera_ip": s.get("ip"), **s, **d}
 
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={(v)=>{ setHost(v); setEndpointPath(null); stablePathRef.current=null; }}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        {!running ? (
-          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
-            <Text style={styles.btnText}>{T.start}</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
-            <Text style={styles.btnText}>{T.stop}</Text>
-          </Pressable>
-        )}
-      </View>
+@app.post("/config")
+def set_config(cfg: ConfigIn):
+  global CAMERA_IP, grabber, detector
+  CAMERA_IP = cfg.camera_ip
+  # reinicia o grabber
+  grabber.stop()
+  grabber = StreamGrabber(CAMERA_IP)
+  grabber.start()
+  # detector continua usando o mesmo objeto? recria para limpar estado
+  detector.stop()
+  detector = FireDetector(grabber)
+  detector.start()
+  return {"ok": True, "camera_ip": CAMERA_IP}
 
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>{statusText}</Text>
-        {!!(endpointPath) && (
-          <Text style={[styles.statusText, { marginTop: 4, opacity: 0.8 }]}>
-            {T.endpoint(endpointPath)}
-          </Text>
-        )}
-      </View>
+@app.get("/snapshot")
+def snapshot():
+  b = grabber.get_latest() or placeholder_jpeg("NO FRAME")
+  headers = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "Content-Type": "image/jpeg"
+  }
+  return Response(content=b, headers=headers, media_type="image/jpeg")
 
-      {/* Controles simples de intervalo */}
-      <View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
-        <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
-        <Pressable
-          onPress={() => setIntervalMs(ms => Math.max(350, ms - 50))}
-          style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-        >
-          <Text style={styles.btnText}>-50</Text>
-        </Pressable>
-        <Pressable
-          onPress={() => setIntervalMs(ms => Math.min(1200, ms + 50))}
-          style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-        >
-          <Text style={styles.btnText}>+50</Text>
-        </Pressable>
-      </View>
+@app.get("/frame.jpg")
+def frame_jpg():
+  return snapshot()
 
-      <View style={{ flex:1 }}>
-        <CrossfadeImage
-          currentUri={currentUri}
-          nextUri={nextUri}
-          onNextLoadStart={onNextLoadStart}
-          onNextShown={onNextShown}
-        />
-      </View>
-    </View>
-  );
-}
+@app.get("/detect")
+def detect():
+  res = detector.get()
+  if res.get("ts", 0) and (int(time.time()*1000) - int(res["ts"]) <= MAX_RESULT_AGE_MS):
+    return res
+  # fallback rápido
+  jpeg = grabber.get_latest()
+  if jpeg is None:
+    return {"ok": False, "error": "no recent frame"}
+  frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+  if frame is None:
+    return {"ok": False, "error": "decode failed"}
+  score = simple_fire_score(frame)
+  is_fire = (score >= FIRE_THRESHOLD)
+  H, W = frame.shape[:2]
+  return {
+    "ok": True,
+    "isFire": bool(is_fire),
+    "score": round(float(score), 3),
+    "score_raw": round(float(score), 3),
+    "ts": int(time.time()*1000),
+    "frame_wh": [W, H],
+    "fallback": True
+  }
 
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-
-  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
-});
-
-
-
-O que mudou e por quê (rápido):
-
-
-
-
-Auto-fallback entre "/snapshot", "/jpg" e "/capture": evita “No live frame” quando o firmware usa um nome diferente.
-
-
-Fixação do endpoint após o primeiro sucesso: reduz tentativas e melhora a estabilidade.
-
-
-Reconexão leve: a cada 2 falhas seguidas, troca para o próximo endpoint.
-
-
-Cache-busting por ?t=Date.now(): impede cache do Android.
-
-
-Polling ajustável (350–1200 ms): dá espaço para placas instáveis sem afogar a rede.
-
-
-
-
-
-
-Dica: com seu firmware acima (webserver padrão), o caminho mais comum é http://<IP>/jpg. No app, basta digitar o IP numérico (sem http://) e tocar Iniciar.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+  import uvicorn
+  print("HydroBot Server (Stable) — lendo /stream")
+  print(f"Camera IP: {CAMERA_IP}")
+  uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 
@@ -1088,268 +768,3 @@ void loop() {
   // Do nothing. Everything is done in another task by the web server
   delay(10000);
 }
-
-
-
-
-
-
-
-
-
-// HydroBotApp2/src/screens/CameraScreen.tsx
-// Expo Go friendly: renderiza /snapshot por polling (sem SDK/HTTPS/WebView)
-
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  View, Text, TextInput, Pressable, StyleSheet, Image, Animated, AppState
-} from "react-native";
-
-import { useLanguage } from "../context/LanguageContext";
-
-const PALETTE = { bg:"#0b0b0f", card:"#121218", border:"#25273a", accent:"#e6403a", text:"#e5e7eb" };
-
-const textsByLang = {
-  pt: {
-    heroSubtitle: "Visualização da Câmera (snapshot)",
-    espIp: "Host/IP do ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Pronto",
-    statusRunning: (ms:number)=>`Coletando snapshots… ${ms} ms`,
-    statusErr: "Erro ao carregar imagem. Verifique IP e Wi-Fi."
-  },
-  en: {
-    heroSubtitle: "Camera Viewer (snapshot)",
-    espIp: "ESP Host/IP:",
-    placeholderIp: "192.168.0.50",
-    start: "Start",
-    stop: "Stop",
-    statusIdle: "Ready",
-    statusRunning: (ms:number)=>`Fetching snapshots… ${ms} ms`,
-    statusErr: "Failed to load image. Check IP & Wi-Fi."
-  },
-  es: {
-    heroSubtitle: "Visor de Cámara (snapshot)",
-    espIp: "Host/IP del ESP:",
-    placeholderIp: "192.168.0.50",
-    start: "Iniciar",
-    stop: "Parar",
-    statusIdle: "Listo",
-    statusRunning: (ms:number)=>`Obteniendo snapshots… ${ms} ms`,
-    statusErr: "Error al cargar imagen. Verifica IP y Wi-Fi."
-  },
-};
-
-const DEFAULT_HOST = "192.168.0.50"; // coloque o IP do seu ESP (numérico funciona melhor no Android)
-const appLogo = require("../../assets/logo.png");
-
-function AppHero({ subtitle }: { subtitle: string }) {
-  return (
-    <View style={styles.hero}>
-      <Image source={appLogo} style={styles.heroLogo} />
-      <Text style={styles.heroTitle}>HydroBot</Text>
-      <Text style={styles.heroSubtitle}>{subtitle}</Text>
-    </View>
-  );
-}
-
-function CrossfadeImage({
-  currentUri, nextUri, onNextLoadStart, onNextShown
-}: {
-  currentUri: string; nextUri: string;
-  onNextLoadStart: () => void; onNextShown: (ok: boolean) => void;
-}) {
-  const fade = useRef(new Animated.Value(0)).current;
-  const [showNext, setShowNext] = useState(false);
-  const lastRef = useRef<string>("");
-
-  useEffect(() => {
-    if (!nextUri || nextUri === lastRef.current) return;
-    lastRef.current = nextUri;
-    setShowNext(true);
-  }, [nextUri]);
-
-  return (
-    <View style={{ flex: 1, backgroundColor: "black" }}>
-      {!!currentUri && (
-        <Image key={currentUri} source={{ uri: currentUri }} style={{ flex: 1, width: "100%" }} resizeMode="contain" />
-      )}
-      {showNext && (
-        <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-          <Image
-            key={nextUri}
-            source={{ uri: nextUri }}
-            style={{ flex: 1, width: "100%" }}
-            resizeMode="contain"
-            onLoadStart={onNextLoadStart}
-            onError={() => { onNextShown(false); fade.setValue(0); setShowNext(false); }}
-            onLoadEnd={() => {
-              Animated.timing(fade, { toValue: 1, duration: 80, useNativeDriver: true }).start(() => {
-                onNextShown(true); fade.setValue(0); setShowNext(false);
-              });
-            }}
-          />
-        </Animated.View>
-      )}
-    </View>
-  );
-}
-
-export default function CameraScreen() {
-  const { lang } = useLanguage();
-  const T = textsByLang[lang];
-
-  const [host, setHost] = useState(DEFAULT_HOST);
-  const [running, setRunning] = useState(false);
-  const [hadError, setHadError] = useState(false);
-  const [intervalMs, setIntervalMs] = useState(600); // ajuste fino no slider (400–900 ms)
-
-  const [currentUri, setCurrentUri] = useState("");
-  const [nextUri, setNextUri] = useState("");
-  const loadingNext = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-
-  const clean = (s:string)=> s.replace(/\/+$/,"");
-  const snapshotUrl = useMemo(()=> `http://${clean(host)}/snapshot`, [host]);
-
-  const schedule = () => {
-    if (!running) return;
-    timerRef.current = setTimeout(() => {
-      if (!loadingNext.current) {
-        setNextUri(`${snapshotUrl}?t=${Date.now()}`); // cache-busting
-      }
-      schedule();
-    }, intervalMs);
-  };
-
-  const start = () => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    setRunning(true);
-    setHadError(false);
-    setCurrentUri(`${snapshotUrl}?t=${Date.now()}`);
-    schedule();
-  };
-
-  const stop = () => {
-    setRunning(false);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
-
-  // pausa automática quando app vai para background
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (s) => {
-      if (s !== "active") stop();
-    });
-    return () => sub.remove();
-  }, []);
-
-  // limpa timer ao desmontar
-  useEffect(()=>()=>{ if(timerRef.current) clearTimeout(timerRef.current); },[]);
-
-  // se mudar o intervalo durante execução, reprograma
-  useEffect(() => {
-    if (running) { stop(); start(); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, host]);
-
-  const onNextLoadStart = ()=>{ loadingNext.current = true; };
-  const onNextShown = (ok:boolean)=>{
-    loadingNext.current = false;
-    if (ok) {
-      setHadError(false);
-      if (nextUri) setCurrentUri(nextUri);
-    } else {
-      setHadError(true);
-    }
-  };
-
-  return (
-    <View style={styles.container}>
-      <AppHero subtitle={T.heroSubtitle} />
-
-      <View style={styles.topbar}>
-        <Text style={styles.label}>{T.espIp}</Text>
-        <TextInput
-          value={host}
-          onChangeText={setHost}
-          placeholder={T.placeholderIp}
-          placeholderTextColor="#8a93a5"
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-          keyboardType="numeric"
-        />
-        {!running ? (
-          <Pressable onPress={start} style={[styles.btn, { backgroundColor: "#16a34a" }]}>
-            <Text style={styles.btnText}>{T.start}</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={stop} style={[styles.btn, { backgroundColor: "#dc2626" }]}>
-            <Text style={styles.btnText}>{T.stop}</Text>
-          </Pressable>
-        )}
-      </View>
-
-      <View style={styles.statusRow}>
-        <Text style={styles.statusText}>
-          {!running ? T.statusIdle : (hadError ? T.statusErr : T.statusRunning(intervalMs))}
-        </Text>
-      </View>
-
-      {/* Controles simples de intervalo */}
-<View style={[styles.sliderRow, {flexDirection:"row", alignItems:"center", gap:8}]}>
-  <Text style={styles.sliderLabel}>Intervalo: {intervalMs} ms</Text>
-  <Pressable
-    onPress={() => setIntervalMs(ms => Math.max(400, ms - 50))}
-    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-  >
-    <Text style={styles.btnText}>-50</Text>
-  </Pressable>
-  <Pressable
-    onPress={() => setIntervalMs(ms => Math.min(900, ms + 50))}
-    style={[styles.btn, { backgroundColor: "#374151", paddingHorizontal:12, paddingVertical:8 }]}
-  >
-    <Text style={styles.btnText}>+50</Text>
-  </Pressable>
-</View>
-
-
-      <View style={{ flex:1 }}>
-        <CrossfadeImage
-          currentUri={currentUri}
-          nextUri={nextUri}
-          onNextLoadStart={onNextLoadStart}
-          onNextShown={onNextShown}
-        />
-      </View>
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container:{ flex:1, backgroundColor:PALETTE.bg },
-  hero:{ alignItems:"center", paddingTop:12, paddingBottom:6 },
-  heroLogo:{ width:80, height:80, marginBottom:6, resizeMode:"contain" },
-  heroTitle:{ color:"#fff", fontSize:22, fontWeight:"800" },
-  heroSubtitle:{ color:"#d1d5db", marginTop:2 },
-
-  topbar:{ flexDirection:"row", alignItems:"center", flexWrap:"wrap",
-           paddingHorizontal:12, paddingVertical:10, gap:8,
-           backgroundColor:PALETTE.card, borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  label:{ color:"#cfd3d8", fontSize:12 },
-  input:{ backgroundColor:"#0b0d14", color:"white", borderRadius:8, paddingHorizontal:10, paddingVertical:8,
-          borderWidth:1, borderColor:PALETTE.border, minWidth:150, flexGrow:1 },
-  btn:{ paddingHorizontal:12, paddingVertical:10, borderRadius:10 },
-  btnText:{ color:"white", fontWeight:"700" },
-
-  statusRow:{ paddingHorizontal:12, paddingVertical:6, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  statusText:{ color:"#cbd5ff", fontSize:12 },
-
-  sliderRow:{ paddingHorizontal:12, paddingVertical:8, backgroundColor:"#0f1322",
-              borderBottomWidth:StyleSheet.hairlineWidth, borderBottomColor:PALETTE.border },
-  sliderLabel:{ color:"#d1d5db", marginBottom:4 },
-});
