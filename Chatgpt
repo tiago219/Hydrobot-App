@@ -1,4 +1,377 @@
 
+show! vamos reduzir ao essencial: apenas Home e Camera, mantendo o design preto + acento vermelho do app antigo. Home é a tela inicial.
+
+
+Estrutura
+
+
+App.tsx
+src/
+  screens/
+    HomeScreen.tsx
+    CameraScreen.tsx
+
+
+
+Dependências (se ainda não tiver)
+
+
+npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context
+npx expo install @expo/vector-icons
+npx expo install react-native-webview
+
+
+
+
+App.tsx (tabs só com Home e Câmera)
+
+
+// App.tsx
+import React from "react";
+import { NavigationContainer, DefaultTheme, Theme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
+
+export type TabParamList = { Home: undefined; Camera: undefined };
+const Tab = createBottomTabNavigator<TabParamList>();
+
+// Design do app antigo (preto + vermelho)
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+};
+
+const DarkThemeHB: Theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: PALETTE.bg,
+    primary: PALETTE.red,
+    card: PALETTE.card,
+    text: PALETTE.white,
+    border: PALETTE.border,
+    notification: PALETTE.red,
+  },
+};
+
+export default function App() {
+  return
+  (
+    <NavigationContainer theme={DarkThemeHB}>
+      <Tab.Navigator
+        initialRouteName="Home"
+        screenOptions={({ route }) => ({
+          headerStyle: { backgroundColor: PALETTE.card },
+          headerTintColor: PALETTE.white,
+          tabBarStyle: { backgroundColor: PALETTE.bg, borderTopColor: PALETTE.border },
+          tabBarActiveTintColor: PALETTE.red,
+          tabBarInactiveTintColor: "#9c9c9c",
+          tabBarIcon: ({ color, size }) => {
+            const iconMap = {
+              Home: "home",
+              Camera: "videocam",
+            } as const;
+            return <Ionicons name={iconMap[route.name as keyof typeof iconMap]} size={size} color={color} />;
+          },
+        })}
+      >
+        <Tab.Screen name="Home" component={HomeScreen} options={{ title: "Início", tabBarLabel: "Início" }} />
+        <Tab.Screen name="Camera" component={CameraScreen} options={{ title: "Câmera", tabBarLabel: "Câmera" }} />
+      </Tab.Navigator>
+    </NavigationContainer>
+  );
+}
+
+
+
+
+src/screens/HomeScreen.tsx (visual antigo, simples)
+
+
+// src/screens/HomeScreen.tsx
+import React from "react";
+import { View, Text, StyleSheet, Pressable } from "react-native";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function HomeScreen({ navigation }: any) {
+  return (
+    <View style={styles.container}>
+      <View style={styles.card}>
+        <Text style={styles.title}>HydroBot</Text>
+        <Text style={styles.sub}>Início do app</Text>
+
+        <Pressable style={styles.btn} onPress={() => navigation.navigate("Camera")}>
+          <Text style={styles.btnTxt}>Ir para Câmera</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, justifyContent: "center" },
+  card: {
+    backgroundColor: PALETTE.card,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    borderRadius: 14,
+    padding: 16,
+    gap: 8,
+  },
+  title: { color: PALETTE.white, fontSize: 22, fontWeight: "700" },
+  sub: { color: PALETTE.sub, marginBottom: 8 },
+  btn: {
+    alignSelf: "flex-start",
+    backgroundColor: PALETTE.red,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+});
+
+
+
+
+src/screens/CameraScreen.tsx (igual a que funcionou, endpoints padrão)
+
+
+// src/screens/CameraScreen.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image,
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+
+type Mode = "mjpeg" | "snapshot";
+
+const PALETTE = {
+  bg: "#000000",
+  card: "#0d0d0d",
+  border: "#1a1a1a",
+  red: "#E53B2F",
+  white: "#FFFFFF",
+  sub: "#9c9c9c",
+};
+
+export default function CameraScreen() {
+  const [ip, setIp] = useState<string>("192.168.3.3"); // ajuste o IP
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [statusText, setStatusText] = useState<string>("—");
+  const [err, setErr] = useState<string>("");
+
+  const [snapUri, setSnapUri] = useState<string>("");
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl = useMemo(() => `${base81}/stream`, [base81]);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+
+  const startSnapshot = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshot, clearTimer]);
+
+  useEffect(() => {
+    setErr("");
+    if (mode === "snapshot") startSnapshot(); else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshot, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const r = await fetch(statusUrl);
+      const txt = await r.text();
+      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+    } catch (e) {
+      const er = e as Error;
+      setStatusText("Falhou");
+      setErr(er?.message ?? String(e));
+    }
+  }, [statusUrl]);
+
+  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Câmera</Text>
+
+      <View style={styles.row}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.label}>ESP IP</Text>
+          <TextInput
+            style={styles.input}
+            value={ip}
+            onChangeText={setIp}
+            placeholder="ex.: 192.168.3.3"
+            placeholderTextColor={PALETTE.sub}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+          />
+        </View>
+        <Pressable style={styles.btn} onPress={checkStatus}>
+          <Text style={styles.btnTxt}>Testar</Text>
+        </Pressable>
+      </View>
+
+      <View style={[styles.row, { marginTop: 8 }]}>
+        <Pressable style={[styles.chip, mode === "mjpeg" && styles.chipActive]} onPress={() => setMode("mjpeg")}>
+          <Text style={[styles.chipTxt, mode === "mjpeg" && styles.chipTxtActive]}>MJPEG (:81/stream)</Text>
+        </Pressable>
+        <Pressable style={[styles.chip, mode === "snapshot" && styles.chipActive]} onPress={() => setMode("snapshot")}>
+          <Text style={[styles.chipTxt, mode === "snapshot" && styles.chipTxtActive]}>Snapshot (/capture)</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.card}>
+        {mode === "mjpeg" ? (
+          <WebView
+            source={{ uri: streamUrl }}
+            style={{ width: "100%", height: "100%" }}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            allowUniversalAccessFromFileURLs
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={{ width: "100%", height: "100%" }}
+            resizeMode="contain"
+            onError={onImgError}
+          />
+        )}
+      </View>
+
+      <Text style={styles.meta}>Status: <Text style={{ color: "#a7f3d0" }}>{statusText}</Text></Text>
+      {!!err && <Text style={[styles.meta, { color: "#ff8b8b" }]}>Erro: {err}</Text>}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: PALETTE.bg, padding: 16, gap: 10 },
+  title: { color: PALETTE.white, fontSize: 20, fontWeight: "700" },
+  row: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
+  input: {
+    backgroundColor: PALETTE.card, borderWidth: 1, borderColor: PALETTE.border,
+    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, color: PALETTE.white,
+  },
+  btn: { backgroundColor: PALETTE.red, paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
+  btnTxt: { color: "#fff", fontWeight: "700" },
+  chip: { borderWidth: 1, borderColor: PALETTE.border, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
+  chipActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  chipTxt: { color: PALETTE.white },
+  chipTxtActive: { color: "#fff", fontWeight: "700" },
+  card: {
+    flex: 1, marginTop: 8, backgroundColor: PALETTE.card,
+    borderWidth: 1, borderColor: PALETTE.border, borderRadius: 12, overflow: "hidden",
+  },
+  meta: { color: "#bbb", fontSize: 12, marginTop: 6 },
+});
+
+
+
+Pronto: só duas telas, Home é a inicial, visual do app antigo preservado. Se quiser que eu ajuste paddings/raios/cores 1:1, manda um print do antigo que eu calibro.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Isso é “arquivo não encontrado” — o App.tsx está importando coisas que ainda não existem. Vamos criar os arquivos mínimos (stubs) para tudo compilar agora.
 
 
