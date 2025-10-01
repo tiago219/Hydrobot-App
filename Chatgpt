@@ -1,4 +1,49 @@
 
+// ---------- DETECÇÃO DE FOGO + DISCADOR ----------
+const fireDetected = simulateFire || hud.fogoE || hud.fogoM || hud.fogoD;
+
+useEffect(() => {
+  const openDialer = async () => {
+    try {
+      if (Platform.OS === "android" && (Linking as any).sendIntent) {
+        // Garante ACTION_DIAL com URI tel: — abre o discador com número já digitado
+        await (Linking as any).sendIntent("android.intent.action.DIAL", [
+          { key: "data", value: "tel:123456" },
+        ]);
+      } else {
+        // iOS (ou Android fallback)
+        await Linking.openURL("tel:123456");
+      }
+    } catch {}
+  };
+
+  if (fireDetected && !dialGuardRef.current) {
+    dialGuardRef.current = true;
+    openDialer();
+  }
+  if (!fireDetected) {
+    dialGuardRef.current = false;
+  }
+}, [fireDetected]);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Perfeito — adicionei (1) discagem automática para 123456 quando houver detecção de fogo e (2) um modo de simulação de fogo na própria tela da câmera, além de (3) subir um pouco o controle de movimento.
 
 
