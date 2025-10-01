@@ -1,183 +1,61 @@
+//App.tsx
+import React from "react";
+import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
+import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
+import { LogBox } from "react-native";
 
-// ================= ESP32-CAM – mantém CameraWebServer + adiciona /cmd /pump /hud =================
-#include "esp_camera.h"
-#include <WiFi.h>
-#include "esp_http_server.h"
+import { I18nProvider } from "./src/i18n";
+import HomeScreen from "./src/screens/HomeScreen";
+import CameraScreen from "./src/screens/CameraScreen";
 
-// ======= Modelo de câmera (ou use seu board_config.h) =======
-#include "board_config.h"   // mantém sua seleção do modelo/pinos
+LogBox.ignoreLogs(["useInsertionEffect must not schedule updates"]);
 
-// ======= Wi-Fi =======
-const char *ssid     = "HydroBot";
-const char *password = "loud2025emibr";
+const Tab = createBottomTabNavigator();
 
-// ======= Declarações vindas do CameraWebServer original =======
-void startCameraServer();
-void setupLedFlash();
+const theme = {
+  ...DefaultTheme,
+  colors: {
+    ...DefaultTheme.colors,
+    background: "#0b0b0f",
+    card: "#0b0b0f",
+    text: "#e5e7eb",
+    border: "#25273a",
+    primary: "#e6403a",
+  },
+};
 
-// O CameraWebServer (app_httpd.cpp) costuma expor este handle global:
-extern "C" httpd_handle_t camera_httpd;   // << usamos pra registrar nossos endpoints
-
-// ======= HUD cache (telemetria lida da Serial do Arduino) =======
-static String lastHudJson = "{\"nivelAguaPct\":0,\"fogoE\":false,\"fogoM\":false,\"fogoD\":false,\"modo\":\"AUTO\"}";
-
-// Leitura de linhas JSON da Serial (terminadas em \n)
-static void poll_serial_hud() {
-  static String line;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c=='\n' || c=='\r') {
-      if (line.length() > 0 && line.charAt(0) == '{') {
-        lastHudJson = line;
-      }
-      line = "";
-    } else {
-      if (line.length() < 512) line += c;
-    }
-  }
-}
-
-// ======= Utils HTTP =======
-static void set_nocache(httpd_req_t *req) {
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  httpd_resp_set_hdr(req, "Pragma", "no-cache");
-  httpd_resp_set_hdr(req, "Expires", "0");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-}
-
-// GET /hud  -> retorna o último JSON vindo do Arduino
-static esp_err_t hud_handler(httpd_req_t *req) {
-  set_nocache(req);
-  httpd_resp_set_type(req, "application/json");
-  // leitura rápida para manter fresco (não bloqueia)
-  poll_serial_hud();
-  return httpd_resp_send(req, lastHudJson.c_str(), HTTPD_RESP_USE_STRLEN);
-}
-
-// GET /cmd?c=FWD&ms=250   |   /cmd?c=STOP
-static esp_err_t cmd_handler(httpd_req_t *req) {
-  set_nocache(req);
-  char q[64]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
-  String c = "STOP"; int ms = 200;
-  if (qlen > 1 && qlen < sizeof(q)) {
-    httpd_req_get_url_query_str(req, q, qlen);
-    char v[16];
-    if (httpd_query_key_value(q, "c", v, sizeof(v)) == ESP_OK) c = v;
-    if (httpd_query_key_value(q, "ms", v, sizeof(v)) == ESP_OK) ms = atoi(v);
-  }
-  if (c == "STOP") Serial.println("CMD:STOP");
-  else             Serial.printf("CMD:%s:ms=%d\n", c.c_str(), ms);
-
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-}
-
-// GET /pump?on=1|0
-static esp_err_t pump_handler(httpd_req_t *req) {
-  set_nocache(req);
-  char q[32]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
-  int on = 0;
-  if (qlen > 1 && qlen < sizeof(q)) {
-    httpd_req_get_url_query_str(req, q, qlen);
-    char v[8];
-    if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) on = atoi(v);
-  }
-  if (on) Serial.println("CMD:PUMP:on"); else Serial.println("CMD:PUMP:off");
-
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-}
-
-// Registra endpoints no mesmo servidor (porta 80) criado por startCameraServer()
-static void register_control_endpoints() {
-  if (!camera_httpd) return;   // se por algum motivo não existir (fork diferente)
-
-  httpd_uri_t hud_uri  = { .uri="/hud",  .method=HTTP_GET, .handler=hud_handler,  .user_ctx=NULL };
-  httpd_uri_t cmd_uri  = { .uri="/cmd",  .method=HTTP_GET, .handler=cmd_handler,  .user_ctx=NULL };
-  httpd_uri_t pump_uri = { .uri="/pump", .method=HTTP_GET, .handler=pump_handler, .user_ctx=NULL };
-
-  httpd_register_uri_handler(camera_httpd, &hud_uri);
-  httpd_register_uri_handler(camera_httpd, &cmd_uri);
-  httpd_register_uri_handler(camera_httpd, &pump_uri);
-}
-
-// ===================== SETUP / LOOP =====================
-void setup() {
-  Serial.begin(115200);               // UART com o Arduino
-  Serial.setDebugOutput(false);
-
-  // ---------- init câmera (igual ao seu "código certo") ----------
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // streaming
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
-
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    if (psramFound()) {
-      config.jpeg_quality = 10;
-      config.fb_count = 2;
-      config.grab_mode = CAMERA_GRAB_LATEST;
-    } else {
-      config.frame_size = FRAMESIZE_SVGA;
-      config.fb_location = CAMERA_FB_IN_DRAM;
-    }
-  } else {
-    config.frame_size = FRAMESIZE_240X240;
-  }
-
-  if (esp_camera_init(&config) != ESP_OK) {
-    // fallback simples, evita reboot em ambientes críticos
-    config.frame_size   = FRAMESIZE_SVGA;
-    config.xclk_freq_hz = 10000000;
-    config.jpeg_quality = 14;
-    config.fb_count     = 1;
-    if (esp_camera_init(&config) != ESP_OK) {
-      for(;;) delay(1000);
-    }
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  if (s->id.PID == OV3660_PID) { s->set_vflip(s, 1); s->set_brightness(s, 1); s->set_saturation(s, -2); }
-  if (config.pixel_format == PIXFORMAT_JPEG) s->set_framesize(s, FRAMESIZE_QVGA);  // taxa mais estável
-
-  // ---------- Wi-Fi ----------
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  while (WiFi.status() != WL_CONNECTED) { delay(400); }
-
-  // ---------- servidor original ----------
-  startCameraServer();
-
-  // ---------- registrar controles no MESMO servidor ----------
-  register_control_endpoints();
-}
-
-void loop() {
-  // Só mantém HUD fresca; não bloqueia
-  poll_serial_hud();
-  delay(10);
+export default function App() {
+  return (
+    <I18nProvider>
+      <NavigationContainer theme={theme}>
+        <Tab.Navigator
+          screenOptions={({ route }) => ({
+            headerShown: false,
+            tabBarStyle: { backgroundColor: "#0b0b0f", borderTopColor: "#25273a" },
+            tabBarActiveTintColor: "#e6403a",
+            tabBarInactiveTintColor: "#9aa0a6",
+            tabBarIcon: ({ color, size }) => {
+              const name =
+                route.name === "Início" ? "home" :
+                route.name === "Câmera" ? "videocam" : "ellipse";
+              return <Ionicons name={name as any} size={size} color={color} />;
+            },
+          })}
+        >
+          <Tab.Screen name="Início" component={HomeScreen} />
+          <Tab.Screen
+            name="Câmera"
+            component={CameraScreen}
+            options={{
+              headerShown: false,
+              tabBarStyle: { display: "none" },
+            }}
+          />
+        </Tab.Navigator>
+      </NavigationContainer>
+    </I18nProvider>
+  );
 }
 
 
@@ -187,260 +65,585 @@ void loop() {
 
 
 
+//HomeScreen.tsx
+import React, { useEffect, useRef, useState } from "react";
+import { View, Text, StyleSheet, Image, Pressable, Animated, Modal } from "react-native";
+import { useNavigation } from "@react-navigation/native";
+import { useI18n, Language } from "../i18n";
 
+const PALETTE = {
+  bg: "#0a0a0f",
+  bgLight: "#12121a",
+  card: "#1a1a24",
+  border: "#2a2a3a",
+  red: "#ff4444",
+  redDark: "#cc0000",
+  white: "#f5f5f5",
+  sub: "#a0a0b0",
+  green: "#00ff88",
+  blue: "#4488ff",
+};
 
+const LANGUAGES: { code: Language; name: string; flag: string }[] = [
+  { code: 'pt', name: 'Português', flag: '🇧🇷' },
+  { code: 'en', name: 'English', flag: '🇺🇸' },
+  { code: 'es', name: 'Español', flag: '🇪🇸' },
+];
 
+export default function HomeScreen() {
+  const nav = useNavigation<any>();
+  const { language, setLanguage, t } = useI18n();
+  const [showLangModal, setShowLangModal] = useState(false);
+  const [expandedCard, setExpandedCard] = useState<string | null>(null);
 
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(30)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const modalAnim = useRef(new Animated.Value(0)).current;
 
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 800,
+        useNativeDriver: true,
+      }),
+      Animated.timing(slideAnim, {
+        toValue: 0,
+        duration: 600,
+        useNativeDriver: true,
+      }),
+    ]).start();
 
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.05,
+          duration: 2000,
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 2000,
+          useNativeDriver: true,
+        }),
+      ])
+    ).start();
+  }, []);
 
+  useEffect(() => {
+    Animated.spring(modalAnim, {
+      toValue: showLangModal ? 1 : 0,
+      useNativeDriver: true,
+      tension: 50,
+      friction: 8,
+    }).start();
+  }, [showLangModal]);
 
+  const FeatureCard = ({
+    id,
+    icon,
+    title,
+    description,
+    expanded,
+  }: {
+    id: string;
+    icon: string;
+    title: string;
+    description: string;
+    expanded: string;
+  }) => {
+    const isExpanded = expandedCard === id;
+    const heightAnim = useRef(new Animated.Value(0)).current;
 
+    useEffect(() => {
+      Animated.spring(heightAnim, {
+        toValue: isExpanded ? 1 : 0,
+        useNativeDriver: false,
+        tension: 50,
+        friction: 8,
+      }).start();
+    }, [isExpanded]);
 
+    return (
+      <Pressable
+        style={[styles.featureCard, isExpanded && styles.featureCardExpanded]}
+        onPress={() => setExpandedCard(isExpanded ? null : id)}
+      >
+        <View style={styles.featureIcon}>
+          <Text style={styles.featureIconText}>{icon}</Text>
+        </View>
+        <View style={styles.featureContent}>
+          <View style={styles.featureHeader}>
+            <Text style={styles.featureTitle}>{title}</Text>
+            <Text style={[styles.expandIcon, isExpanded && styles.expandIconRotated]}>
+              ▼
+            </Text>
+          </View>
+          <Text style={styles.featureDesc}>{description}</Text>
+          {isExpanded && (
+            <Animated.View
+              style={[
+                styles.expandedContent,
+                {
+                  opacity: heightAnim,
+                  maxHeight: heightAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [0, 300],
+                  }),
+                },
+              ]}
+            >
+              <View style={styles.divider} />
+              <Text style={styles.expandedText}>{expanded}</Text>
+            </Animated.View>
+          )}
+        </View>
+      </Pressable>
+    );
+  };
 
+  const handleLanguageSelect = (lang: Language) => {
+    setLanguage(lang);
+    setShowLangModal(false);
+  };
 
+  const currentLang = LANGUAGES.find(l => l.code === language)!;
 
+  return (
+    <View style={styles.container}>
+      <View style={styles.bgLayer1} />
+      <View style={styles.bgLayer2} />
 
-// ===================== ESP32-CAM — Camera + Controle do Carro + HUD =====================
-#include "esp_camera.h"
-#include <WiFi.h>
-#include "esp_http_server.h"
+      <Pressable 
+        style={styles.langButton}
+        onPress={() => setShowLangModal(true)}
+      >
+        <Text style={styles.langFlag}>{currentLang.flag}</Text>
+        <Text style={styles.langCode}>{currentLang.code.toUpperCase()}</Text>
+      </Pressable>
 
-// --------- SELECIONE SEU MODELO (ou use seu board_config.h) ---------
-// Se já usa "board_config.h" no seu projeto, descomente a linha abaixo e remova o bloco de pinos.
-// #include "board_config.h"
+      <Animated.View
+        style={[
+          styles.content,
+          {
+            opacity: fadeAnim,
+            transform: [{ translateY: slideAnim }],
+          },
+        ]}
+      >
+        <View style={styles.logoSection}>
+          <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+            <View style={styles.logoContainer}>
+              <Image
+                source={require("../../assets/logo.png")}
+                style={styles.logo}
+                resizeMode="contain"
+              />
+              <View style={styles.logoBg} />
+            </View>
+          </Animated.View>
 
-// >>> Pinos do AI Thinker (comente se usar board_config.h)
-#ifndef CAMERA_MODEL_AI_THINKER
-#define CAMERA_MODEL_AI_THINKER
-#endif
+          <Text style={styles.title}>{t.home.title}</Text>
+          <View style={styles.subtitleContainer}>
+            <View style={styles.statusDot} />
+            <Text style={styles.subtitle}>{t.home.subtitle}</Text>
+          </View>
+        </View>
 
-#if defined(CAMERA_MODEL_AI_THINKER)
-  #define PWDN_GPIO_NUM     32
-  #define RESET_GPIO_NUM    -1
-  #define XCLK_GPIO_NUM      0
-  #define SIOD_GPIO_NUM     26
-  #define SIOC_GPIO_NUM     27
-  #define Y9_GPIO_NUM       35
-  #define Y8_GPIO_NUM       34
-  #define Y7_GPIO_NUM       39
-  #define Y6_GPIO_NUM       36
-  #define Y5_GPIO_NUM       21
-  #define Y4_GPIO_NUM       19
-  #define Y3_GPIO_NUM       18
-  #define Y2_GPIO_NUM        5
-  #define VSYNC_GPIO_NUM    25
-  #define HREF_GPIO_NUM     23
-  #define PCLK_GPIO_NUM     22
-#endif
+        <View style={styles.featuresSection}>
+          <Text style={styles.sectionTitle}>{t.home.resourcesTitle}</Text>
+          <FeatureCard
+            id="camera"
+            icon="📹"
+            title={t.home.features.camera.title}
+            description={t.home.features.camera.desc}
+            expanded={t.home.features.camera.expanded}
+          />
+          <FeatureCard
+            id="control"
+            icon="🎮"
+            title={t.home.features.control.title}
+            description={t.home.features.control.desc}
+            expanded={t.home.features.control.expanded}
+          />
+          <FeatureCard
+            id="fire"
+            icon="🔥"
+            title={t.home.features.fire.title}
+            description={t.home.features.fire.desc}
+            expanded={t.home.features.fire.expanded}
+          />
+          <FeatureCard
+            id="pump"
+            icon="💧"
+            title={t.home.features.pump.title}
+            description={t.home.features.pump.desc}
+            expanded={t.home.features.pump.expanded}
+          />
+        </View>
 
-// ======================= WIFI =======================
-const char* ssid     = "HydroBot";
-const char* password = "loud2025emibr";
+        <Pressable
+          style={({ pressed }) => [
+            styles.ctaButton,
+            pressed && styles.ctaButtonPressed,
+          ]}
+          onPress={() => nav.navigate("Câmera")}
+        >
+          <Text style={styles.ctaText}>{t.home.startButton}</Text>
+        </Pressable>
 
-// =================== HTTP SERVERS ===================
-static httpd_handle_t httpd_main = nullptr;
+        <View style={styles.footer}>
+          <View style={styles.footerDivider} />
+          <Text style={styles.footerText}>{t.home.footer}</Text>
+        </View>
+      </Animated.View>
 
-static void set_nocache(httpd_req_t *req) {
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  httpd_resp_set_hdr(req, "Pragma", "no-cache");
-  httpd_resp_set_hdr(req, "Expires", "0");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+      <Modal
+        visible={showLangModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowLangModal(false)}
+      >
+        <Pressable 
+          style={styles.modalOverlay}
+          onPress={() => setShowLangModal(false)}
+        >
+          <Animated.View
+            style={[
+              styles.modalContent,
+              {
+                opacity: modalAnim,
+                transform: [
+                  {
+                    scale: modalAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [0.9, 1],
+                    }),
+                  },
+                ],
+              },
+            ]}
+          >
+            <Text style={styles.modalTitle}>🌍 Select Language</Text>
+            <View style={styles.langList}>
+              {LANGUAGES.map((lang) => (
+                <Pressable
+                  key={lang.code}
+                  style={[
+                    styles.langOption,
+                    language === lang.code && styles.langOptionActive,
+                  ]}
+                  onPress={() => handleLanguageSelect(lang.code)}
+                >
+                  <Text style={styles.langOptionFlag}>{lang.flag}</Text>
+                  <Text
+                    style={[
+                      styles.langOptionName,
+                      language === lang.code && styles.langOptionNameActive,
+                    ]}
+                  >
+                    {lang.name}
+                  </Text>
+                  {language === lang.code && (
+                    <Text style={styles.langCheckmark}>✓</Text>
+                  )}
+                </Pressable>
+              ))}
+            </View>
+          </Animated.View>
+        </Pressable>
+      </Modal>
+    </View>
+  );
 }
 
-// ---------- HUD cache (telemetria recebida do Arduino) ----------
-static String lastHudJson = "{\"nivelAguaPct\":0,\"fogoE\":false,\"fogoM\":false,\"fogoD\":false,\"modo\":\"AUTO\"}";
-static unsigned long lastHudUpdateMs = 0;
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: PALETTE.bg,
+  },
+  bgLayer1: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: PALETTE.bg,
+  },
+  bgLayer2: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: PALETTE.red,
+    opacity: 0.05,
+  },
+  langButton: {
+    position: 'absolute',
+    top: 50,
+    right: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: PALETTE.card,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    gap: 6,
+    zIndex: 10,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  langFlag: {
+    fontSize: 18,
+  },
+  langCode: {
+    color: PALETTE.white,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  content: {
+    flex: 1,
+    paddingHorizontal: 24,
+    paddingTop: 60,
+    paddingBottom: 40,
+  },
+  logoSection: {
+    alignItems: "center",
+    marginBottom: 32,
+  },
+  logoContainer: {
+    width: 140,
+    height: 140,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 20,
+  },
+  logo: {
+    width: 120,
+    height: 120,
+    zIndex: 2,
+  },
+  logoBg: {
+    position: "absolute",
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: PALETTE.red,
+    opacity: 0.15,
+    zIndex: 1,
+  },
+  title: {
+    color: PALETTE.white,
+    fontSize: 38,
+    fontWeight: "900",
+    letterSpacing: 1.5,
+    textShadowColor: "rgba(255, 68, 68, 0.6)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+    marginBottom: 8,
+  },
+  subtitleContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  statusDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: PALETTE.green,
+  },
+  subtitle: {
+    color: PALETTE.sub,
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  featuresSection: {
+    flex: 1,
+    gap: 12,
+  },
+  sectionTitle: {
+    color: PALETTE.white,
+    fontSize: 20,
+    fontWeight: "800",
+    marginBottom: 8,
+    paddingLeft: 4,
+  },
+  featureCard: {
+    flexDirection: "row",
+    backgroundColor: PALETTE.card,
+    borderRadius: 16,
+    padding: 16,
+    borderLeftWidth: 4,
+    borderLeftColor: PALETTE.red,
+    shadowColor: "#ff4444",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  featureCardExpanded: {
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    elevation: 8,
+    borderLeftWidth: 6,
+  },
+  featureIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "rgba(255, 68, 68, 0.15)",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 16,
+  },
+  featureIconText: {
+    fontSize: 24,
+  },
+  featureContent: {
+    flex: 1,
+  },
+  featureHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  featureTitle: {
+    color: PALETTE.white,
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  expandIcon: {
+    color: PALETTE.sub,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  expandIconRotated: {
+    transform: [{ rotate: "180deg" }],
+    color: PALETTE.red,
+  },
+  featureDesc: {
+    color: PALETTE.sub,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  expandedContent: {
+    overflow: "hidden",
+  },
+  divider: {
+    height: 1,
+    backgroundColor: PALETTE.border,
+    marginVertical: 12,
+  },
+  expandedText: {
+    color: PALETTE.white,
+    fontSize: 13,
+    lineHeight: 20,
+    opacity: 0.9,
+  },
+  ctaButton: {
+    borderRadius: 16,
+    marginTop: 28,
+    paddingVertical: 18,
+    backgroundColor: PALETTE.red,
+    shadowColor: PALETTE.red,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.6,
+    shadowRadius: 16,
+    elevation: 10,
+    alignItems: "center",
+  },
+  ctaButtonPressed: {
+    opacity: 0.9,
+    transform: [{ scale: 0.98 }],
+  },
+  ctaText: {
+    color: PALETTE.white,
+    fontSize: 19,
+    fontWeight: "900",
+    letterSpacing: 1,
+  },
+  footer: {
+    alignItems: "center",
+    marginTop: 40,
+    gap: 16,
+  },
+  footerDivider: {
+    width: 70,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: PALETTE.border,
+  },
+  footerText: {
+    color: PALETTE.sub,
+    fontSize: 12,
+    fontWeight: "500",
+    textAlign: "center",
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  modalContent: {
+    backgroundColor: PALETTE.card,
+    borderRadius: 24,
+    padding: 24,
+    width: '100%',
+    maxWidth: 340,
+    borderWidth: 1,
+    borderColor: PALETTE.border,
+    shadowColor: PALETTE.red,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.3,
+    shadowRadius: 16,
+    elevation: 10,
+  },
+  modalTitle: {
+    color: PALETTE.white,
+    fontSize: 22,
+    fontWeight: '900',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  langList: {
+    gap: 10,
+  },
+  langOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: PALETTE.bgLight,
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 2,
+    borderColor: PALETTE.border,
+  },
+  langOptionActive: {
+    borderColor: PALETTE.red,
+    backgroundColor: 'rgba(255, 68, 68, 0.1)',
+  },
+  langOptionFlag: {
+    fontSize: 28,
+    marginRight: 14,
+  },
+  langOptionName: {
+    flex: 1,
+    color: PALETTE.sub,
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  langOptionNameActive: {
+    color: PALETTE.white,
+  },
+  langCheckmark: {
+    color: PALETTE.red,
+    fontSize: 22,
+    fontWeight: '900',
+  },
+});
 
-// Leia continuamente a Serial e capture linhas JSON (terminadas em \n)
-static void poll_serial_hud() {
-  static String line;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (line.length() > 0 && line.charAt(0) == '{') {
-        lastHudJson = line;
-        lastHudUpdateMs = millis();
-      }
-      line = "";
-    } else {
-      if (line.length() < 512) line += c;
-    }
-  }
-}
-
-// ===================== Handlers HTTP (câmera) =====================
-static esp_err_t status_handler(httpd_req_t *req) {
-  set_nocache(req);
-  String j = String("{\"ok\":true,\"ip\":\"") + WiFi.localIP().toString() + "\"}";
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, j.c_str(), HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t capture_handler(httpd_req_t *req) {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
-  set_nocache(req);
-  httpd_resp_set_type(req, "image/jpeg");
-  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-  return res;
-}
-
-static esp_err_t stream_handler(httpd_req_t *req) {
-  static const char* BOUNDARY = "--frame";
-  static const char* CT = "multipart/x-mixed-replace;boundary=frame";
-  set_nocache(req);
-  httpd_resp_set_type(req, CT);
-
-  while (true) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) break;
-
-    char part[64];
-    size_t hlen = snprintf(part, sizeof(part),
-                           "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-
-    if (httpd_resp_send_chunk(req, "\r\n--frame\r\n", 12) != ESP_OK) { esp_camera_fb_return(fb); break; }
-    if (httpd_resp_send_chunk(req, part, hlen) != ESP_OK)           { esp_camera_fb_return(fb); break; }
-    if (httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len) != ESP_OK) { esp_camera_fb_return(fb); break; }
-    esp_camera_fb_return(fb);
-    if (httpd_resp_send_chunk(req, "\r\n", 2) != ESP_OK) break;
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-  httpd_resp_send_chunk(req, NULL, 0);
-  return ESP_OK;
-}
-
-// ===================== Handlers HTTP (controle/HUD) =====================
-// /hud  -> JSON mais recente vindo do Arduino
-static esp_err_t hud_handler(httpd_req_t *req) {
-  set_nocache(req);
-  httpd_resp_set_type(req, "application/json");
-  poll_serial_hud(); // garante leitura recente
-  return httpd_resp_send(req, lastHudJson.c_str(), HTTPD_RESP_USE_STRLEN);
-}
-
-// /cmd?c=FWD&ms=250   ou   /cmd?c=STOP
-static esp_err_t cmd_handler(httpd_req_t *req) {
-  set_nocache(req);
-  char q[64]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
-  String c = "STOP"; int ms = 200;
-  if (qlen > 1 && qlen < sizeof(q)) {
-    httpd_req_get_url_query_str(req, q, qlen);
-    char v[16];
-    if (httpd_query_key_value(q, "c", v, sizeof(v)) == ESP_OK) c = v;
-    if (httpd_query_key_value(q, "ms", v, sizeof(v)) == ESP_OK) ms = atoi(v);
-  }
-  if (c == "STOP") Serial.println("CMD:STOP");
-  else Serial.printf("CMD:%s:ms=%d\n", c.c_str(), ms);
-
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-}
-
-// /pump?on=1|0
-static esp_err_t pump_handler(httpd_req_t *req) {
-  set_nocache(req);
-  char q[32]; size_t qlen = httpd_req_get_url_query_len(req) + 1;
-  int on = 0;
-  if (qlen > 1 && qlen < sizeof(q)) {
-    httpd_req_get_url_query_str(req, q, qlen);
-    char v[8];
-    if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) on = atoi(v);
-  }
-  if (on) Serial.println("CMD:PUMP:on"); else Serial.println("CMD:PUMP:off");
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-}
-
-// ===================== Start server =====================
-static void start_server() {
-  httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
-  conf.server_port = 80;
-  conf.max_uri_handlers = 16;
-  conf.stack_size = 6144;
-
-  if (httpd_main) httpd_stop(httpd_main);
-  if (httpd_start(&httpd_main, &conf) == ESP_OK) {
-    httpd_uri_t status_uri = { .uri="/status",  .method=HTTP_GET, .handler=status_handler,  .user_ctx=NULL };
-    httpd_uri_t still_uri  = { .uri="/capture", .method=HTTP_GET, .handler=capture_handler, .user_ctx=NULL };
-    httpd_uri_t stream_uri = { .uri="/stream",  .method=HTTP_GET, .handler=stream_handler,  .user_ctx=NULL };
-    httpd_uri_t hud_uri    = { .uri="/hud",     .method=HTTP_GET, .handler=hud_handler,     .user_ctx=NULL };
-    httpd_uri_t cmd_uri    = { .uri="/cmd",     .method=HTTP_GET, .handler=cmd_handler,     .user_ctx=NULL };
-    httpd_uri_t pump_uri   = { .uri="/pump",    .method=HTTP_GET, .handler=pump_handler,    .user_ctx=NULL };
-
-    httpd_register_uri_handler(httpd_main, &status_uri);
-    httpd_register_uri_handler(httpd_main, &still_uri);
-    httpd_register_uri_handler(httpd_main, &stream_uri);
-    httpd_register_uri_handler(httpd_main, &hud_uri);
-    httpd_register_uri_handler(httpd_main, &cmd_uri);
-    httpd_register_uri_handler(httpd_main, &pump_uri);
-  }
-}
-
-// ===================== SETUP / LOOP =====================
-void setup() {
-  Serial.begin(115200);   // UART para o Arduino
-  Serial.setDebugOutput(true);
-  delay(200);
-
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_QVGA;   // inicia leve; você pode subir depois
-  config.jpeg_quality = 12;
-  config.fb_count     = 1;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
-
-  if (psramFound()) { config.jpeg_quality = 10; config.fb_count = 2; }
-  else              { config.frame_size = FRAMESIZE_SVGA; config.fb_location = CAMERA_FB_IN_DRAM; }
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed 0x%x\n", err);
-    for(;;) delay(1000);
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  if (s->id.PID == OV3660_PID) { s->set_vflip(s, 1); s->set_brightness(s, 1); s->set_saturation(s, -2); }
-  s->set_framesize(s, FRAMESIZE_QVGA);   // frame rate mais alto p/ stream
-
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
-  Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
-
-  start_server();
-  Serial.println("HTTP server started");
-  Serial.printf("Open stream: http://%s/stream\n", WiFi.localIP().toString().c_str());
-}
-
-void loop() {
-  // Mantém HUD atualizada
-  poll_serial_hud();
-  delay(10);
-}
 
 
 
@@ -451,21 +654,18 @@ void loop() {
 
 
 
-
-
-
-
-
-
+//CameraScreen.tsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   View, Text, TextInput, Pressable, StyleSheet, Image,
-  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData,
+  Animated
 } from "react-native";
 import { WebView } from "react-native-webview";
 import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { StatusBar } from "expo-status-bar";
+import { useI18n } from "../i18n";
 
 type Mode = "mjpeg" | "snapshot";
 type Hud = {
@@ -474,38 +674,68 @@ type Hud = {
   fogoM: boolean;
   fogoD: boolean;
   modo: "AUTO" | "APP";
+  vel: number;
 };
 
 const PALETTE = {
-  bg: "#0b0b0f",
-  card: "#121218",
-  border: "#25273a",
-  red: "#E53B2F",
-  white: "#E5E7EB",
-  sub: "#9CA3AF",
-  green: "#10b981",
-  danger: "#ef4444",
+  bg: "#0a0a0f",
+  bgLight: "#12121a",
+  card: "#1a1a24",
+  border: "#2a2a3a",
+  red: "#ff4444",
+  redDark: "#cc0000",
+  white: "#f5f5f5",
+  sub: "#a0a0b0",
+  green: "#00ff88",
+  danger: "#ff3333",
+  blue: "#4488ff",
 };
 
-const LOGO = require("../../assets/logo.png"); // ajuste se preciso
+const LOGO = require("../../assets/logo.png");
 
 export default function CameraScreen() {
   const navigation = useNavigation<any>();
-
+  const { t } = useI18n();
   const [ip, setIp] = useState<string>("192.168.3.3");
   const [mode, setMode] = useState<Mode>("mjpeg");
   const [statusText, setStatusText] = useState<string>("—");
   const [err, setErr] = useState<string>("");
+  const [showSettings, setShowSettings] = useState<boolean>(false);
 
-  // HUD state
-  const [hud, setHud] = useState<Hud>({ nivelAguaPct: 0, fogoE: false, fogoM: false, fogoD: false, modo: "AUTO" });
+  const [hud, setHud] = useState<Hud>({ 
+    nivelAguaPct: 0, 
+    fogoE: false, 
+    fogoM: false, 
+    fogoD: false, 
+    modo: "AUTO",
+    vel: 60 
+  });
 
-  // Snapshot loop
+  const [velocidade, setVelocidade] = useState<number>(60);
   const [snapUri, setSnapUri] = useState<string>("");
   const timerRef = useRef<number | null>(null);
   const appState = useRef(AppState.currentState);
 
-  // Endpoints CameraWebServer + control/hud
+  const settingsAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.15, duration: 1000, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 1000, useNativeDriver: true }),
+      ])
+    ).start();
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(settingsAnim, {
+      toValue: showSettings ? 1 : 0,
+      duration: 300,
+      useNativeDriver: true,
+    }).start();
+  }, [showSettings]);
+
   const base80 = useMemo(() => `http://${ip}`, [ip]);
   const base81 = useMemo(() => `http://${ip}:81`, [ip]);
   const statusUrl   = useMemo(() => `${base80}/status`, [base80]);
@@ -514,8 +744,8 @@ export default function CameraScreen() {
   const cmdUrl      = useMemo(() => `${base80}/cmd`, [base80]);
   const pumpUrl     = useMemo(() => `${base80}/pump`, [base80]);
   const hudUrl      = useMemo(() => `${base80}/hud`, [base80]);
+  const velUrl      = useMemo(() => `${base80}/vel`, [base80]);
 
-  // Esconde TAB BAR aqui para liberar tela total ao viewer
   useFocusEffect(useCallback(() => {
     const parent = navigation.getParent?.();
     parent?.setOptions({ tabBarStyle: { display: "none" } });
@@ -523,16 +753,24 @@ export default function CameraScreen() {
   }, [navigation]));
 
   const clearTimer = useCallback(() => {
-    if (timerRef.current !== null) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (timerRef.current !== null) { 
+      clearInterval(timerRef.current); 
+      timerRef.current = null; 
+    }
   }, []);
+
   const startSnapshot = useCallback(() => {
     clearTimer();
-    timerRef.current = setInterval(() => setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125) as unknown as number;
+    timerRef.current = setInterval(() => 
+      setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125
+    ) as unknown as number;
   }, [snapshotUrl, clearTimer]);
 
   useEffect(() => {
     const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
-      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") startSnapshot();
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") {
+        startSnapshot();
+      }
       if (next.match(/inactive|background/)) clearTimer();
       appState.current = next;
     });
@@ -541,29 +779,35 @@ export default function CameraScreen() {
 
   useEffect(() => {
     setErr("");
-    if (mode === "snapshot") startSnapshot(); else clearTimer();
+    if (mode === "snapshot") startSnapshot(); 
+    else clearTimer();
     return () => clearTimer();
   }, [mode, startSnapshot, clearTimer]);
 
   const checkStatus = useCallback(async () => {
     try {
       const r = await fetch(statusUrl);
-      const txt = await r.text();
-      setStatusText(`OK (${txt.slice(0, 60)}${txt.length > 60 ? "..." : ""})`);
+      await r.text();
+      setStatusText(t.camera.connected);
+      setErr("");
     } catch (e) {
       const er = e as Error;
-      setStatusText("Falhou");
+      setStatusText(t.camera.disconnected);
       setErr(er?.message ?? String(e));
     }
-  }, [statusUrl]);
+  }, [statusUrl, t.camera.connected, t.camera.disconnected]);
 
-  useEffect(() => { if (ip) checkStatus(); }, [ip, checkStatus]);
+  useEffect(() => { 
+    if (ip) checkStatus(); 
+  }, [ip, checkStatus]);
 
-  const onWvError = useCallback((e: WebViewErrorEvent) => setErr(`WebView: ${e.nativeEvent.description}`), []);
-  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
-  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+  const onWvError = useCallback((e: WebViewErrorEvent) => 
+    setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => 
+    setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => 
+    setErr(`Snapshot: ${e.nativeEvent.error}`), []);
 
-  // Poll HUD (a cada 300ms)
   useEffect(() => {
     let stop = false;
     const tick = async () => {
@@ -571,32 +815,40 @@ export default function CameraScreen() {
         const r = await fetch(hudUrl, { cache: "no-store" });
         if (!r.ok) throw new Error(`HUD HTTP ${r.status}`);
         const j = await r.json();
-        if (!stop) setHud({
-          nivelAguaPct: Number(j.nivelAguaPct ?? 0),
-          fogoE: !!j.fogoE,
-          fogoM: !!j.fogoM,
-          fogoD: !!j.fogoD,
-          modo: j.modo === 1 || j.modo === "APP" ? "APP" : "AUTO",
-        });
-      } catch (e) {
-        // silencioso para não poluir
-      }
+        if (!stop) {
+          const newHud: Hud = {
+            nivelAguaPct: Number(j.nivelAguaPct ?? 0),
+            fogoE: !!j.fogoE,
+            fogoM: !!j.fogoM,
+            fogoD: !!j.fogoD,
+            modo: j.modo === 1 || j.modo === "APP" ? "APP" : "AUTO",
+            vel: Number(j.vel ?? 60),
+          };
+          setHud(newHud);
+          setVelocidade(newHud.vel);
+        }
+      } catch (e) {}
       if (!stop) setTimeout(tick, 300);
     };
     tick();
     return () => { stop = true; };
   }, [hudUrl]);
 
-  // Envio de comandos
   const sendCmd = useCallback(async (c: "FWD"|"BACK"|"LEFT"|"RIGHT"|"STOP", ms: number = 220) => {
     const url = c === "STOP" ? `${cmdUrl}?c=STOP` : `${cmdUrl}?c=${c}&ms=${ms}`;
     try { await fetch(url); } catch {}
   }, [cmdUrl]);
+
   const togglePump = useCallback(async (on: boolean) => {
     try { await fetch(`${pumpUrl}?on=${on ? 1 : 0}`); } catch {}
   }, [pumpUrl]);
 
-  // HTML "contain" — mostra 100% sem cortar
+  const setVel = useCallback(async (v: number) => {
+    const vel = Math.max(20, Math.min(100, v));
+    setVelocidade(vel);
+    try { await fetch(`${velUrl}?v=${vel}`); } catch {}
+  }, [velUrl]);
+
   const mjpegHtml = useMemo(
     () => `
 <!DOCTYPE html>
@@ -612,17 +864,37 @@ export default function CameraScreen() {
       }
     </style>
   </head>
-  <body>
-    <img src="${streamUrl}" />
-  </body>
+  <body><img src="${streamUrl}" /></body>
 </html>`.trim(),
     [streamUrl]
   );
 
-  // UI
-  const fireBadge = (label: string, active: boolean) => (
-    <View style={[styles.fire, { borderColor: active ? PALETTE.danger : PALETTE.border, backgroundColor: active ? "#7f1d1d" : "#00000066" }]}>
-      <Text style={{ color: active ? PALETTE.white : PALETTE.sub, fontWeight: "700" }}>{label}</Text>
+  const StatusIndicator = () => {
+    const isConnected = statusText === t.camera.connected;
+    return (
+      <View style={styles.statusRow}>
+        <Animated.View 
+          style={[
+            styles.statusDot, 
+            { 
+              backgroundColor: isConnected ? PALETTE.green : PALETTE.danger,
+              transform: [{ scale: isConnected ? pulseAnim : 1 }]
+            }
+          ]} 
+        />
+        <Text style={[styles.statusText, { color: isConnected ? PALETTE.green : PALETTE.danger }]}>
+          {statusText}
+        </Text>
+      </View>
+    );
+  };
+
+  const FireBadge = ({ label, active }: { label: string; active: boolean }) => (
+    <View style={[styles.fireBadge, active && styles.fireBadgeActive]}>
+      <View style={[styles.fireDot, { backgroundColor: active ? PALETTE.danger : PALETTE.sub }]} />
+      <Text style={[styles.fireLabel, { color: active ? PALETTE.white : PALETTE.sub }]}>
+        {label}
+      </Text>
     </View>
   );
 
@@ -630,7 +902,7 @@ export default function CameraScreen() {
     <View style={styles.root}>
       <StatusBar hidden />
 
-      {/* VIEWER em tela cheia */}
+      {/* Viewer */}
       <View style={styles.viewer}>
         {mode === "mjpeg" ? (
           <WebView
@@ -650,85 +922,180 @@ export default function CameraScreen() {
             onError={onImgError}
           />
         )}
+        <View style={styles.viewerOverlay} />
       </View>
 
-      {/* ====== OVERLAYS ====== */}
-      {/* Top: logo + chips modo + status */}
-      <View style={styles.topOverlay}>
-        <View style={styles.brandRow}>
-          <Image source={LOGO} style={styles.logo} resizeMode="contain" />
-          <Text style={styles.brand}>HydroBot</Text>
-          <View style={{ flex: 1 }} />
-          <View style={styles.modeRow}>
-            <Pressable style={[styles.chip, mode === "mjpeg" && styles.chipActive]} onPress={() => setMode("mjpeg")}>
-              <Text style={[styles.chipTxt, mode === "mjpeg" && styles.chipTxtActive]}>MJPEG</Text>
+      {/* Top Bar */}
+      <View style={styles.topBar}>
+        <View style={styles.topLeft}>
+          <Pressable style={styles.backBtn} onPress={() => navigation.goBack()}>
+            <Text style={styles.backBtnText}>←</Text>
+          </Pressable>
+          <Image source={LOGO} style={styles.topLogo} resizeMode="contain" />
+          <View>
+            <Text style={styles.topTitle}>{t.camera.title}</Text>
+            <StatusIndicator />
+          </View>
+        </View>
+        <View style={styles.topRight}>
+          <View style={[styles.modeBadge, hud.modo === "APP" && styles.modeBadgeActive]}>
+            <Text style={[styles.modeText, hud.modo === "APP" && styles.modeTextActive]}>
+              {hud.modo}
+            </Text>
+          </View>
+          <Pressable style={styles.settingsBtn} onPress={() => setShowSettings(!showSettings)}>
+            <Text style={styles.settingsBtnText}>⚙</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* Settings Panel */}
+      <Animated.View 
+        style={[
+          styles.settingsPanel,
+          {
+            opacity: settingsAnim,
+            transform: [{ translateY: settingsAnim.interpolate({
+              inputRange: [0, 1],
+              outputRange: [-20, 0]
+            })}],
+            pointerEvents: showSettings ? 'auto' : 'none'
+          }
+        ]}
+      >
+        <View style={styles.settingsContent}>
+          <View style={styles.settingsHeader}>
+            <Text style={styles.settingsTitle}>{t.camera.settings}</Text>
+            <Pressable onPress={() => setShowSettings(false)} style={styles.closeBtn}>
+              <Text style={styles.closeBtnText}>×</Text>
             </Pressable>
-            <Pressable style={[styles.chip, mode === "snapshot" && styles.chipActive]} onPress={() => setMode("snapshot")}>
-              <Text style={[styles.chipTxt, mode === "snapshot" && styles.chipTxtActive]}>Snapshot</Text>
+          </View>
+          
+          <Text style={styles.settingsLabel}>{t.camera.videoMode}</Text>
+          <View style={styles.modeToggle}>
+            <Pressable 
+              style={[styles.modeOption, mode === "mjpeg" && styles.modeOptionActive]}
+              onPress={() => setMode("mjpeg")}
+            >
+              <Text style={[styles.modeOptionText, mode === "mjpeg" && styles.modeOptionTextActive]}>
+                MJPEG
+              </Text>
+            </Pressable>
+            <Pressable 
+              style={[styles.modeOption, mode === "snapshot" && styles.modeOptionActive]}
+              onPress={() => setMode("snapshot")}
+            >
+              <Text style={[styles.modeOptionText, mode === "snapshot" && styles.modeOptionTextActive]}>
+                Snapshot
+              </Text>
+            </Pressable>
+          </View>
+
+          <Text style={styles.settingsLabel}>{t.camera.ipAddress}</Text>
+          <View style={styles.ipRow}>
+            <TextInput
+              style={styles.ipInput}
+              value={ip}
+              onChangeText={setIp}
+              placeholder="192.168.3.3"
+              placeholderTextColor={PALETTE.sub}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+            />
+            <Pressable style={styles.testBtn} onPress={checkStatus}>
+              <Text style={styles.testBtnText}>{t.camera.testButton}</Text>
+            </Pressable>
+          </View>
+          {!!err && <Text style={styles.errorText} numberOfLines={2}>{err}</Text>}
+        </View>
+      </Animated.View>
+
+      {/* Control Pad */}
+      <View style={styles.controlPad}>
+        <View style={styles.dpadContainer}>
+          <View style={styles.dpadRow}>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnSide]} onPress={() => sendCmd("LEFT", 180)}>
+              <Text style={styles.dpadIcon}>◀</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnMain]} onPress={() => sendCmd("FWD", 260)}>
+              <Text style={styles.dpadIcon}>▲</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnSide]} onPress={() => sendCmd("RIGHT", 180)}>
+              <Text style={styles.dpadIcon}>▶</Text>
+            </Pressable>
+          </View>
+          <View style={styles.dpadRow}>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnStop]} onPress={() => sendCmd("STOP")}>
+              <Text style={[styles.dpadIcon, { fontSize: 18 }]}>■</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnMain]} onPress={() => sendCmd("BACK", 240)}>
+              <Text style={styles.dpadIcon}>▼</Text>
             </Pressable>
           </View>
         </View>
-        <Text style={styles.meta}>Status: <Text style={{ color: PALETTE.green }}>{statusText}</Text> • Modo robô: <Text style={{ color: PALETTE.white, fontWeight: "700" }}>{hud.modo}</Text></Text>
       </View>
 
-      {/* Left: d-pad */}
-      <View style={styles.leftOverlay}>
-        <View style={styles.dpadRow}>
-          <Pressable style={[styles.dbtn, styles.dbtnGhost]} onPress={() => sendCmd("LEFT", 180)}><Text style={styles.dtxt}>◀︎</Text></Pressable>
-          <Pressable style={[styles.dbtn, styles.dbtnMain]} onPress={() => sendCmd("FWD", 260)}><Text style={styles.dtxt}>▲</Text></Pressable>
-          <Pressable style={[styles.dbtn, styles.dbtnGhost]} onPress={() => sendCmd("RIGHT", 180)}><Text style={styles.dtxt}>▶︎</Text></Pressable>
-        </View>
-        <View style={[styles.dpadRow, { marginTop: 8 }]}>
-          <Pressable style={[styles.dbtn, styles.dbtnWarn]} onPress={() => sendCmd("STOP")}><Text style={styles.dtxt}>■</Text></Pressable>
-          <Pressable style={[styles.dbtn, styles.dbtnMain]} onPress={() => sendCmd("BACK", 240)}><Text style={styles.dtxt}>▼</Text></Pressable>
-        </View>
-      </View>
-
-      {/* Right: bomba + HUD */}
-      <View style={styles.rightOverlay}>
-        <Pressable style={styles.pump} onPress={() => togglePump(true)}>
-          <Text style={styles.pumpTxt}>Ligar Bomba</Text>
-        </Pressable>
-        <Pressable style={[styles.pump, { backgroundColor: "#00000055", borderColor: PALETTE.border }]} onPress={() => togglePump(false)}>
-          <Text style={styles.pumpTxt}>Desligar Bomba</Text>
-        </Pressable>
-
-        <View style={styles.hudCard}>
-          <Text style={styles.hudTitle}>Sensores</Text>
-          <View style={styles.fireRow}>
-            {fireBadge("ESQ", hud.fogoE)}
-            {fireBadge("MEIO", hud.fogoM)}
-            {fireBadge("DIR", hud.fogoD)}
+      {/* Right Panel */}
+      <View style={styles.rightPanel}>
+        {/* Velocidade */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.speed}</Text>
+          <Text style={styles.velDisplay}>{velocidade}%</Text>
+          <View style={styles.velControls}>
+            <Pressable style={styles.velBtn} onPress={() => setVel(velocidade - 10)}>
+              <Text style={styles.velBtnText}>−</Text>
+            </Pressable>
+            <View style={styles.velBarContainer}>
+              <View style={[styles.velBarFill, { width: `${velocidade}%` }]} />
+            </View>
+            <Pressable style={styles.velBtn} onPress={() => setVel(velocidade + 10)}>
+              <Text style={styles.velBtnText}>+</Text>
+            </Pressable>
           </View>
-
-          <View style={{ height: 8 }} />
-          <Text style={styles.hudTitle}>Nível de Água</Text>
-          <View style={styles.bar}>
-            <View style={[styles.barFill, { width: `${Math.max(0, Math.min(100, hud.nivelAguaPct))}%` }]} />
+          <View style={styles.velPresets}>
+            {[30, 60, 100].map(v => (
+              <Pressable key={v} style={styles.velPreset} onPress={() => setVel(v)}>
+                <Text style={styles.velPresetText}>{v}%</Text>
+              </Pressable>
+            ))}
           </View>
-          <Text style={styles.meta}>&nbsp;{hud.nivelAguaPct}%</Text>
         </View>
-      </View>
 
-      {/* Bottom: IP field */}
-      <View style={styles.bottomOverlay}>
-        <Text style={styles.label}>ESP IP</Text>
-        <View style={{ flexDirection: "row", gap: 8 }}>
-          <TextInput
-            style={styles.input}
-            value={ip}
-            onChangeText={setIp}
-            placeholder="ex.: 192.168.3.3"
-            placeholderTextColor={PALETTE.sub}
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
-          />
-          <Pressable style={styles.btn} onPress={checkStatus}><Text style={styles.btnTxt}>Testar</Text></Pressable>
+        {/* Bomba */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.pump}</Text>
+          <Pressable style={styles.pumpBtn} onPress={() => togglePump(true)}>
+            <Text style={styles.pumpBtnText}>{t.camera.pumpOn}</Text>
+          </Pressable>
+          <Pressable style={[styles.pumpBtn, styles.pumpBtnOff]} onPress={() => togglePump(false)}>
+            <Text style={styles.pumpBtnText}>{t.camera.pumpOff}</Text>
+          </Pressable>
         </View>
-        {!!err && <Text style={[styles.meta, { color: "#ff8b8b", marginTop: 6 }]} numberOfLines={2}>Erro: {err}</Text>}
+
+        {/* Sensores */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.sensors}</Text>
+          <View style={styles.fireGrid}>
+            <FireBadge label={t.camera.left} active={hud.fogoE} />
+            <FireBadge label={t.camera.middle} active={hud.fogoM} />
+            <FireBadge label={t.camera.right} active={hud.fogoD} />
+          </View>
+        </View>
+
+        {/* Água */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.water}</Text>
+          <Text style={styles.waterLevel}>{hud.nivelAguaPct}%</Text>
+          <View style={styles.waterBar}>
+            <View style={[styles.waterBarFill, { 
+              width: `${Math.max(0, Math.min(100, hud.nivelAguaPct))}%`,
+              backgroundColor: hud.nivelAguaPct > 40 ? PALETTE.green : 
+                               hud.nivelAguaPct > 20 ? "#ffbb33" : PALETTE.danger
+            }]} />
+          </View>
+        </View>
       </View>
-      {/* ====== /OVERLAYS ====== */}
     </View>
   );
 }
@@ -736,56 +1103,165 @@ export default function CameraScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: PALETTE.bg },
   viewer: { ...StyleSheet.absoluteFillObject, backgroundColor: "#000" },
-
-  // Top overlay
-  topOverlay: {
-    position: "absolute", left: 12, right: 12, top: 12,
-    backgroundColor: "#00000099", borderRadius: 12, padding: 10, borderWidth: 1, borderColor: "#00000055",
+  viewerOverlay: { 
+    ...StyleSheet.absoluteFillObject, 
+    backgroundColor: "rgba(0,0,0,0.1)",
+    pointerEvents: "none"
   },
-  brandRow: { flexDirection: "row", alignItems: "center", gap: 10 },
-  logo: { width: 26, height: 26 },
-  brand: { color: PALETTE.white, fontSize: 18, fontWeight: "800" },
-  modeRow: { flexDirection: "row", gap: 8 },
-  chip: { borderWidth: 1, borderColor: PALETTE.border, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
-  chipActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
-  chipTxt: { color: PALETTE.white, fontWeight: "600", fontSize: 12 },
-  chipTxtActive: { color: "#fff", fontWeight: "800" },
-  meta: { color: PALETTE.sub, fontSize: 12, marginTop: 6 },
 
-  // Left — d-pad
-  leftOverlay: { position: "absolute", left: 12, bottom: 12 },
+  // Top Bar
+  topBar: {
+    position: "absolute", top: 0, left: 0, right: 0,
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingHorizontal: 16, paddingTop: 50, paddingBottom: 14,
+    backgroundColor: "rgba(10,10,15,0.96)",
+    borderBottomWidth: 1, borderBottomColor: PALETTE.border,
+    shadowColor: "#000", shadowOpacity: 0.5, shadowRadius: 10, elevation: 10,
+  },
+  topLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  backBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: PALETTE.card, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  backBtnText: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+  topLogo: { width: 32, height: 32 },
+  topTitle: { color: PALETTE.white, fontSize: 19, fontWeight: "800", letterSpacing: 0.5 },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 },
+  statusDot: { width: 7, height: 7, borderRadius: 4 },
+  statusText: { fontSize: 11, fontWeight: "600" },
+  topRight: { flexDirection: "row", gap: 8, alignItems: "center" },
+  modeBadge: {
+    paddingHorizontal: 11, paddingVertical: 6, borderRadius: 20,
+    backgroundColor: PALETTE.card, borderWidth: 1, borderColor: PALETTE.border,
+  },
+  modeBadgeActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  modeText: { color: PALETTE.sub, fontSize: 11, fontWeight: "700" },
+  modeTextActive: { color: PALETTE.white },
+  settingsBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: PALETTE.card, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  settingsBtnText: { fontSize: 16 },
+
+  // Settings Panel
+  settingsPanel: {
+    position: "absolute", top: 110, left: 16, right: 16,
+    backgroundColor: PALETTE.card, borderRadius: 16, borderWidth: 1, borderColor: PALETTE.border,
+    shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 12,
+    elevation: 10,
+  },
+  settingsContent: { padding: 16 },
+  settingsHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
+  settingsTitle: { color: PALETTE.white, fontSize: 18, fontWeight: "800" },
+  closeBtn: { width: 28, height: 28, alignItems: "center", justifyContent: "center" },
+  closeBtnText: { color: PALETTE.sub, fontSize: 32, fontWeight: "300" },
+  settingsLabel: { color: PALETTE.sub, fontSize: 12, fontWeight: "600", marginBottom: 8, marginTop: 10 },
+  modeToggle: { flexDirection: "row", gap: 8 },
+  modeOption: {
+    flex: 1, paddingVertical: 10, borderRadius: 10,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    alignItems: "center",
+  },
+  modeOptionActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  modeOptionText: { color: PALETTE.sub, fontWeight: "700", fontSize: 13 },
+  modeOptionTextActive: { color: PALETTE.white },
+  ipRow: { flexDirection: "row", gap: 8 },
+  ipInput: {
+    flex: 1, backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10,
+    color: PALETTE.white, fontSize: 14,
+  },
+  testBtn: {
+    paddingHorizontal: 16, paddingVertical: 10, borderRadius: 10,
+    backgroundColor: PALETTE.blue, alignItems: "center", justifyContent: "center",
+  },
+  testBtnText: { color: PALETTE.white, fontWeight: "700", fontSize: 13 },
+  errorText: { color: PALETTE.danger, fontSize: 11, marginTop: 8 },
+
+  // Control Pad
+  controlPad: { position: "absolute", left: 16, bottom: 16 },
+  dpadContainer: { gap: 8 },
   dpadRow: { flexDirection: "row", gap: 8, justifyContent: "center" },
-  dbtn: { minWidth: 56, height: 56, borderRadius: 12, alignItems: "center", justifyContent: "center", borderWidth: 1 },
-  dbtnMain: { backgroundColor: PALETTE.red, borderColor: "#000" },
-  dbtnGhost:{ backgroundColor: "#00000066", borderColor: PALETTE.border },
-  dbtnWarn: { backgroundColor: "#7f1d1d", borderColor: "#000" },
-  dtxt: { color: "#fff", fontSize: 20, fontWeight: "800" },
-
-  // Right — bomba + HUD
-  rightOverlay: { position: "absolute", right: 12, bottom: 12, alignItems: "stretch", gap: 8, width: 200 },
-  pump: { backgroundColor: PALETTE.red, borderRadius: 12, paddingVertical: 10, alignItems: "center", borderWidth: 1, borderColor: "#000" },
-  pumpTxt: { color: "#fff", fontWeight: "800" },
-
-  hudCard: { backgroundColor: "#00000099", borderRadius: 12, padding: 10, borderWidth: 1, borderColor: "#00000055" },
-  hudTitle: { color: PALETTE.white, fontWeight: "800", marginBottom: 6 },
-  fireRow: { flexDirection: "row", gap: 8 },
-  fire: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1 },
-
-  bar: { height: 12, borderRadius: 999, backgroundColor: "#111", borderWidth: 1, borderColor: PALETTE.border, overflow: "hidden" },
-  barFill: { height: "100%", backgroundColor: PALETTE.green },
-
-  // Bottom — IP
-  bottomOverlay: {
-    position: "absolute", left: 12, right: 12, bottom: 12,
-    backgroundColor: "#00000099", borderRadius: 12, padding: 10, borderWidth: 1, borderColor: "#00000055",
+  dpadBtn: {
+    width: 60, height: 60, borderRadius: 14,
+    alignItems: "center", justifyContent: "center",
+    borderWidth: 2,
+    shadowColor: "#000", shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
   },
-  label: { color: PALETTE.white, marginBottom: 6, fontWeight: "600" },
-  input: {
-    flex: 1, backgroundColor: PALETTE.card, borderWidth: 1, borderColor: PALETTE.border,
-    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, color: PALETTE.white,
+  dpadBtnMain: {
+    backgroundColor: PALETTE.red, borderColor: PALETTE.redDark,
+    shadowColor: PALETTE.red,
   },
-  btn: { backgroundColor: PALETTE.red, paddingHorizontal: 14, paddingVertical: 11, borderRadius: 12 },
-  btnTxt: { color: "#fff", fontWeight: "700" },
+  dpadBtnSide: {
+    backgroundColor: "rgba(255,68,68,0.25)", borderColor: PALETTE.red,
+  },
+  dpadBtnStop: {
+    backgroundColor: "rgba(204,0,0,0.35)", borderColor: PALETTE.redDark,
+  },
+  dpadIcon: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+
+  // Right Panel
+  rightPanel: { position: "absolute", right: 16, top: 120, width: 200, gap: 10 },
+  infoCard: {
+    backgroundColor: "rgba(26,26,36,0.96)", borderRadius: 14,
+    padding: 12, borderWidth: 1, borderColor: PALETTE.border,
+    shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.4, shadowRadius: 6,
+    elevation: 6,
+  },
+  cardTitle: { color: PALETTE.white, fontSize: 12, fontWeight: "800", marginBottom: 8, letterSpacing: 0.5 },
+
+  // Velocidade
+  velDisplay: { color: PALETTE.white, fontSize: 26, fontWeight: "800", textAlign: "center", marginBottom: 6 },
+  velControls: { flexDirection: "row", alignItems: "center", gap: 8 },
+  velBtn: {
+    width: 30, height: 30, borderRadius: 8,
+    backgroundColor: PALETTE.red, alignItems: "center", justifyContent: "center",
+  },
+  velBtnText: { color: PALETTE.white, fontSize: 18, fontWeight: "800" },
+  velBarContainer: {
+    flex: 1, height: 11, borderRadius: 6,
+    backgroundColor: PALETTE.bgLight, overflow: "hidden",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  velBarFill: { height: "100%", backgroundColor: PALETTE.red },
+  velPresets: { flexDirection: "row", gap: 6, marginTop: 8 },
+  velPreset: {
+    flex: 1, paddingVertical: 6, borderRadius: 8,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    alignItems: "center",
+  },
+  velPresetText: { color: PALETTE.white, fontSize: 11, fontWeight: "700" },
+
+  // Bomba
+  pumpBtn: {
+    backgroundColor: PALETTE.green, borderRadius: 10, paddingVertical: 9,
+    alignItems: "center", marginBottom: 6,
+  },
+  pumpBtnOff: { backgroundColor: PALETTE.danger },
+  pumpBtnText: { color: PALETTE.white, fontWeight: "800", fontSize: 12 },
+
+  // Sensores
+  fireGrid: { flexDirection: "row", gap: 6, flexWrap: "wrap" },
+  fireBadge: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    paddingHorizontal: 9, paddingVertical: 5, borderRadius: 20,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+  },
+  fireBadgeActive: {
+    backgroundColor: "rgba(255,51,51,0.2)", borderColor: PALETTE.danger,
+  },
+  fireDot: { width: 5, height: 5, borderRadius: 3 },
+  fireLabel: { fontSize: 10, fontWeight: "700" },
+
+  // Água
+  waterLevel: { color: PALETTE.white, fontSize: 28, fontWeight: "800", textAlign: "center", marginBottom: 6 },
+  waterBar: {
+    height: 12, borderRadius: 6, backgroundColor: PALETTE.bgLight,
+    overflow: "hidden", borderWidth: 1, borderColor: PALETTE.border,
+  },
+  waterBarFill: { height: "100%" },
 });
 
 
@@ -797,196 +1273,4 @@ const styles = StyleSheet.create({
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#include "esp_camera.h"
-#include <WiFi.h>
-
-// ===========================
-// Select camera model in board_config.h
-// ===========================
-#include "board_config.h"
-
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-const char *ssid = "HydroBot";
-const char *password = "loud2025emibr";
-
-void startCameraServer();
-void setupLedFlash();
-
-void setup() {
-  Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
-
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    if (psramFound()) {
-      config.jpeg_quality = 10;
-      config.fb_count = 2;
-      config.grab_mode = CAMERA_GRAB_LATEST;
-    } else {
-      // Limit the frame size when PSRAM is not available
-      config.frame_size = FRAMESIZE_SVGA;
-      config.fb_location = CAMERA_FB_IN_DRAM;
-    }
-  } else {
-    // Best option for face detection/recognition
-    config.frame_size = FRAMESIZE_240X240;
-#if CONFIG_IDF_TARGET_ESP32S3
-    config.fb_count = 2;
-#endif
-  }
-
-#if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-#endif
-
-  // camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
-  }
-  // drop down frame size for higher initial frame rate
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-  }
-
-#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
-#endif
-
-#if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
-#endif
-
-// Setup LED FLash if LED pin is defined in camera_pins.h
-#if defined(LED_GPIO_NUM)
-  setupLedFlash();
-#endif
-
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-
-  startCameraServer();
-
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
-}
-
-void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
-}
+Faça com que o dispositivo automaticamente vá para o telefone com o numero 123456 discado caso fogo seja detectado. Além disso, faça uma opção para simular a detecçao de fogo na tela Camera (para testar as funcionalidades). Também suba um pouquinho a posição do controle de movimento do carrinho.
