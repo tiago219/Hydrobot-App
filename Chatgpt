@@ -1,3 +1,748 @@
+
+Perfeito — adicionei (1) discagem automática para 123456 quando houver detecção de fogo e (2) um modo de simulação de fogo na própria tela da câmera, além de (3) subir um pouco o controle de movimento.
+
+
+Abaixo vai o CameraScreen.tsx completo já com tudo integrado. Depois disso, troque apenas 1 linha no seu styles.controlPad (marquei no final) para subir o D-Pad.
+
+
+
+src/screens/CameraScreen.tsx (substitua inteiro)
+
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  View, Text, TextInput, Pressable, StyleSheet, Image,
+  AppState, AppStateStatus, Platform, NativeSyntheticEvent, ImageErrorEventData,
+  Animated, Linking
+} from "react-native";
+import { WebView } from "react-native-webview";
+import type { WebViewErrorEvent, WebViewHttpErrorEvent } from "react-native-webview/lib/WebViewTypes";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { StatusBar } from "expo-status-bar";
+import { useI18n } from "../i18n";
+
+type Mode = "mjpeg" | "snapshot";
+type Hud = {
+  nivelAguaPct: number;
+  fogoE: boolean;
+  fogoM: boolean;
+  fogoD: boolean;
+  modo: "AUTO" | "APP";
+  vel: number;
+};
+
+const PALETTE = {
+  bg: "#0a0a0f",
+  bgLight: "#12121a",
+  card: "#1a1a24",
+  border: "#2a2a3a",
+  red: "#ff4444",
+  redDark: "#cc0000",
+  white: "#f5f5f5",
+  sub: "#a0a0b0",
+  green: "#00ff88",
+  danger: "#ff3333",
+  blue: "#4488ff",
+};
+
+const LOGO = require("../../assets/logo.png");
+
+export default function CameraScreen() {
+  const navigation = useNavigation<any>();
+  const { t } = useI18n();
+  const [ip, setIp] = useState<string>("192.168.3.3");
+  const [mode, setMode] = useState<Mode>("mjpeg");
+  const [statusText, setStatusText] = useState<string>("—");
+  const [err, setErr] = useState<string>("");
+  const [showSettings, setShowSettings] = useState<boolean>(false);
+
+  const [hud, setHud] = useState<Hud>({ 
+    nivelAguaPct: 0, 
+    fogoE: false, 
+    fogoM: false, 
+    fogoD: false, 
+    modo: "AUTO",
+    vel: 60 
+  });
+
+  const [velocidade, setVelocidade] = useState<number>(60);
+  const [snapUri, setSnapUri] = useState<string>("");
+  const [simulateFire, setSimulateFire] = useState<boolean>(false);
+
+  const timerRef = useRef<number | null>(null);
+  const appState = useRef(AppState.currentState);
+  const dialGuardRef = useRef(false); // evita múltiplos disparos da discagem
+
+  const settingsAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.15, duration: 1000, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 1000, useNativeDriver: true }),
+      ])
+    ).start();
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(settingsAnim, {
+      toValue: showSettings ? 1 : 0,
+      duration: 300,
+      useNativeDriver: true,
+    }).start();
+  }, [showSettings]);
+
+  const base80 = useMemo(() => `http://${ip}`, [ip]);
+  const base81 = useMemo(() => `http://${ip}:81`, [ip]);
+  const statusUrl   = useMemo(() => `${base80}/status`, [base80]);
+  const snapshotUrl = useMemo(() => `${base80}/capture`, [base80]);
+  const streamUrl   = useMemo(() => `${base81}/stream`, [base81]);
+  const cmdUrl      = useMemo(() => `${base80}/cmd`, [base80]);
+  const pumpUrl     = useMemo(() => `${base80}/pump`, [base80]);
+  const hudUrl      = useMemo(() => `${base80}/hud`, [base80]);
+  const velUrl      = useMemo(() => `${base80}/vel`, [base80]);
+
+  useFocusEffect(useCallback(() => {
+    const parent = navigation.getParent?.();
+    parent?.setOptions({ tabBarStyle: { display: "none" } });
+    return () => parent?.setOptions({ tabBarStyle: undefined });
+  }, [navigation]));
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) { 
+      clearInterval(timerRef.current); 
+      timerRef.current = null; 
+    }
+  }, []);
+
+  const startSnapshot = useCallback(() => {
+    clearTimer();
+    timerRef.current = setInterval(() => 
+      setSnapUri(`${snapshotUrl}?ts=${Date.now()}`), 125
+    ) as unknown as number;
+  }, [snapshotUrl, clearTimer]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next: AppStateStatus) => {
+      if (appState.current.match(/inactive|background/) && next === "active" && mode === "snapshot") {
+        startSnapshot();
+      }
+      if (next.match(/inactive|background/)) clearTimer();
+      appState.current = next;
+    });
+    return () => { sub.remove(); clearTimer(); };
+  }, [mode, startSnapshot, clearTimer]);
+
+  useEffect(() => {
+    setErr("");
+    if (mode === "snapshot") startSnapshot(); 
+    else clearTimer();
+    return () => clearTimer();
+  }, [mode, startSnapshot, clearTimer]);
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const r = await fetch(statusUrl);
+      await r.text();
+      setStatusText(t.camera.connected);
+      setErr("");
+    } catch (e) {
+      const er = e as Error;
+      setStatusText(t.camera.disconnected);
+      setErr(er?.message ?? String(e));
+    }
+  }, [statusUrl, t.camera.connected, t.camera.disconnected]);
+
+  useEffect(() => { 
+    if (ip) checkStatus(); 
+  }, [ip, checkStatus]);
+
+  const onWvError = useCallback((e: WebViewErrorEvent) => 
+    setErr(`WebView: ${e.nativeEvent.description}`), []);
+  const onWvHttpError = useCallback((e: WebViewHttpErrorEvent) => 
+    setErr(`HTTP ${e.nativeEvent.statusCode}`), []);
+  const onImgError = useCallback((e: NativeSyntheticEvent<ImageErrorEventData>) => 
+    setErr(`Snapshot: ${e.nativeEvent.error}`), []);
+
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const r = await fetch(hudUrl, { cache: "no-store" });
+        if (!r.ok) throw new Error(`HUD HTTP ${r.status}`);
+        const j = await r.json();
+        if (!stop) {
+          const newHud: Hud = {
+            nivelAguaPct: Number(j.nivelAguaPct ?? 0),
+            fogoE: !!j.fogoE,
+            fogoM: !!j.fogoM,
+            fogoD: !!j.fogoD,
+            modo: j.modo === 1 || j.modo === "APP" ? "APP" : "AUTO",
+            vel: Number(j.vel ?? 60),
+          };
+          setHud(newHud);
+          setVelocidade(newHud.vel);
+        }
+      } catch (e) {}
+      if (!stop) setTimeout(tick, 300);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [hudUrl]);
+
+  const sendCmd = useCallback(async (c: "FWD"|"BACK"|"LEFT"|"RIGHT"|"STOP", ms: number = 220) => {
+    const url = c === "STOP" ? `${cmdUrl}?c=STOP` : `${cmdUrl}?c=${c}&ms=${ms}`;
+    try { await fetch(url); } catch {}
+  }, [cmdUrl]);
+
+  const togglePump = useCallback(async (on: boolean) => {
+    try { await fetch(`${pumpUrl}?on=${on ? 1 : 0}`); } catch {}
+  }, [pumpUrl]);
+
+  const setVel = useCallback(async (v: number) => {
+    const vel = Math.max(20, Math.min(100, v));
+    setVelocidade(vel);
+    try { await fetch(`${velUrl}?v=${vel}`); } catch {}
+  }, [velUrl]);
+
+  // HTML para o stream MJPEG
+  const mjpegHtml = useMemo(
+    () => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no"/>
+    <style>
+      html, body { margin:0; padding:0; background:#000; }
+      img {
+        position: fixed; inset: 0;
+        width: 100vw; height: 100vh;
+        object-fit: contain; background:#000;
+      }
+    </style>
+  </head>
+  <body><img src="${streamUrl}" /></body>
+</html>`.trim(),
+    [streamUrl]
+  );
+
+  // ---------- DETECÇÃO DE FOGO + DISCADOR ----------
+  const fireDetected = simulateFire || hud.fogoE || hud.fogoM || hud.fogoD;
+
+  useEffect(() => {
+    if (fireDetected && !dialGuardRef.current) {
+      dialGuardRef.current = true;
+      // Abre o discador com o número preenchido (Android/iOS)
+      Linking.openURL("tel:123456").catch(() => {});
+    }
+    if (!fireDetected) {
+      // volta a permitir um novo disparo quando o fogo some / simulação desliga
+      dialGuardRef.current = false;
+    }
+  }, [fireDetected]);
+
+  const StatusIndicator = () => {
+    const isConnected = statusText === t.camera.connected;
+    return (
+      <View style={styles.statusRow}>
+        <Animated.View 
+          style={[
+            styles.statusDot, 
+            { 
+              backgroundColor: isConnected ? PALETTE.green : PALETTE.danger,
+              transform: [{ scale: isConnected ? pulseAnim : 1 }]
+            }
+          ]} 
+        />
+        <Text style={[styles.statusText, { color: isConnected ? PALETTE.green : PALETTE.danger }]}>
+          {statusText}
+        </Text>
+      </View>
+    );
+  };
+
+  const FireBadge = ({ label, active }: { label: string; active: boolean }) => (
+    <View style={[styles.fireBadge, active && styles.fireBadgeActive]}>
+      <View style={[styles.fireDot, { backgroundColor: active ? PALETTE.danger : PALETTE.sub }]} />
+      <Text style={[styles.fireLabel, { color: active ? PALETTE.white : PALETTE.sub }]}>
+        {label}
+      </Text>
+    </View>
+  );
+
+  return (
+    <View style={styles.root}>
+      <StatusBar hidden />
+
+      {/* Viewer */}
+      <View style={styles.viewer}>
+        {mode === "mjpeg" ? (
+          <WebView
+            originWhitelist={['*']}
+            source={{ html: mjpegHtml }}
+            style={StyleSheet.absoluteFill}
+            allowsInlineMediaPlayback
+            mediaPlaybackRequiresUserAction={false}
+            onError={onWvError}
+            onHttpError={onWvHttpError}
+          />
+        ) : (
+          <Image
+            source={{ uri: snapUri || `${snapshotUrl}?ts=${Date.now()}` }}
+            style={StyleSheet.absoluteFill}
+            resizeMode="contain"
+            onError={onImgError}
+          />
+        )}
+        <View style={styles.viewerOverlay} />
+      </View>
+
+      {/* Top Bar */}
+      <View style={styles.topBar}>
+        <View style={styles.topLeft}>
+          <Pressable style={styles.backBtn} onPress={() => navigation.goBack()}>
+            <Text style={styles.backBtnText}>←</Text>
+          </Pressable>
+          <Image source={LOGO} style={styles.topLogo} resizeMode="contain" />
+          <View>
+            <Text style={styles.topTitle}>{t.camera.title}</Text>
+            <StatusIndicator />
+          </View>
+        </View>
+        <View style={styles.topRight}>
+          <View style={[styles.modeBadge, hud.modo === "APP" && styles.modeBadgeActive]}>
+            <Text style={[styles.modeText, hud.modo === "APP" && styles.modeTextActive]}>
+              {hud.modo}
+            </Text>
+          </View>
+          <Pressable style={styles.settingsBtn} onPress={() => setShowSettings(!showSettings)}>
+            <Text style={styles.settingsBtnText}>⚙</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* Settings Panel */}
+      <Animated.View 
+        style={[
+          styles.settingsPanel,
+          {
+            opacity: settingsAnim,
+            transform: [{ translateY: settingsAnim.interpolate({
+              inputRange: [0, 1],
+              outputRange: [-20, 0]
+            })}],
+            pointerEvents: showSettings ? 'auto' : 'none'
+          }
+        ]}
+      >
+        <View style={styles.settingsContent}>
+          <View style={styles.settingsHeader}>
+            <Text style={styles.settingsTitle}>{t.camera.settings}</Text>
+            <Pressable onPress={() => setShowSettings(false)} style={styles.closeBtn}>
+              <Text style={styles.closeBtnText}>×</Text>
+            </Pressable>
+          </View>
+          
+          <Text style={styles.settingsLabel}>{t.camera.videoMode}</Text>
+          <View style={styles.modeToggle}>
+            <Pressable 
+              style={[styles.modeOption, mode === "mjpeg" && styles.modeOptionActive]}
+              onPress={() => setMode("mjpeg")}
+            >
+              <Text style={[styles.modeOptionText, mode === "mjpeg" && styles.modeOptionTextActive]}>
+                MJPEG
+              </Text>
+            </Pressable>
+            <Pressable 
+              style={[styles.modeOption, mode === "snapshot" && styles.modeOptionActive]}
+              onPress={() => setMode("snapshot")}
+            >
+              <Text style={[styles.modeOptionText, mode === "snapshot" && styles.modeOptionTextActive]}>
+                Snapshot
+              </Text>
+            </Pressable>
+          </View>
+
+          <Text style={styles.settingsLabel}>{t.camera.ipAddress}</Text>
+          <View style={styles.ipRow}>
+            <TextInput
+              style={styles.ipInput}
+              value={ip}
+              onChangeText={setIp}
+              placeholder="192.168.3.3"
+              placeholderTextColor={PALETTE.sub}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType={Platform.OS === "android" ? "numeric" : "numbers-and-punctuation"}
+            />
+            <Pressable style={styles.testBtn} onPress={checkStatus}>
+              <Text style={styles.testBtnText}>{t.camera.testButton}</Text>
+            </Pressable>
+          </View>
+          {!!err && <Text style={styles.errorText} numberOfLines={2}>{err}</Text>}
+        </View>
+      </Animated.View>
+
+      {/* Control Pad */}
+      <View style={styles.controlPad}>
+        <View style={styles.dpadContainer}>
+          <View style={styles.dpadRow}>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnSide]} onPress={() => sendCmd("LEFT", 180)}>
+              <Text style={styles.dpadIcon}>◀</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnMain]} onPress={() => sendCmd("FWD", 260)}>
+              <Text style={styles.dpadIcon}>▲</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnSide]} onPress={() => sendCmd("RIGHT", 180)}>
+              <Text style={styles.dpadIcon}>▶</Text>
+            </Pressable>
+          </View>
+          <View style={styles.dpadRow}>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnStop]} onPress={() => sendCmd("STOP")}>
+              <Text style={[styles.dpadIcon, { fontSize: 18 }]}>■</Text>
+            </Pressable>
+            <Pressable style={[styles.dpadBtn, styles.dpadBtnMain]} onPress={() => sendCmd("BACK", 240)}>
+              <Text style={styles.dpadIcon}>▼</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+
+      {/* Right Panel */}
+      <View style={styles.rightPanel}>
+        {/* Velocidade */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.speed}</Text>
+          <Text style={styles.velDisplay}>{velocidade}%</Text>
+          <View style={styles.velControls}>
+            <Pressable style={styles.velBtn} onPress={() => setVel(velocidade - 10)}>
+              <Text style={styles.velBtnText}>−</Text>
+            </Pressable>
+            <View style={styles.velBarContainer}>
+              <View style={[styles.velBarFill, { width: `${velocidade}%` }]} />
+            </View>
+            <Pressable style={styles.velBtn} onPress={() => setVel(velocidade + 10)}>
+              <Text style={styles.velBtnText}>+</Text>
+            </Pressable>
+          </View>
+          <View style={styles.velPresets}>
+            {[30, 60, 100].map(v => (
+              <Pressable key={v} style={styles.velPreset} onPress={() => setVel(v)}>
+                <Text style={styles.velPresetText}>{v}%</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+
+        {/* Bomba */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.pump}</Text>
+          <Pressable style={styles.pumpBtn} onPress={() => togglePump(true)}>
+            <Text style={styles.pumpBtnText}>{t.camera.pumpOn}</Text>
+          </Pressable>
+          <Pressable style={[styles.pumpBtn, styles.pumpBtnOff]} onPress={() => togglePump(false)}>
+            <Text style={styles.pumpBtnText}>{t.camera.pumpOff}</Text>
+          </Pressable>
+        </View>
+
+        {/* Sensores */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.sensors}</Text>
+          <View style={styles.fireGrid}>
+            <FireBadge label={t.camera.left} active={hud.fogoE} />
+            <FireBadge label={t.camera.middle} active={hud.fogoM} />
+            <FireBadge label={t.camera.right} active={hud.fogoD} />
+          </View>
+        </View>
+
+        {/* Água */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>{t.camera.water}</Text>
+          <Text style={styles.waterLevel}>{hud.nivelAguaPct}%</Text>
+          <View style={styles.waterBar}>
+            <View style={[styles.waterBarFill, { 
+              width: `${Math.max(0, Math.min(100, hud.nivelAguaPct))}%`,
+              backgroundColor: hud.nivelAguaPct > 40 ? PALETTE.green : 
+                               hud.nivelAguaPct > 20 ? "#ffbb33" : PALETTE.danger
+            }]} />
+          </View>
+        </View>
+
+        {/* --- NOVO: Teste / Simulação de Fogo --- */}
+        <View style={styles.infoCard}>
+          <Text style={styles.cardTitle}>Teste</Text>
+          <Pressable
+            style={[
+              styles.simBtn,
+              simulateFire ? styles.simBtnOn : styles.simBtnOff
+            ]}
+            onPress={() => setSimulateFire(s => !s)}
+          >
+            <Text style={styles.simBtnText}>
+              {simulateFire ? "Simulação de Fogo: ATIVA" : "Simular Fogo"}
+            </Text>
+          </Pressable>
+          {simulateFire && (
+            <Text style={{ color: PALETTE.danger, fontSize: 12, marginTop: 6, fontWeight: "700" }}>
+              Discador será aberto automaticamente.
+            </Text>
+          )}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: PALETTE.bg },
+  viewer: { ...StyleSheet.absoluteFillObject, backgroundColor: "#000" },
+  viewerOverlay: { 
+    ...StyleSheet.absoluteFillObject, 
+    backgroundColor: "rgba(0,0,0,0.1)",
+    pointerEvents: "none"
+  },
+
+  // Top Bar
+  topBar: {
+    position: "absolute", top: 0, left: 0, right: 0,
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingHorizontal: 16, paddingTop: 50, paddingBottom: 14,
+    backgroundColor: "rgba(10,10,15,0.96)",
+    borderBottomWidth: 1, borderBottomColor: PALETTE.border,
+    shadowColor: "#000", shadowOpacity: 0.5, shadowRadius: 10, elevation: 10,
+  },
+  topLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  backBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: PALETTE.card, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  backBtnText: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+  topLogo: { width: 32, height: 32 },
+  topTitle: { color: PALETTE.white, fontSize: 19, fontWeight: "800", letterSpacing: 0.5 },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 },
+  statusDot: { width: 7, height: 7, borderRadius: 4 },
+  statusText: { fontSize: 11, fontWeight: "600" },
+  topRight: { flexDirection: "row", gap: 8, alignItems: "center" },
+  modeBadge: {
+    paddingHorizontal: 11, paddingVertical: 6, borderRadius: 20,
+    backgroundColor: PALETTE.card, borderWidth: 1, borderColor: PALETTE.border,
+  },
+  modeBadgeActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  modeText: { color: PALETTE.sub, fontSize: 11, fontWeight: "700" },
+  modeTextActive: { color: PALETTE.white },
+  settingsBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: PALETTE.card, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  settingsBtnText: { fontSize: 16 },
+
+  // Settings Panel
+  settingsPanel: {
+    position: "absolute", top: 110, left: 16, right: 16,
+    backgroundColor: PALETTE.card, borderRadius: 16, borderWidth: 1, borderColor: PALETTE.border,
+    shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 12,
+    elevation: 10,
+  },
+  settingsContent: { padding: 16 },
+  settingsHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 14 },
+  settingsTitle: { color: PALETTE.white, fontSize: 18, fontWeight: "800" },
+  closeBtn: { width: 28, height: 28, alignItems: "center", justifyContent: "center" },
+  closeBtnText: { color: PALETTE.sub, fontSize: 32, fontWeight: "300" },
+  settingsLabel: { color: PALETTE.sub, fontSize: 12, fontWeight: "600", marginBottom: 8, marginTop: 10 },
+  modeToggle: { flexDirection: "row", gap: 8 },
+  modeOption: {
+    flex: 1, paddingVertical: 10, borderRadius: 10,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    alignItems: "center",
+  },
+  modeOptionActive: { backgroundColor: PALETTE.red, borderColor: PALETTE.red },
+  modeOptionText: { color: PALETTE.sub, fontWeight: "700", fontSize: 13 },
+  modeOptionTextActive: { color: PALETTE.white },
+  ipRow: { flexDirection: "row", gap: 8 },
+  ipInput: {
+    flex: 1, backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10,
+    color: PALETTE.white, fontSize: 14,
+  },
+  testBtn: {
+    paddingHorizontal: 16, paddingVertical: 10, borderRadius: 10,
+    backgroundColor: PALETTE.blue, alignItems: "center", justifyContent: "center",
+  },
+  testBtnText: { color: PALETTE.white, fontWeight: "700", fontSize: 13 },
+  errorText: { color: PALETTE.danger, fontSize: 11, marginTop: 8 },
+
+  // Control Pad (SUBI UM POUCO — bottom: 16 -> 56)
+  controlPad: { position: "absolute", left: 16, bottom: 56 },
+  dpadContainer: { gap: 8 },
+  dpadRow: { flexDirection: "row", gap: 8, justifyContent: "center" },
+  dpadBtn: {
+    width: 60, height: 60, borderRadius: 14,
+    alignItems: "center", justifyContent: "center",
+    borderWidth: 2,
+    shadowColor: "#000", shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
+  },
+  dpadBtnMain: {
+    backgroundColor: PALETTE.red, borderColor: PALETTE.redDark,
+    shadowColor: PALETTE.red,
+  },
+  dpadBtnSide: {
+    backgroundColor: "rgba(255,68,68,0.25)", borderColor: PALETTE.red,
+  },
+  dpadBtnStop: {
+    backgroundColor: "rgba(204,0,0,0.35)", borderColor: PALETTE.redDark,
+  },
+  dpadIcon: { color: PALETTE.white, fontSize: 24, fontWeight: "800" },
+
+  // Right Panel
+  rightPanel: { position: "absolute", right: 16, top: 120, width: 200, gap: 10 },
+  infoCard: {
+    backgroundColor: "rgba(26,26,36,0.96)", borderRadius: 14,
+    padding: 12, borderWidth: 1, borderColor: PALETTE.border,
+    shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.4, shadowRadius: 6,
+    elevation: 6,
+  },
+  cardTitle: { color: PALETTE.white, fontSize: 12, fontWeight: "800", marginBottom: 8, letterSpacing: 0.5 },
+
+  // Velocidade
+  velDisplay: { color: PALETTE.white, fontSize: 26, fontWeight: "800", textAlign: "center", marginBottom: 6 },
+  velControls: { flexDirection: "row", alignItems: "center", gap: 8 },
+  velBtn: {
+    width: 30, height: 30, borderRadius: 8,
+    backgroundColor: PALETTE.red, alignItems: "center", justifyContent: "center",
+  },
+  velBtnText: { color: PALETTE.white, fontSize: 18, fontWeight: "800" },
+  velBarContainer: {
+    flex: 1, height: 11, borderRadius: 6,
+    backgroundColor: PALETTE.bgLight, overflow: "hidden",
+    borderWidth: 1, borderColor: PALETTE.border,
+  },
+  velBarFill: { height: "100%", backgroundColor: PALETTE.red },
+  velPresets: { flexDirection: "row", gap: 6, marginTop: 8 },
+  velPreset: {
+    flex: 1, paddingVertical: 6, borderRadius: 8,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+    alignItems: "center",
+  },
+  velPresetText: { color: PALETTE.white, fontSize: 11, fontWeight: "700" },
+
+  // Bomba
+  pumpBtn: {
+    backgroundColor: PALETTE.green, borderRadius: 10, paddingVertical: 9,
+    alignItems: "center", marginBottom: 6,
+  },
+  pumpBtnOff: { backgroundColor: PALETTE.danger },
+  pumpBtnText: { color: PALETTE.white, fontWeight: "800", fontSize: 12 },
+
+  // Sensores
+  fireGrid: { flexDirection: "row", gap: 6, flexWrap: "wrap" },
+  fireBadge: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    paddingHorizontal: 9, paddingVertical: 5, borderRadius: 20,
+    backgroundColor: PALETTE.bgLight, borderWidth: 1, borderColor: PALETTE.border,
+  },
+  fireBadgeActive: {
+    backgroundColor: "rgba(255,51,51,0.2)", borderColor: PALETTE.danger,
+  },
+  fireDot: { width: 5, height: 5, borderRadius: 3 },
+  fireLabel: { fontSize: 10, fontWeight: "700", color: PALETTE.sub },
+
+  // Água
+  waterLevel: { color: PALETTE.white, fontSize: 28, fontWeight: "800", textAlign: "center", marginBottom: 6 },
+  waterBar: {
+    height: 12, borderRadius: 6, backgroundColor: PALETTE.bgLight,
+    overflow: "hidden", borderWidth: 1, borderColor: PALETTE.border,
+  },
+  waterBarFill: { height: "100%" },
+
+  // Simulação
+  simBtn: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: "center",
+    borderWidth: 1,
+  },
+  simBtnOn: {
+    backgroundColor: "rgba(255,51,51,0.18)",
+    borderColor: PALETTE.danger,
+  },
+  simBtnOff: {
+    backgroundColor: PALETTE.bgLight,
+    borderColor: PALETTE.border,
+  },
+  simBtnText: { color: PALETTE.white, fontWeight: "800", fontSize: 12 },
+});
+
+
+
+
+Ajuste no posicionamento do controle (já aplicado acima)
+
+
+No seu original estava:
+
+
+controlPad: { position: "absolute", left: 16, bottom: 16 },
+
+
+
+Eu subi um pouco para:
+
+
+controlPad: { position: "absolute", left: 16, bottom: 56 },
+
+
+
+
+
+Se quiser mais alto/baixo, altere o valor de bottom.
+
+
+
+
+
+Observações rápidas
+
+
+
+
+Discagem: usar Linking.openURL("tel:123456") abre o discador com o número preenchido (sem precisar de permissão). Em iOS, tel: também funciona; não usei telprompt: para evitar inconsistências.
+
+
+Anti-spam: o dialGuardRef garante que o discador seja aberto uma vez por evento de fogo (real ou simulado). Quando o fogo some (ou você desliga a simulação), ele “reseta”.
+
+
+Simulação: o cartão “Teste” no painel da direita tem o botão Simular Fogo que ativa/desativa a simulação e aciona o discador como se os sensores tivessem detectado.
+
+
+
+
+Quer que eu coloque essa simulação também em um atalho no topo (ex.: um botão 🔥 na Top Bar)?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 //App.tsx
 import React from "react";
 import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
